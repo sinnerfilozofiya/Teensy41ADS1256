@@ -50,26 +50,24 @@ void setup() {
   bitToVolt = resolution*Gain/vRef;
 }
 
-int32_t val1;
-int32_t val2;
-int32_t val3;
+int32_t val1;  // Load cell 1 (AIN0-AIN1)
+int32_t val2;  // Load cell 2 (AIN2-AIN3)
+int32_t val3;  // Load cell 3 (AIN4-AIN5)
+int32_t val4;  // Load cell 4 (AIN6-AIN7)
 
 void loop() {
-  // put your main code here, to run repeatedly:
-
-double value = 0;
-for (int i = 0; i <1; i++){
-  read_three_values();
-  value += val1;
-}
-
-value /=1.;
-
-  Serial.print(value,8);
-  Serial.print("\t");
+  // Read all 4 load cells
+  read_four_values();
+  
+  // Print all 4 load cell values
+  Serial.print("LC1: ");
+  Serial.print(val1);
+  Serial.print("\tLC2: ");
   Serial.print(val2);
-  Serial.print("\t");
-  Serial.println(val3);
+  Serial.print("\tLC3: ");
+  Serial.print(val3);
+  Serial.print("\tLC4: ");
+  Serial.println(val4);
 
 //
 //double value = 0;

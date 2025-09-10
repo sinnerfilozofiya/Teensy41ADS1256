@@ -336,6 +336,138 @@ void read_three_values() {
   val3 = adc_val3;
 }
 
+void read_four_values() {
+  //datasheet page 21 at the bottom gives the timing
+  int32_t adc_val1 = 0;
+  int32_t adc_val2 = 0;
+  int32_t adc_val3 = 0;
+  int32_t adc_val4 = 0;
+
+  waitforDRDY(); // Wait until DRDY is LOW
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+  digitalWriteFast(ADS_CS_PIN, LOW); //Pull SS Low to Enable Communications with ADS1256
+
+  //now change the mux register to read channels 2,3
+  SPI.transfer(WREG | MUX); // send 1st command byte, address of the register
+  SPI.transfer(0x00);   // send 2nd command byte, write only one register
+  SPI.transfer(0x23);     //pins registers 2 and 3
+
+  //now we need to sync
+  delayMicroseconds(2);
+  SPI.transfer(SYNC);
+  delayMicroseconds(5);
+  SPI.transfer(WAKEUP);
+  delayMicroseconds(1);
+
+  SPI.transfer(RDATA); //Issue RDATA
+  delayMicroseconds(7);
+
+  //This is the reading from channels 0,1 (from previous mux setting)
+  adc_val1 |= SPI.transfer(NOP);
+  adc_val1 <<= 8;
+  adc_val1 |= SPI.transfer(NOP);
+  adc_val1 <<= 8;
+  adc_val1 |= SPI.transfer(NOP);
+
+  //now wait for the next dataready
+  waitforDRDY(); // Wait until DRDY is LOW
+
+  //now change the mux register to read channels 4,5
+  SPI.transfer(WREG | MUX); // send 1st command byte, address of the register
+  SPI.transfer(0x00);   // send 2nd command byte, write only one register
+  SPI.transfer(0x45);     //pins registers 4 and 5
+
+  delayMicroseconds(2);
+  SPI.transfer(SYNC);
+  delayMicroseconds(5);
+  SPI.transfer(WAKEUP);
+  delayMicroseconds(1);
+
+  SPI.transfer(RDATA); //Issue RDATA
+  delayMicroseconds(7);
+
+  //this is the reading from pins 2,3
+  adc_val2 |= SPI.transfer(NOP);
+  adc_val2 <<= 8;
+  adc_val2 |= SPI.transfer(NOP);
+  adc_val2 <<= 8;
+  adc_val2 |= SPI.transfer(NOP);
+
+  //now wait for the next dataready
+  waitforDRDY(); // Wait until DRDY is LOW
+
+  //now change the mux register to read channels 6,7
+  SPI.transfer(WREG | MUX); // send 1st command byte, address of the register
+  SPI.transfer(0x00);   // send 2nd command byte, write only one register
+  SPI.transfer(0x67);     //pins registers 6 and 7
+
+  delayMicroseconds(2);
+  SPI.transfer(SYNC);
+  delayMicroseconds(5);
+  SPI.transfer(WAKEUP);
+  delayMicroseconds(1);
+
+  SPI.transfer(RDATA); //Issue RDATA
+  delayMicroseconds(7);
+
+  //this is the reading from pins 4,5
+  adc_val3 |= SPI.transfer(NOP);
+  adc_val3 <<= 8;
+  adc_val3 |= SPI.transfer(NOP);
+  adc_val3 <<= 8;
+  adc_val3 |= SPI.transfer(NOP);
+
+  //now wait for the next dataready
+  waitforDRDY(); // Wait until DRDY is LOW
+
+  //now change the mux register back to 0,1 so we left things how we found them
+  SPI.transfer(WREG | MUX); // send 1st command byte, address of the register
+  SPI.transfer(0x00);   // send 2nd command byte, write only one register
+  SPI.transfer(MUX_RESET);     //pins registers 0 and 1
+
+  delayMicroseconds(2);
+  SPI.transfer(SYNC);
+  delayMicroseconds(5);
+  SPI.transfer(WAKEUP);
+  delayMicroseconds(1);
+
+  SPI.transfer(RDATA); //Issue RDATA
+  delayMicroseconds(7);
+
+  //this should now be the value from pins 6,7
+  adc_val4 |= SPI.transfer(NOP);
+  adc_val4 <<= 8;
+  adc_val4 |= SPI.transfer(NOP);
+  adc_val4 <<= 8;
+  adc_val4 |= SPI.transfer(NOP);
+
+  digitalWriteFast(ADS_CS_PIN, HIGH);
+  SPI.endTransaction();
+
+  // Convert to signed values (2's complement)
+  if (adc_val1 > 0x7fffff) { //if MSB == 1
+    adc_val1 = adc_val1 - 16777216; //do 2's complement, keep the sign this time!
+  }
+
+  if (adc_val2 > 0x7fffff) { //if MSB == 1
+    adc_val2 = adc_val2 - 16777216; //do 2's complement, keep the sign this time!
+  }
+
+  if (adc_val3 > 0x7fffff) { //if MSB == 1
+    adc_val3 = adc_val3 - 16777216; //do 2's complement, keep the sign this time!
+  }
+
+  if (adc_val4 > 0x7fffff) { //if MSB == 1
+    adc_val4 = adc_val4 - 16777216; //do 2's complement, keep the sign this time!
+  }
+
+  // Store results in global variables
+  val1 = adc_val1;
+  val2 = adc_val2;
+  val3 = adc_val3;
+  val4 = adc_val4;
+}
+
 
 //library files
 
