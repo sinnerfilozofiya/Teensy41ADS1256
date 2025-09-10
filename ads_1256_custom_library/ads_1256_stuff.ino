@@ -78,7 +78,7 @@ int32_t read_Value() {
   digitalWriteFast(ADS_CS_PIN, LOW); //Pull SS Low to Enable Communications with ADS1256
   //delayMicroseconds(5); // RD: Wait 25ns for ADC12xx to get ready
   SPI.transfer(RDATA); //Issue RDATA
-  delayMicroseconds(7);
+  delayMicroseconds(3);  // Reduced from 7 for speed
   adc_val |= SPI.transfer(NOP);
   //delayMicroseconds(10);
   adc_val <<= 8;
@@ -117,22 +117,15 @@ void read_two_values() {
   SPI.transfer(0x00);   // send 2nd command byte, write only one register
   SPI.transfer(0x23);     //pins registers 2 and 3
 
-  //now we need to sync
-  //need to delay by 4x SPI clock = 2.35 uS (t1)
-  //to be safe 5 uS
-  delayMicroseconds(2);
+  //now we need to sync - optimized timing
+  delayMicroseconds(1);  // Reduced from 2
   SPI.transfer(SYNC);
-
-  //again delay by t1
-  delayMicroseconds(5);
-  //send wakeup
+  delayMicroseconds(2);  // Reduced from 5  
   SPI.transfer(WAKEUP);
-
-  //then delay one more time by t1 before rdata
-  delayMicroseconds(1);
+  // Removed final delay - not needed
 
   SPI.transfer(RDATA); //Issue RDATA
-  delayMicroseconds(7);
+  delayMicroseconds(3);  // Reduced from 7 for speed
 
   //This is the reading in the Data register from whatever the mux was set to the last
   //time this function was called. By default, it is configured to leave that value at 0
@@ -154,22 +147,15 @@ void read_two_values() {
   SPI.transfer(0x00);   // send 2nd command byte, write only one register
   SPI.transfer(MUX_RESET);     //pins registers 2 and 3
 
-  //now we need to sync
-  //need to delay by 4x SPI clock = 2.35 uS (t1)
-  //to be safe 5 uS
-  delayMicroseconds(2);
+  //now we need to sync - optimized timing
+  delayMicroseconds(1);  // Reduced from 2
   SPI.transfer(SYNC);
-
-  //again delay by t1
-  delayMicroseconds(5);
-  //send wakeup
+  delayMicroseconds(2);  // Reduced from 5  
   SPI.transfer(WAKEUP);
-
-  //then delay one more time by t1 before rdata
-  delayMicroseconds(1);
+  // Removed final delay - not needed
 
   SPI.transfer(RDATA); //Issue RDATA
-  delayMicroseconds(7);
+  delayMicroseconds(3);  // Reduced from 7 for speed
   //this should now be the value from the mux change we just did (0,1 to 2,3)
   adc_val2 |= SPI.transfer(NOP);
   //delayMicroseconds(10);
@@ -213,22 +199,15 @@ void read_three_values() {
   SPI.transfer(0x00);   // send 2nd command byte, write only one register
   SPI.transfer(0x23);     //pins registers 2 and 3
 
-  //now we need to sync
-  //need to delay by 4x SPI clock = 2.35 uS (t1)
-  //to be safe 5 uS
-  delayMicroseconds(2);
+  //now we need to sync - optimized timing
+  delayMicroseconds(1);  // Reduced from 2
   SPI.transfer(SYNC);
-
-  //again delay by t1
-  delayMicroseconds(5);
-  //send wakeup
+  delayMicroseconds(2);  // Reduced from 5  
   SPI.transfer(WAKEUP);
-
-  //then delay one more time by t1 before rdata
-  delayMicroseconds(1);
+  // Removed final delay - not needed
 
   SPI.transfer(RDATA); //Issue RDATA
-  delayMicroseconds(7);
+  delayMicroseconds(3);  // Reduced from 7 for speed
 
   //This is the reading in the Data register from whatever the mux was set to the last
   //time this function was called. By default, it is configured to leave that value at 0
@@ -265,7 +244,7 @@ void read_three_values() {
   delayMicroseconds(1);
 
   SPI.transfer(RDATA); //Issue RDATA
-  delayMicroseconds(7);
+  delayMicroseconds(3);  // Reduced from 7 for speed
 
   //this is the reading from pins 2,3
   adc_val2 |= SPI.transfer(NOP);
@@ -286,22 +265,15 @@ void read_three_values() {
   SPI.transfer(0x00);   // send 2nd command byte, write only one register
   SPI.transfer(MUX_RESET);     //pins registers 2 and 3
 
-  //now we need to sync
-  //need to delay by 4x SPI clock = 2.35 uS (t1)
-  //to be safe 5 uS
-  delayMicroseconds(2);
+  //now we need to sync - optimized timing
+  delayMicroseconds(1);  // Reduced from 2
   SPI.transfer(SYNC);
-
-  //again delay by t1
-  delayMicroseconds(5);
-  //send wakeup
+  delayMicroseconds(2);  // Reduced from 5  
   SPI.transfer(WAKEUP);
-
-  //then delay one more time by t1 before rdata
-  delayMicroseconds(1);
+  // Removed final delay - not needed
 
   SPI.transfer(RDATA); //Issue RDATA
-  delayMicroseconds(7);
+  delayMicroseconds(3);  // Reduced from 7 for speed
   //this should now be the value from the mux change we just did (2,3 to 4,5)
   adc_val3 |= SPI.transfer(NOP);
   //delayMicroseconds(10);
@@ -360,7 +332,7 @@ void read_four_values() {
   delayMicroseconds(1);
 
   SPI.transfer(RDATA); //Issue RDATA
-  delayMicroseconds(7);
+  delayMicroseconds(3);  // Reduced from 7 for speed
 
   //This is the reading from channels 0,1 (from previous mux setting)
   adc_val1 |= SPI.transfer(NOP);
@@ -384,7 +356,7 @@ void read_four_values() {
   delayMicroseconds(1);
 
   SPI.transfer(RDATA); //Issue RDATA
-  delayMicroseconds(7);
+  delayMicroseconds(3);  // Reduced from 7 for speed
 
   //this is the reading from pins 2,3
   adc_val2 |= SPI.transfer(NOP);
@@ -408,7 +380,7 @@ void read_four_values() {
   delayMicroseconds(1);
 
   SPI.transfer(RDATA); //Issue RDATA
-  delayMicroseconds(7);
+  delayMicroseconds(3);  // Reduced from 7 for speed
 
   //this is the reading from pins 4,5
   adc_val3 |= SPI.transfer(NOP);
@@ -432,7 +404,7 @@ void read_four_values() {
   delayMicroseconds(1);
 
   SPI.transfer(RDATA); //Issue RDATA
-  delayMicroseconds(7);
+  delayMicroseconds(3);  // Reduced from 7 for speed
 
   //this should now be the value from pins 6,7
   adc_val4 |= SPI.transfer(NOP);
