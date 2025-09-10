@@ -1,6 +1,6 @@
 //my code
 //note...this is written for TEENSY meaning I am using DigitalWriteFast to speed things up.
-//thus the CS pin must be hard coded. in my case, this is pin 21 but you will have to change it for yourself if needed
+//Updated for Teensy 4.1: CS pin is now defined as ADS_CS_PIN (pin 10) in the main file
 //see this post about how to use: https://forum.pjrc.com/threads/24573-Speed-of-digitalRead-and-digitalWrite-with-Teensy3-0
 
 //built up on the work of:
@@ -72,10 +72,10 @@ void initADS() {
 //function to read a value
 //this assumes that we are not changing the mux action
 int32_t read_Value() {
-  int32_t adc_val;
+  int32_t adc_val = 0;
   waitforDRDY(); // Wait until DRDY is LOW
   SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
-  digitalWriteFast(21, LOW); //Pull SS Low to Enable Communications with ADS1247
+  digitalWriteFast(ADS_CS_PIN, LOW); //Pull SS Low to Enable Communications with ADS1256
   //delayMicroseconds(5); // RD: Wait 25ns for ADC12xx to get ready
   SPI.transfer(RDATA); //Issue RDATA
   delayMicroseconds(7);
@@ -87,7 +87,7 @@ int32_t read_Value() {
   adc_val <<= 8;
   adc_val |= SPI.transfer(NOP);
   //delayMicroseconds(5);
-  digitalWriteFast(21, HIGH);
+  digitalWriteFast(ADS_CS_PIN, HIGH);
   SPI.endTransaction();
 
   if (adc_val > 0x7fffff) { //if MSB == 1
@@ -104,12 +104,12 @@ int32_t read_Value() {
 
 void read_two_values() {
   //datasheet page 21 at the bottom gives the timing
-  int32_t adc_val1;
-  int32_t adc_val2;
+  int32_t adc_val1 = 0;
+  int32_t adc_val2 = 0;
 
   waitforDRDY(); // Wait until DRDY is LOW
   SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
-  digitalWriteFast(21, LOW); //Pull SS Low to Enable Communications with ADS1247
+  digitalWriteFast(ADS_CS_PIN, LOW); //Pull SS Low to Enable Communications with ADS1256
   //delayMicroseconds(5); // RD: Wait 25ns for ADC12xx to get ready
 
   //now change the mux register
@@ -181,7 +181,7 @@ void read_two_values() {
   //delayMicroseconds(5);
   //this is the value for the
 
-  digitalWriteFast(21, HIGH);
+  digitalWriteFast(ADS_CS_PIN, HIGH);
   SPI.endTransaction();
 
   if (adc_val1 > 0x7fffff) { //if MSB == 1
@@ -199,13 +199,13 @@ void read_two_values() {
 
 void read_three_values() {
   //datasheet page 21 at the bottom gives the timing
-  int32_t adc_val1;
-  int32_t adc_val2;
-  int32_t adc_val3;
+  int32_t adc_val1 = 0;
+  int32_t adc_val2 = 0;
+  int32_t adc_val3 = 0;
 
   waitforDRDY(); // Wait until DRDY is LOW
   SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
-  digitalWriteFast(21, LOW); //Pull SS Low to Enable Communications with ADS1247
+  digitalWriteFast(ADS_CS_PIN, LOW); //Pull SS Low to Enable Communications with ADS1256
   //delayMicroseconds(5); // RD: Wait 25ns for ADC12xx to get ready
 
   //now change the mux register
@@ -313,7 +313,7 @@ void read_three_values() {
  // delayMicroseconds(5);
   //this is the value for the
 
-  digitalWriteFast(21, HIGH);
+  digitalWriteFast(ADS_CS_PIN, HIGH);
   SPI.endTransaction();
 
   if (adc_val1 > 0x7fffff) { //if MSB == 1
@@ -357,14 +357,14 @@ void DRDY_Interuppt() {
 
 long GetRegisterValue(uint8_t regAdress) {
   uint8_t bufr;
-  digitalWriteFast(21, LOW);
+  digitalWriteFast(ADS_CS_PIN, LOW);
   delayMicroseconds(10);
   SPI.transfer(RREG | regAdress); // send 1st command byte, address of the register
   SPI.transfer(0x00);     // send 2nd command byte, read only one register
   delayMicroseconds(10);
   bufr = SPI.transfer(NOP); // read data of the register
   delayMicroseconds(10);
-  digitalWriteFast(21, HIGH);
+  digitalWriteFast(ADS_CS_PIN, HIGH);
   //digitalWrite(_START, LOW);
   SPI.endTransaction();
   return bufr;
@@ -374,23 +374,23 @@ long GetRegisterValue(uint8_t regAdress) {
 void SendCMD(uint8_t cmd) {
   waitforDRDY();
   SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1)); // initialize SPI with 4Mhz clock, MSB first, SPI Mode0
-  digitalWriteFast(21, LOW);
+  digitalWriteFast(ADS_CS_PIN, LOW);
   delayMicroseconds(10);
   SPI.transfer(cmd);
   delayMicroseconds(10);
-  digitalWriteFast(21, HIGH);
+  digitalWriteFast(ADS_CS_PIN, HIGH);
   SPI.endTransaction();
 }
 
 void Reset() {
   SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1)); // initialize SPI with  clock, MSB first, SPI Mode1
-  digitalWriteFast(21, LOW);
+  digitalWriteFast(ADS_CS_PIN, LOW);
   delayMicroseconds(10);
   SPI.transfer(RESET); //Reset
   delay(2); //Minimum 0.6ms required for Reset to finish.
   SPI.transfer(SDATAC); //Issue SDATAC
   delayMicroseconds(100);
-  digitalWriteFast(21, HIGH);
+  digitalWriteFast(ADS_CS_PIN, HIGH);
   SPI.endTransaction();
 }
 
@@ -402,13 +402,13 @@ void SetRegisterValue(uint8_t regAdress, uint8_t regValue) {
     delayMicroseconds(10);
     waitforDRDY();
     SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1)); // initialize SPI with SPI_SPEED, MSB first, SPI Mode1
-    digitalWriteFast(21, LOW);
+    digitalWriteFast(ADS_CS_PIN, LOW);
     delayMicroseconds(10);
     SPI.transfer(WREG | regAdress); // send 1st command byte, address of the register
     SPI.transfer(0x00);   // send 2nd command byte, write only one register
     SPI.transfer(regValue);         // write data (1 Byte) for the register
     delayMicroseconds(10);
-    digitalWriteFast(21, HIGH);
+    digitalWriteFast(ADS_CS_PIN, HIGH);
     //digitalWrite(_START, LOW);
     if (regValue != GetRegisterValue(regAdress)) {   //Check if write was succesfull
       Serial.print("Write to Register 0x");

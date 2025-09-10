@@ -3,14 +3,17 @@
 
 
 //(other stuff for getting the ADS1526 to work is in the next tab
-#define ADS_RST_PIN    8 //ADS1256 reset pin
-#define ADS_RDY_PIN    22 //ADS1256 data ready
-#define ADS_CS_PIN    21 //ADS1256 chip select
+// Updated pin definitions for Teensy 4.1
+#define ADS_RST_PIN    8  //ADS1256 reset pin (same as Teensy 3.1)
+#define ADS_RDY_PIN    22 //ADS1256 data ready (same as Teensy 3.1) 
+#define ADS_CS_PIN     10 //ADS1256 chip select (Teensy 4.1 default SPI CS)
 
 /* 
-    CLK  - pin 13
+    Teensy 4.1 SPI0 pins:
+    CLK  - pin 13 (SCK)
     DIN  - pin 11 (MOSI)
     DOUT - pin 12 (MISO)
+    CS   - pin 10 (default CS, but we define our own above)
 */
 
 
@@ -28,6 +31,7 @@ double bitToVolt = 0.;
 
 void setup() {
   delay(1000);
+  // Teensy 4.1 supports higher baud rates than 3.1
   Serial.begin(115200);
   Serial.println("booting");
   //initialize the ADS
