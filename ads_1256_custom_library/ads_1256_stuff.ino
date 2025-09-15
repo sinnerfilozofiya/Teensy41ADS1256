@@ -8,6 +8,9 @@
 //https://gist.github.com/dariosalvi78/f2e990b4317199d235bbf5963c3486ae
 //https://github.com/adienakhmad/ADS1256
 
+// Global variables
+volatile int DRDY_state = HIGH;
+
 
 void initADS() {
   attachInterrupt(ADS_RDY_PIN, DRDY_Interuppt, FALLING);
@@ -39,8 +42,8 @@ void initADS() {
   //you need to adjust the constants for the other ones according to datasheet pg 31 if you need other values
   SetRegisterValue(ADCON, PGA_64); //set the adcon register
 
-  //next set the data rate
-  SetRegisterValue(DRATE, DR_30000); //set the drate register
+  //next set the data rate - use higher rate for faster settling
+  SetRegisterValue(DRATE, DR_7500); //set the drate register to 7500 SPS for faster settling
 
   //we're going to ignore the GPIO for now...
 
@@ -468,10 +471,112 @@ void read_four_values() {
   val4 = adc_val4;
 }
 
+// Optimized function for faster single-channel reads at high SPS
+int32_t read_single_channel(uint8_t mux_setting) {
+  int32_t adc_val = 0;
+  
+  waitforDRDY(); // Wait until DRDY is LOW
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+  digitalWriteFast(ADS_CS_PIN, LOW);
+  
+  // Set MUX register
+  SPI.transfer(WREG | MUX);
+  SPI.transfer(0x00);
+  SPI.transfer(mux_setting);
+  
+  // Minimal sync sequence for speed
+  delayMicroseconds(1);
+  SPI.transfer(SYNC);
+  delayMicroseconds(3);
+  SPI.transfer(WAKEUP);
+  delayMicroseconds(1);
+  
+  // Read data
+  SPI.transfer(RDATA);
+  delayMicroseconds(5);
+  adc_val |= SPI.transfer(NOP);
+  adc_val <<= 8;
+  adc_val |= SPI.transfer(NOP);
+  adc_val <<= 8;
+  adc_val |= SPI.transfer(NOP);
+  
+  digitalWriteFast(ADS_CS_PIN, HIGH);
+  SPI.endTransaction();
+  
+  // Convert to signed
+  if (adc_val > 0x7fffff) {
+    adc_val = adc_val - 16777216;
+  }
+  
+  return adc_val;
+}
+
+// Ultra-fast single channel read for 1000 SPS
+int32_t read_single_channel_ultra_fast(uint8_t mux_setting) {
+  int32_t adc_val = 0;
+  
+  // Start SPI transaction
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+  digitalWriteFast(ADS_CS_PIN, LOW);
+  
+  // Set MUX register
+  SPI.transfer(WREG | MUX);
+  SPI.transfer(0x00);
+  SPI.transfer(mux_setting);
+  
+  // Minimal sync - just enough for ADS1256
+  SPI.transfer(SYNC);
+  SPI.transfer(WAKEUP);
+  
+  // Wait for DRDY without ending transaction
+  digitalWriteFast(ADS_CS_PIN, HIGH);
+  waitforDRDY();
+  digitalWriteFast(ADS_CS_PIN, LOW);
+  
+  // Read data immediately
+  SPI.transfer(RDATA);
+  delayMicroseconds(7);  // t6 delay
+  adc_val |= SPI.transfer(NOP);
+  adc_val <<= 8;
+  adc_val |= SPI.transfer(NOP);
+  adc_val <<= 8;
+  adc_val |= SPI.transfer(NOP);
+  
+  digitalWriteFast(ADS_CS_PIN, HIGH);
+  SPI.endTransaction();
+  
+  // Convert to signed
+  if (adc_val > 0x7fffff) {
+    adc_val = adc_val - 16777216;
+  }
+  
+  return adc_val;
+}
+
+// State machine for non-blocking ADS1256 reading
+// Unused non-blocking and round-robin code removed - using blocking read_four_values() instead
+
+// Fast 4-channel read optimized for 1000 SPS
+void read_four_values_fast() {
+  // Read channels in sequence with minimal delays
+  val1 = read_single_channel(0x01); // AIN0-AIN1
+  val2 = read_single_channel(0x23); // AIN2-AIN3  
+  val3 = read_single_channel(0x45); // AIN4-AIN5
+  val4 = read_single_channel(0x67); // AIN6-AIN7
+  
+  // Reset to default MUX setting
+  waitforDRDY();
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+  digitalWriteFast(ADS_CS_PIN, LOW);
+  SPI.transfer(WREG | MUX);
+  SPI.transfer(0x00);
+  SPI.transfer(MUX_RESET);
+  digitalWriteFast(ADS_CS_PIN, HIGH);
+  SPI.endTransaction();
+}
+
 
 //library files
-
-volatile int DRDY_state = HIGH;
 
 void waitforDRDY() {
   while (DRDY_state) {
