@@ -26,8 +26,8 @@
 // ============================================================================
 
 // Transport selection (set one to 1, the other to 0)
-#define USE_WIFI_UDP 1
-#define USE_ESPNOW 0
+#define USE_WIFI_UDP 0
+#define USE_ESPNOW 1
 
 // Wi-Fi Configuration
 #define WIFI_SSID "YourWiFiSSID"
@@ -37,7 +37,7 @@
 
 // ESP-NOW Configuration
 #define ESPNOW_CHANNEL 1
-static const uint8_t ESPNOW_PEER_MAC[6] = {0x02, 0xAA, 0xBB, 0x00, 0x00, 0x02};
+static const uint8_t ESPNOW_PEER_MAC[6] = {0x02, 0xAA, 0xBB, 0x00, 0x00, 0x03};  // Part 2 MAC
 
 // Custom MAC Configuration
 #define USE_CUSTOM_MAC 1
@@ -46,24 +46,7 @@ static const uint8_t CUSTOM_STA_MAC_TX[6] = {0x02, 0xAA, 0xBB, 0x00, 0x00, 0x01}
 // Network buffer size
 #define NET_QUEUE_SIZE 64
 
-struct __attribute__((packed)) Frame {
-  uint8_t  sync[2];
-  uint8_t  plate_id, proto_ver;
-  uint16_t frame_idx;
-  uint32_t t0_us;
-  uint8_t  samples[120];
-  uint16_t crc16;
-  uint8_t  pad[12];
-};
 
-static inline uint16_t crc16_ccitt_false(const uint8_t* d, uint32_t n) {
-  uint16_t crc = 0xFFFF;
-  while (n--) {
-    crc ^= ((uint16_t)*d++) << 8;
-    for (int i=0;i<8;i++) crc = (crc & 0x8000) ? ((crc<<1) ^ 0x1021) : (crc<<1);
-  }
-  return crc;
-}
 
 // DMA-capable buffers + transactions
 static uint8_t rxbuf[QUEUED_XFERS][FRAME_BYTES] __attribute__((aligned(4)));
@@ -208,7 +191,7 @@ static void wifi_check_connection() {
 // ============================================================================
 
 #if USE_ESPNOW
-static void espnow_send_callback(const uint8_t *mac_addr, esp_now_send_status_t status) {
+static void espnow_send_callback(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
   if (status == ESP_NOW_SEND_SUCCESS) {
     espnow_send_success++;
   } else {
@@ -312,14 +295,14 @@ static void spi_rx_task(void*){
     esp_err_t e = spi_slave_get_trans_result(SPI2_HOST, &ret, portMAX_DELAY);
     if (e != ESP_OK) continue;
     int idx = (int)(intptr_t)ret->user;
-    Frame* f = (Frame*)rxbuf[idx];
+    InnerFrame* f = (InnerFrame*)rxbuf[idx];
 
     uint32_t now_us = micros();
 
     bool ok = (f->sync[0]==0xA5 && f->sync[1]==0x5A);
     if (ok) {
       uint16_t want = f->crc16;
-      uint16_t got  = crc16_ccitt_false((uint8_t*)f, offsetof(Frame, crc16));
+      uint16_t got  = crc16_ccitt_false((uint8_t*)f, offsetof(InnerFrame, crc16));
       ok = (want == got);
     }
     if (!ok) {
@@ -401,52 +384,29 @@ static void stats_task(void*){
   }
 }
 
-// Helper function to extract int24 little-endian values
-static inline int32_t unpack_int24_le(const uint8_t* p) {
-  uint32_t u = p[0] | (p[1] << 8) | (p[2] << 16);
-  // Sign extend from 24-bit to 32-bit
-  if (u & 0x800000) {
-    u |= 0xFF000000;
-  }
-  return (int32_t)u;
-}
 
 // Process load cell data from received frame (compact format)
-void process_load_cell_data_compact(Frame* f) {
-  // Extract load cell values from the frame
-  uint8_t* s = f->samples;
-  
+void process_load_cell_data_compact(InnerFrame* f) {
   for (int sample = 0; sample < SAMPLES_PER_FRAME; sample++) {
-    int32_t lc1 = unpack_int24_le(s + 0);
-    int32_t lc2 = unpack_int24_le(s + 3);
-    int32_t lc3 = unpack_int24_le(s + 6);
-    int32_t lc4 = unpack_int24_le(s + 9);
+    int32_t lc1, lc2, lc3, lc4;
+    extract_load_cell_sample(f->samples, sample, &lc1, &lc2, &lc3, &lc4);
     
-    // Compact format: FRAME:SAMPLE:LC1:LC2:LC3:LC4
+    // Compact format: DATA:FRAME:SAMPLE:LC1:LC2:LC3:LC4
     Serial.printf("DATA:%u:%d:%ld:%ld:%ld:%ld\n", 
                   f->frame_idx, sample, lc1, lc2, lc3, lc4);
-    
-    s += 12; // 4 channels × 3 bytes each
   }
 }
 
 // Process load cell data from received frame (verbose format)
-void process_load_cell_data(Frame* f) {
-  // Extract load cell values from the frame
-  uint8_t* s = f->samples;
-  
+void process_load_cell_data(InnerFrame* f) {
   Serial.printf("[ESP] Frame %u: Load Cell Data:\n", f->frame_idx);
   
   for (int sample = 0; sample < SAMPLES_PER_FRAME; sample++) {
-    int32_t lc1 = unpack_int24_le(s + 0);
-    int32_t lc2 = unpack_int24_le(s + 3);
-    int32_t lc3 = unpack_int24_le(s + 6);
-    int32_t lc4 = unpack_int24_le(s + 9);
+    int32_t lc1, lc2, lc3, lc4;
+    extract_load_cell_sample(f->samples, sample, &lc1, &lc2, &lc3, &lc4);
     
     Serial.printf("  Sample %d: LC1=%ld LC2=%ld LC3=%ld LC4=%ld\n", 
                   sample, lc1, lc2, lc3, lc4);
-    
-    s += 12; // 4 channels × 3 bytes each
   }
 }
 

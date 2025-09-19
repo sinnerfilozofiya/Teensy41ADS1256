@@ -37,7 +37,7 @@
 
 // ESP-NOW Configuration
 #define ESPNOW_CHANNEL 1
-static const uint8_t ESPNOW_PEER_MAC[6] = {0x02, 0xAA, 0xBB, 0x00, 0x00, 0x02};
+static const uint8_t ESPNOW_PEER_MAC[6] = {0x02, 0xAA, 0xBB, 0x00, 0x00, 0x03};  // Part 2 MAC
 
 // Custom MAC Configuration
 #define USE_CUSTOM_MAC 1
