@@ -39,20 +39,38 @@ bool oldDeviceConnected = false;
 // REDIS-LIKE DATA STORE
 // ============================================================================
 
-// Redis-like data store for latest 8-channel data
-struct DataStore {
-    // Latest local data (4 load cells)
-    int32_t local_lc[4];
-    uint32_t local_timestamp;
-    bool local_valid;
-    
-    // Latest remote data (4 load cells)  
-    int32_t remote_lc[4];
-    uint32_t remote_timestamp;
-    bool remote_valid;
+// Redis-like data store with queues to prevent duplicates
+#define REDIS_QUEUE_SIZE 20  // Buffer for incoming samples
+
+struct SampleData {
+    int32_t lc[4];
+    uint32_t timestamp;
+    uint16_t frame_idx;
+    uint8_t sample_idx;
+    bool consumed;  // Flag to prevent duplicate reads
 };
 
-static DataStore redis_store = {0};
+struct RedisStore {
+    // Local data queue
+    SampleData local_queue[REDIS_QUEUE_SIZE];
+    int local_head;
+    int local_tail;
+    int local_count;
+    
+    // Remote data queue
+    SampleData remote_queue[REDIS_QUEUE_SIZE];
+    int remote_head;
+    int remote_tail;
+    int remote_count;
+    
+    // Latest consumed samples (for fallback)
+    int32_t last_local_lc[4];
+    int32_t last_remote_lc[4];
+    bool has_local_data;
+    bool has_remote_data;
+};
+
+static RedisStore redis_store = {0};
 
 // Hardware timer for 1000Hz sampling
 hw_timer_t* sampling_timer = nullptr;
@@ -145,12 +163,12 @@ static inline void process_uart_packet(const UartPacket* packet) {
     switch (packet->type) {
         case 'L':
             local_samples_received++;
-            update_redis_store('L', packet->lc);
+            add_to_redis_queue('L', packet->lc, packet->frame_idx, packet->sample_idx);
             break;
             
         case 'R':
             remote_samples_received++;
-            update_redis_store('R', packet->lc);
+            add_to_redis_queue('R', packet->lc, packet->frame_idx, packet->sample_idx);
             break;
             
         case 'C':
@@ -180,20 +198,108 @@ class MyServerCallbacks: public BLEServerCallbacks {
 // REDIS-LIKE DATA STORE FUNCTIONS
 // ============================================================================
 
-static inline void update_redis_store(uint8_t type, const int32_t* lc) {
+static inline void add_to_redis_queue(uint8_t type, const int32_t* lc, uint16_t frame_idx, uint8_t sample_idx) {
     uint32_t now = millis();
     
     if (type == 'L') {
-        // Update local slot in Redis-like store
-        memcpy(redis_store.local_lc, lc, sizeof(redis_store.local_lc));
-        redis_store.local_timestamp = now;
-        redis_store.local_valid = true;
+        // Add to local queue
+        if (redis_store.local_count < REDIS_QUEUE_SIZE) {
+            SampleData* sample = &redis_store.local_queue[redis_store.local_tail];
+            memcpy(sample->lc, lc, sizeof(sample->lc));
+            sample->timestamp = now;
+            sample->frame_idx = frame_idx;
+            sample->sample_idx = sample_idx;
+            sample->consumed = false;
+            
+            redis_store.local_tail = (redis_store.local_tail + 1) % REDIS_QUEUE_SIZE;
+            redis_store.local_count++;
+        } else {
+            // Queue full - overwrite oldest (move head forward)
+            SampleData* sample = &redis_store.local_queue[redis_store.local_tail];
+            memcpy(sample->lc, lc, sizeof(sample->lc));
+            sample->timestamp = now;
+            sample->frame_idx = frame_idx;
+            sample->sample_idx = sample_idx;
+            sample->consumed = false;
+            
+            redis_store.local_tail = (redis_store.local_tail + 1) % REDIS_QUEUE_SIZE;
+            redis_store.local_head = (redis_store.local_head + 1) % REDIS_QUEUE_SIZE;
+        }
     } else if (type == 'R') {
-        // Update remote slot in Redis-like store
-        memcpy(redis_store.remote_lc, lc, sizeof(redis_store.remote_lc));
-        redis_store.remote_timestamp = now;
-        redis_store.remote_valid = true;
+        // Add to remote queue
+        if (redis_store.remote_count < REDIS_QUEUE_SIZE) {
+            SampleData* sample = &redis_store.remote_queue[redis_store.remote_tail];
+            memcpy(sample->lc, lc, sizeof(sample->lc));
+            sample->timestamp = now;
+            sample->frame_idx = frame_idx;
+            sample->sample_idx = sample_idx;
+            sample->consumed = false;
+            
+            redis_store.remote_tail = (redis_store.remote_tail + 1) % REDIS_QUEUE_SIZE;
+            redis_store.remote_count++;
+        } else {
+            // Queue full - overwrite oldest (move head forward)
+            SampleData* sample = &redis_store.remote_queue[redis_store.remote_tail];
+            memcpy(sample->lc, lc, sizeof(sample->lc));
+            sample->timestamp = now;
+            sample->frame_idx = frame_idx;
+            sample->sample_idx = sample_idx;
+            sample->consumed = false;
+            
+            redis_store.remote_tail = (redis_store.remote_tail + 1) % REDIS_QUEUE_SIZE;
+            redis_store.remote_head = (redis_store.remote_head + 1) % REDIS_QUEUE_SIZE;
+        }
     }
+}
+
+static inline bool get_next_redis_sample(int32_t* local_lc, int32_t* remote_lc) {
+    bool got_local = false;
+    bool got_remote = false;
+    
+    // Try to get unconsumed local sample
+    if (redis_store.local_count > 0) {
+        SampleData* sample = &redis_store.local_queue[redis_store.local_head];
+        if (!sample->consumed) {
+            memcpy(local_lc, sample->lc, sizeof(sample->lc));
+            memcpy(redis_store.last_local_lc, sample->lc, sizeof(sample->lc));
+            sample->consumed = true;
+            redis_store.has_local_data = true;
+            got_local = true;
+            
+            // Remove consumed sample from queue
+            redis_store.local_head = (redis_store.local_head + 1) % REDIS_QUEUE_SIZE;
+            redis_store.local_count--;
+        }
+    }
+    
+    // Try to get unconsumed remote sample
+    if (redis_store.remote_count > 0) {
+        SampleData* sample = &redis_store.remote_queue[redis_store.remote_head];
+        if (!sample->consumed) {
+            memcpy(remote_lc, sample->lc, sizeof(sample->lc));
+            memcpy(redis_store.last_remote_lc, sample->lc, sizeof(sample->lc));
+            sample->consumed = true;
+            redis_store.has_remote_data = true;
+            got_remote = true;
+            
+            // Remove consumed sample from queue
+            redis_store.remote_head = (redis_store.remote_head + 1) % REDIS_QUEUE_SIZE;
+            redis_store.remote_count--;
+        }
+    }
+    
+    // If we didn't get new samples, use last known data (fallback)
+    if (!got_local && redis_store.has_local_data) {
+        memcpy(local_lc, redis_store.last_local_lc, sizeof(redis_store.last_local_lc));
+        got_local = true;
+    }
+    
+    if (!got_remote && redis_store.has_remote_data) {
+        memcpy(remote_lc, redis_store.last_remote_lc, sizeof(redis_store.last_remote_lc));
+        got_remote = true;
+    }
+    
+    return got_local && got_remote;
 }
 
 // ============================================================================
@@ -207,8 +313,11 @@ void IRAM_ATTR timer_sample_callback() {
 }
 
 static inline void create_8channel_sample_from_redis() {
-    // Read latest data from Redis-like store
-    if (!redis_store.local_valid || !redis_store.remote_valid) {
+    int32_t local_lc[4];
+    int32_t remote_lc[4];
+    
+    // Try to get next unique sample from Redis queues
+    if (!get_next_redis_sample(local_lc, remote_lc)) {
         return; // Skip if we don't have both data sources
     }
     
@@ -224,8 +333,8 @@ static inline void create_8channel_sample_from_redis() {
     // Add 8-channel sample to current batch
     if (current_sample_count < SAMPLES_PER_BLE_PACKET) {
         LoadCellSample* sample = &current_ble_packet.samples[current_sample_count];
-        memcpy(sample->local_lc, redis_store.local_lc, sizeof(sample->local_lc));
-        memcpy(sample->remote_lc, redis_store.remote_lc, sizeof(sample->remote_lc));
+        memcpy(sample->local_lc, local_lc, sizeof(sample->local_lc));
+        memcpy(sample->remote_lc, remote_lc, sizeof(sample->remote_lc));
         current_sample_count++;
     }
     
@@ -420,18 +529,25 @@ static void handle_serial_commands() {
             Serial.printf("  Timer samples: %lu\n", timer_samples_generated);
         } else if (command == "REDIS_STATUS") {
             Serial.printf("Redis Store Status:\n");
-            Serial.printf("  Local valid: %s, age: %lums\n", 
-                         redis_store.local_valid ? "YES" : "NO", 
-                         redis_store.local_valid ? (millis() - redis_store.local_timestamp) : 0);
-            Serial.printf("  Remote valid: %s, age: %lums\n", 
-                         redis_store.remote_valid ? "YES" : "NO", 
-                         redis_store.remote_valid ? (millis() - redis_store.remote_timestamp) : 0);
-            Serial.printf("  Local LC: [%ld, %ld, %ld, %ld]\n", 
-                         redis_store.local_lc[0], redis_store.local_lc[1], 
-                         redis_store.local_lc[2], redis_store.local_lc[3]);
-            Serial.printf("  Remote LC: [%ld, %ld, %ld, %ld]\n", 
-                         redis_store.remote_lc[0], redis_store.remote_lc[1], 
-                         redis_store.remote_lc[2], redis_store.remote_lc[3]);
+            Serial.printf("  Local queue: %d/%d samples (head=%d, tail=%d)\n", 
+                         redis_store.local_count, REDIS_QUEUE_SIZE,
+                         redis_store.local_head, redis_store.local_tail);
+            Serial.printf("  Remote queue: %d/%d samples (head=%d, tail=%d)\n", 
+                         redis_store.remote_count, REDIS_QUEUE_SIZE,
+                         redis_store.remote_head, redis_store.remote_tail);
+            Serial.printf("  Has data: Local=%s, Remote=%s\n", 
+                         redis_store.has_local_data ? "YES" : "NO",
+                         redis_store.has_remote_data ? "YES" : "NO");
+            if (redis_store.has_local_data) {
+                Serial.printf("  Last Local LC: [%ld, %ld, %ld, %ld]\n", 
+                             redis_store.last_local_lc[0], redis_store.last_local_lc[1], 
+                             redis_store.last_local_lc[2], redis_store.last_local_lc[3]);
+            }
+            if (redis_store.has_remote_data) {
+                Serial.printf("  Last Remote LC: [%ld, %ld, %ld, %ld]\n", 
+                             redis_store.last_remote_lc[0], redis_store.last_remote_lc[1], 
+                             redis_store.last_remote_lc[2], redis_store.last_remote_lc[3]);
+            }
         }
     }
 }
@@ -518,11 +634,11 @@ void loop() {
                      uart_packet_rate, uart_kbps, local_samples_received, remote_samples_received);
         
         // Redis Data Store Status
-        uint32_t local_age = redis_store.local_valid ? (millis() - redis_store.local_timestamp) : 9999;
-        uint32_t remote_age = redis_store.remote_valid ? (millis() - redis_store.remote_timestamp) : 9999;
-        Serial.printf("REDIS: Local [%s, %lums old] | Remote [%s, %lums old]\n",
-                     redis_store.local_valid ? "VALID" : "INVALID", local_age,
-                     redis_store.remote_valid ? "VALID" : "INVALID", remote_age);
+        Serial.printf("REDIS: Local queue [%d samples] | Remote queue [%d samples]\n",
+                     redis_store.local_count, redis_store.remote_count);
+        Serial.printf("       Has data: Local [%s] | Remote [%s]\n",
+                     redis_store.has_local_data ? "YES" : "NO",
+                     redis_store.has_remote_data ? "YES" : "NO");
         
         // Timer-Based Sampling Stats
         static unsigned long last_timer_interrupts = 0;
