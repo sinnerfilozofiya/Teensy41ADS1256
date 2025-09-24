@@ -62,6 +62,29 @@ struct __attribute__((packed)) CombinedSample {
 };
 
 // ============================================================================
+// UART FORWARDING CONFIGURATION
+// ============================================================================
+
+#define UART_BAUD_RATE 921600   // Safe baud rate matching Serial console
+#define UART_TX_PIN 17          // GPIO17 for UART TX
+#define UART_RX_PIN 18          // GPIO18 for UART RX (not used but defined)
+
+// UART packet structure (24 bytes total)
+struct __attribute__((packed)) UartPacket {
+    uint8_t sync[2];        // 0xAA, 0x55
+    uint8_t type;           // 'L' = local, 'R' = remote, 'C' = combined
+    uint16_t frame_idx;     // Frame index
+    uint8_t sample_idx;     // Sample index within frame
+    int32_t lc[4];          // Load cell values
+    uint16_t crc16;         // CRC16 of packet (excluding sync and crc)
+};
+
+// UART statistics
+static unsigned long uart_packets_sent = 0;
+static unsigned long uart_bytes_sent = 0;
+static unsigned long uart_send_errors = 0;
+
+// ============================================================================
 // LATEST DATA SYNCHRONIZATION
 // ============================================================================
 
@@ -78,6 +101,49 @@ static LatestData latest_remote = {0};
 // SPI buffers
 static uint8_t spi_rxbuf[QUEUED_XFERS][FRAME_BYTES] __attribute__((aligned(4)));
 static spi_slave_transaction_t spi_trx[QUEUED_XFERS];
+
+// ============================================================================
+// UART FORWARDING FUNCTIONS
+// ============================================================================
+
+static inline uint16_t calculate_uart_crc(const UartPacket* packet) {
+    // CRC of everything except sync bytes and crc field
+    const uint8_t* data = (const uint8_t*)packet + 2; // Skip sync bytes
+    uint32_t length = sizeof(UartPacket) - 4; // Exclude sync and crc
+    return crc16_ccitt_false(data, length);
+}
+
+static inline bool send_uart_packet(uint8_t type, uint16_t frame_idx, uint8_t sample_idx,
+                                   int32_t lc1, int32_t lc2, int32_t lc3, int32_t lc4) {
+    UartPacket packet;
+    packet.sync[0] = 0xAA;
+    packet.sync[1] = 0x55;
+    packet.type = type;
+    packet.frame_idx = frame_idx;
+    packet.sample_idx = sample_idx;
+    packet.lc[0] = lc1;
+    packet.lc[1] = lc2;
+    packet.lc[2] = lc3;
+    packet.lc[3] = lc4;
+    packet.crc16 = calculate_uart_crc(&packet);
+    
+    size_t bytes_written = Serial2.write((uint8_t*)&packet, sizeof(packet));
+    
+    if (bytes_written == sizeof(packet)) {
+        uart_packets_sent++;
+        uart_bytes_sent += bytes_written;
+        return true;
+    } else {
+        uart_send_errors++;
+        return false;
+    }
+}
+
+static inline void forward_sample_to_uart(char type, uint16_t frame_idx, uint8_t sample_idx,
+                                         int32_t lc1, int32_t lc2, int32_t lc3, int32_t lc4) {
+    // Send only individual sample - Redis-like system on slave handles combining
+    send_uart_packet(type, frame_idx, sample_idx, lc1, lc2, lc3, lc4);
+}
 
 // ============================================================================
 // ULTRA-FAST DATA PROCESSING
@@ -114,7 +180,7 @@ static unsigned long remote_frames_count = 0;
 
 static inline void count_sample(char type, uint16_t frame_idx, uint8_t sample_idx,
                                int32_t lc1, int32_t lc2, int32_t lc3, int32_t lc4) {
-    // Just count samples for statistics - no serial output
+    // Count samples for statistics and forward to UART
     if (type == 'L') {
         local_samples_count++;
         if (sample_idx == 0) local_frames_count++;  // Count frames on first sample
@@ -129,6 +195,9 @@ static inline void count_sample(char type, uint16_t frame_idx, uint8_t sample_id
     if (latest_local.valid && latest_remote.valid) {
         combined_samples_count++;
     }
+    
+    // Forward sample to UART slave ESP32
+    forward_sample_to_uart(type, frame_idx, sample_idx, lc1, lc2, lc3, lc4);
 }
 
 static inline void process_frame_ultra_fast(const InnerFrame* frame, char type) {
@@ -196,6 +265,20 @@ static void spi_rx_task(void* param) {
 // ============================================================================
 
 static void espnow_rx_callback(const esp_now_recv_info *recv_info, const uint8_t *data, int len) {
+    static unsigned long last_debug_time = 0;
+    static unsigned long debug_packet_count = 0;
+    
+    debug_packet_count++;
+    
+    // Debug output every 5 seconds
+    unsigned long now = millis();
+    if (now - last_debug_time >= 5000) {
+        Serial.printf("ESP-NOW: Received %lu packets in last 5s, len=%d, expected=%d\n", 
+                     debug_packet_count, len, INNER_FRAME_SIZE);
+        debug_packet_count = 0;
+        last_debug_time = now;
+    }
+    
     if (!output_remote_data || len != INNER_FRAME_SIZE) return;
     
     const InnerFrame* frame = (const InnerFrame*)data;
@@ -212,12 +295,20 @@ static void espnow_init() {
 #if USE_CUSTOM_MAC
     WiFi.mode(WIFI_STA);
     esp_wifi_set_mac(WIFI_IF_STA, (uint8_t*)CUSTOM_STA_MAC_DUAL);
+    Serial.printf("Custom MAC set: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  CUSTOM_STA_MAC_DUAL[0], CUSTOM_STA_MAC_DUAL[1], CUSTOM_STA_MAC_DUAL[2],
+                  CUSTOM_STA_MAC_DUAL[3], CUSTOM_STA_MAC_DUAL[4], CUSTOM_STA_MAC_DUAL[5]);
 #endif
     
     WiFi.mode(WIFI_STA);
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    Serial.printf("WiFi channel set to: %d\n", ESPNOW_CHANNEL);
     
-    if (esp_now_init() != ESP_OK) return;
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW init failed!");
+        return;
+    }
+    Serial.println("ESP-NOW initialized successfully");
     
     esp_now_register_recv_cb(espnow_rx_callback);
     
@@ -226,7 +317,13 @@ static void espnow_init() {
     peer_info.channel = ESPNOW_CHANNEL;
     peer_info.encrypt = false;
     
-    esp_now_add_peer(&peer_info);
+    if (esp_now_add_peer(&peer_info) == ESP_OK) {
+        Serial.printf("ESP-NOW peer added: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                      ESPNOW_PEER_MAC[0], ESPNOW_PEER_MAC[1], ESPNOW_PEER_MAC[2],
+                      ESPNOW_PEER_MAC[3], ESPNOW_PEER_MAC[4], ESPNOW_PEER_MAC[5]);
+    } else {
+        Serial.println("Failed to add ESP-NOW peer!");
+    }
 }
 
 static void handle_serial_commands() {
@@ -250,6 +347,45 @@ static void handle_serial_commands() {
             current_output_mode = MODE_COMBINED_TEXT;
         } else if (command == "MODE_COMBINED_BIN") {
             current_output_mode = MODE_COMBINED_BINARY;
+        } else if (command == "UART_STATS") {
+            Serial.printf("UART Stats: Packets=%lu, Bytes=%lu, Errors=%lu, Buffer=%d\n",
+                         uart_packets_sent, uart_bytes_sent, uart_send_errors, Serial2.availableForWrite());
+        } else if (command == "UART_RESET") {
+            uart_packets_sent = 0;
+            uart_bytes_sent = 0;
+            uart_send_errors = 0;
+            Serial.println("UART statistics reset");
+        } else if (command == "UART_TEST") {
+            // Send a test packet
+            UartPacket test_packet;
+            test_packet.sync[0] = 0xAA;
+            test_packet.sync[1] = 0x55;
+            test_packet.type = 'T';  // Test packet
+            test_packet.frame_idx = 12345;
+            test_packet.sample_idx = 99;
+            test_packet.lc[0] = 1000;
+            test_packet.lc[1] = 2000;
+            test_packet.lc[2] = 3000;
+            test_packet.lc[3] = 4000;
+            test_packet.crc16 = calculate_uart_crc(&test_packet);
+            
+            size_t bytes_sent = Serial2.write((uint8_t*)&test_packet, sizeof(test_packet));
+            Serial.printf("UART Test: Sent %d bytes (expected %d)\n", bytes_sent, sizeof(test_packet));
+        } else if (command == "UART_LOOPBACK") {
+            // Test UART loopback (connect TX to RX on same ESP32)
+            Serial.println("UART Loopback test - connect GPIO17 to GPIO16 temporarily");
+            
+            // Send test data
+            Serial2.write("HELLO");
+            delay(10);
+            
+            // Try to read it back
+            if (Serial2.available()) {
+                String received = Serial2.readString();
+                Serial.printf("Loopback received: '%s'\n", received.c_str());
+            } else {
+                Serial.println("Loopback failed - no data received");
+            }
         }
     }
 }
@@ -261,6 +397,28 @@ static void handle_serial_commands() {
 void setup() {
     Serial.begin(921600);   // Safer baud rate to prevent USB driver issues
     delay(50);
+    
+    // Initialize UART2 for forwarding data to slave ESP32
+    Serial2.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+    Serial2.setTxBufferSize(8192);  // Increase TX buffer for high throughput
+    Serial.printf("UART2 initialized at %d bps on TX pin %d\n", UART_BAUD_RATE, UART_TX_PIN);
+    
+    // Send a startup test packet
+    delay(1000);  // Wait for slave to initialize
+    UartPacket startup_packet;
+    startup_packet.sync[0] = 0xAA;
+    startup_packet.sync[1] = 0x55;
+    startup_packet.type = 'S';  // Startup packet
+    startup_packet.frame_idx = 0;
+    startup_packet.sample_idx = 0;
+    startup_packet.lc[0] = 11111;
+    startup_packet.lc[1] = 22222;
+    startup_packet.lc[2] = 33333;
+    startup_packet.lc[3] = 44444;
+    startup_packet.crc16 = calculate_uart_crc(&startup_packet);
+    
+    size_t bytes_sent = Serial2.write((uint8_t*)&startup_packet, sizeof(startup_packet));
+    Serial.printf("Startup UART test: Sent %d bytes\n", bytes_sent);
     
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
@@ -301,6 +459,8 @@ void loop() {
     static unsigned long last_local_count = 0;
     static unsigned long last_remote_count = 0;
     static unsigned long last_combined_count = 0;
+    static unsigned long last_uart_packets = 0;
+    static unsigned long last_uart_bytes = 0;
     
     unsigned long now = millis();
     
@@ -309,6 +469,9 @@ void loop() {
         unsigned long local_rate = (local_samples_count - last_local_count) / 5;
         unsigned long remote_rate = (remote_samples_count - last_remote_count) / 5;
         unsigned long combined_rate = (combined_samples_count - last_combined_count) / 5;
+        unsigned long uart_packet_rate = (uart_packets_sent - last_uart_packets) / 5;
+        unsigned long uart_byte_rate = (uart_bytes_sent - last_uart_bytes) / 5;
+        unsigned long uart_kbps = (uart_byte_rate * 8) / 1000;  // Kbps
         
         Serial.printf("STATS: T=%lu.%lus | LOCAL: %lu sps (%lu total) | REMOTE: %lu sps (%lu total) | COMBINED: %lu sps (%lu total) | FRAMES: L=%lu R=%lu\n",
                      now / 1000, (now % 1000) / 100,
@@ -317,10 +480,17 @@ void loop() {
                      combined_rate, combined_samples_count,
                      local_frames_count, remote_frames_count);
         
+        Serial.printf("UART: %lu pps (%lu total) | %lu Bps (%lu kbps) | Errors: %lu | Buffer: %d bytes free\n",
+                     uart_packet_rate, uart_packets_sent,
+                     uart_byte_rate, uart_kbps,
+                     uart_send_errors, Serial2.availableForWrite());
+        
         last_stats_time = now;
         last_local_count = local_samples_count;
         last_remote_count = remote_samples_count;
         last_combined_count = combined_samples_count;
+        last_uart_packets = uart_packets_sent;
+        last_uart_bytes = uart_bytes_sent;
     }
     
     handle_serial_commands();
