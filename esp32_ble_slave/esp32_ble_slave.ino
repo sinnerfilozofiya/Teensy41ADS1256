@@ -201,6 +201,14 @@ class MyServerCallbacks: public BLEServerCallbacks {
 static inline void add_to_redis_queue(uint8_t type, const int32_t* lc, uint16_t frame_idx, uint8_t sample_idx) {
     uint32_t now = millis();
     
+    // Debug: Print first few samples to check for duplicates
+    static int debug_count = 0;
+    if (debug_count < 10) {
+        Serial.printf("DEBUG %c: [%ld, %ld, %ld, %ld] frame=%d sample=%d\n", 
+                     type, lc[0], lc[1], lc[2], lc[3], frame_idx, sample_idx);
+        debug_count++;
+    }
+    
     if (type == 'L') {
         // Add to local queue
         if (redis_store.local_count < REDIS_QUEUE_SIZE) {
@@ -547,6 +555,20 @@ static void handle_serial_commands() {
                 Serial.printf("  Last Remote LC: [%ld, %ld, %ld, %ld]\n", 
                              redis_store.last_remote_lc[0], redis_store.last_remote_lc[1], 
                              redis_store.last_remote_lc[2], redis_store.last_remote_lc[3]);
+            }
+        } else if (command == "DEBUG_QUEUE") {
+            Serial.printf("Debug Queue Contents:\n");
+            if (redis_store.local_count > 0) {
+                SampleData* sample = &redis_store.local_queue[redis_store.local_head];
+                Serial.printf("  Next Local: [%ld, %ld, %ld, %ld] frame=%d sample=%d\n",
+                             sample->lc[0], sample->lc[1], sample->lc[2], sample->lc[3],
+                             sample->frame_idx, sample->sample_idx);
+            }
+            if (redis_store.remote_count > 0) {
+                SampleData* sample = &redis_store.remote_queue[redis_store.remote_head];
+                Serial.printf("  Next Remote: [%ld, %ld, %ld, %ld] frame=%d sample=%d\n",
+                             sample->lc[0], sample->lc[1], sample->lc[2], sample->lc[3],
+                             sample->frame_idx, sample->sample_idx);
             }
         }
     }

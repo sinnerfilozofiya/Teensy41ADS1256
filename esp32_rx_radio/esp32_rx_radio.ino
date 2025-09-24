@@ -115,6 +115,14 @@ static inline uint16_t calculate_uart_crc(const UartPacket* packet) {
 
 static inline bool send_uart_packet(uint8_t type, uint16_t frame_idx, uint8_t sample_idx,
                                    int32_t lc1, int32_t lc2, int32_t lc3, int32_t lc4) {
+    // Debug: Print first few samples to check for duplicates
+    static int debug_count = 0;
+    if (debug_count < 10) {
+        Serial.printf("UART_TX %c: [%ld, %ld, %ld, %ld] frame=%d sample=%d\n", 
+                     type, lc1, lc2, lc3, lc4, frame_idx, sample_idx);
+        debug_count++;
+    }
+    
     UartPacket packet;
     packet.sync[0] = 0xAA;
     packet.sync[1] = 0x55;
@@ -205,20 +213,10 @@ static inline void process_frame_ultra_fast(const InnerFrame* frame, char type) 
     uint16_t frame_idx = frame->frame_idx;
     
     for (int sample = 0; sample < SAMPLES_PER_FRAME; sample++) {
-        const uint8_t* s = samples + (sample * 12);
+        int32_t lc1, lc2, lc3, lc4;
         
-        // Fastest possible unpack
-        int32_t lc1 = s[0] | (s[1] << 8) | (s[2] << 16);
-        if (lc1 & 0x800000) lc1 |= 0xFF000000;
-        
-        int32_t lc2 = s[3] | (s[4] << 8) | (s[5] << 16);
-        if (lc2 & 0x800000) lc2 |= 0xFF000000;
-        
-        int32_t lc3 = s[6] | (s[7] << 8) | (s[8] << 16);
-        if (lc3 & 0x800000) lc3 |= 0xFF000000;
-        
-        int32_t lc4 = s[9] | (s[10] << 8) | (s[11] << 16);
-        if (lc4 & 0x800000) lc4 |= 0xFF000000;
+        // Use the tested unpacking function from common_frame.h
+        extract_load_cell_sample(samples, sample, &lc1, &lc2, &lc3, &lc4);
         
         count_sample(type, frame_idx, sample, lc1, lc2, lc3, lc4);
     }
@@ -386,6 +384,10 @@ static void handle_serial_commands() {
             } else {
                 Serial.println("Loopback failed - no data received");
             }
+        } else if (command == "RAW_HEX") {
+            Serial.println("Will show raw hex data from next frame...");
+            // Set a flag to show raw hex data
+            static bool show_raw_hex = true;
         }
     }
 }
