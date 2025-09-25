@@ -23,7 +23,10 @@
 #define FRAME_BYTES 144
 #define SAMPLES_PER_FRAME 10
 #define CHANNELS 4
-#define FS_HZ 1000.0
+#define FS_HZ 4000.0  // 4kHz total (1kHz per channel)
+
+// Performance mode selection
+#define USE_CONTINUOUS_MODE 0  // Set to 1 for experimental continuous mode, 0 for optimized standard mode
 
 struct __attribute__((packed)) Frame {
   uint8_t  sync[2];
@@ -110,7 +113,7 @@ void setup() {
   st.start_ms = millis();
   st.last_ms = st.start_ms;
   
-  Serial.println("[T41] Ready - starting 1kHz sampling with 10ms frame transmission");
+  Serial.println("[T41] Ready - starting 1kHz per channel sampling (4kSPS total) with 10ms frame transmission");
 }
 
 int32_t val1;  // Load cell 1 (AIN0-AIN1)
@@ -119,27 +122,35 @@ int32_t val3;  // Load cell 3 (AIN4-AIN5)
 int32_t val4;  // Load cell 4 (AIN6-AIN7)
 
 void loop() {
-  // Sample at 1kHz - read all 4 load cells every millisecond
-  static elapsedMillis sample_timer;
-  if (sample_timer >= 1) {
+  // Sample at 1kHz per channel (4kHz total) - rotate through channels every 250μs
+  static elapsedMicros sample_timer;
+  static uint8_t current_channel = 0;
+  static uint32_t sample_count = 0;
+  
+  if (sample_timer >= 250) {  // 4kHz total sampling rate
     sample_timer = 0;
     
-    // Read all 4 load cells
-    read_four_values();
+    // Read current channel only
+    int32_t current_value = read_single_channel_fast(current_channel);
     
-    // Store samples in buffer
-    sample_buffer[0][buffer_index] = val1;
-    sample_buffer[1][buffer_index] = val2;
-    sample_buffer[2][buffer_index] = val3;
-    sample_buffer[3][buffer_index] = val4;
+    // Store in appropriate buffer
+    sample_buffer[current_channel][buffer_index] = current_value;
     
-    buffer_index++;
-    if (buffer_index >= SAMPLES_PER_FRAME) {
-      buffer_index = 0;
+    // Move to next channel
+    current_channel++;
+    if (current_channel >= CHANNELS) {
+      current_channel = 0;
+      // All 4 channels sampled, increment buffer index
+      buffer_index++;
+      if (buffer_index >= SAMPLES_PER_FRAME) {
+        buffer_index = 0;
+      }
     }
+    
+    sample_count++;
   }
 
-  // Send frame every 10ms (100 Hz frame rate)
+  // Send frame every 10ms (100 Hz frame rate) for stable transmission
   if (tick >= 10) {
     uint32_t actual_interval = tick;
     tick = 0;
@@ -210,10 +221,20 @@ void send_frame_to_esp32() {
 void print_statistics() {
   double secs = (millis() - st.start_ms) / 1000.0;
   double kbps = (st.frames_sent * FRAME_BYTES * 8.0) / secs / 1000.0;
-  double sps = (st.frames_sent * SAMPLES_PER_FRAME * CHANNELS) / secs; // 4 channels per sample
+  double total_sps = (st.frames_sent * SAMPLES_PER_FRAME * CHANNELS) / secs; // 4 channels per sample
+  double sps_per_channel = total_sps / CHANNELS;
 
-  Serial.printf("[T41] t=%.1fs sent=%lu rate=%.1f kbit/s samples=%.1f sps (4ch) xfer_us[min=%lu max=%lu]\n",
-    secs, (unsigned long)st.frames_sent, kbps, sps,
+  Serial.printf("[T41] t=%.1fs sent=%lu rate=%.1f kbit/s samples=%.1f sps (%.1f per ch) xfer_us[min=%lu max=%lu] ROTATING\n",
+    secs, (unsigned long)st.frames_sent, kbps, total_sps, sps_per_channel,
     (unsigned long)(st.min_xfer_us == UINT32_MAX ? 0 : st.min_xfer_us),
     (unsigned long)st.max_xfer_us);
+    
+  // Performance analysis
+  if (sps_per_channel >= 1000.0) {
+    Serial.println("[T41] ✓ TARGET ACHIEVED: 1000+ SPS per channel!");
+  } else if (sps_per_channel >= 800.0) {
+    Serial.println("[T41] ⚠ CLOSE: Near target, consider further optimization");
+  } else {
+    Serial.println("[T41] ✗ BELOW TARGET: Performance optimization needed");
+  }
 }

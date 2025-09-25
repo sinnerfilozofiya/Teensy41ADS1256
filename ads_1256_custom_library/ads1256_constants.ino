@@ -1,8 +1,8 @@
 //using the definitions in this library: https://github.com/Flydroid/ADS12xx-Library
 
 // SPI speed - ADS1256 supports up to 1.92MHz (datasheet)
-// Teensy 4.1 can handle this easily, keeping conservative 2.5MHz
-#define SPI_SPEED 2500000
+// Using maximum supported speed for optimal performance
+#define SPI_SPEED 1920000
 
 
 /* For information to the register and settings see manual page (p..) */

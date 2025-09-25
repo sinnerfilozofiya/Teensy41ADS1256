@@ -39,8 +39,8 @@ void initADS() {
   //you need to adjust the constants for the other ones according to datasheet pg 31 if you need other values
   SetRegisterValue(ADCON, PGA_64); //set the adcon register
 
-  //next set the data rate
-  SetRegisterValue(DRATE, DR_30000); //set the drate register
+  //next set the data rate to maximum for best performance
+  SetRegisterValue(DRATE, DR_30000); //set the drate register to 30kSPS
 
   //we're going to ignore the GPIO for now...
 
@@ -384,47 +384,234 @@ int32_t read_single_channel(uint8_t mux_setting) {
   return adc_val;
 }
 
+// Alternative ultra-fast continuous mode function (experimental)
+void read_four_values_continuous() {
+  static bool continuous_mode_active = false;
+  static uint8_t current_channel = 0;
+  
+  if (!continuous_mode_active) {
+    // Initialize continuous mode
+    waitforDRDY();
+    SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+    digitalWriteFast(ADS_CS_PIN, LOW);
+    SPI.transfer(RDATAC); // Start continuous read mode
+    digitalWriteFast(ADS_CS_PIN, HIGH);
+    SPI.endTransaction();
+    continuous_mode_active = true;
+    current_channel = 0;
+  }
+  
+  int32_t values[4];
+  
+  // Read 4 channels in continuous mode with channel switching
+  for (int ch = 0; ch < 4; ch++) {
+    waitforDRDY();
+    
+    SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+    digitalWriteFast(ADS_CS_PIN, LOW);
+    
+    // In continuous mode, data is automatically available
+    int32_t adc_val = 0;
+    adc_val |= SPI.transfer(NOP);
+    adc_val <<= 8;
+    adc_val |= SPI.transfer(NOP);
+    adc_val <<= 8;
+    adc_val |= SPI.transfer(NOP);
+    
+    digitalWriteFast(ADS_CS_PIN, HIGH);
+    SPI.endTransaction();
+    
+    values[ch] = (adc_val > 0x7FFFFF) ? adc_val - 0x1000000 : adc_val;
+    
+    // Switch to next channel
+    if (ch < 3) {
+      waitforDRDY();
+      SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+      digitalWriteFast(ADS_CS_PIN, LOW);
+      SPI.transfer(SDATAC); // Stop continuous mode temporarily
+      SPI.transfer(WREG | MUX);
+      SPI.transfer(0x00);
+      const uint8_t channels[4] = {0x01, 0x23, 0x45, 0x67};
+      SPI.transfer(channels[ch + 1]);
+      SPI.transfer(SYNC);
+      SPI.transfer(RDATAC); // Restart continuous mode
+      digitalWriteFast(ADS_CS_PIN, HIGH);
+      SPI.endTransaction();
+    }
+  }
+  
+  // Reset to first channel for next cycle
+  waitforDRDY();
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+  digitalWriteFast(ADS_CS_PIN, LOW);
+  SPI.transfer(SDATAC);
+  SPI.transfer(WREG | MUX);
+  SPI.transfer(0x00);
+  SPI.transfer(0x01); // AIN0-AIN1
+  SPI.transfer(SYNC);
+  SPI.transfer(RDATAC);
+  digitalWriteFast(ADS_CS_PIN, HIGH);
+  SPI.endTransaction();
+  
+  val1 = values[0];
+  val2 = values[1];
+  val3 = values[2];
+  val4 = values[3];
+}
+
+// Fast single channel read function for rotating sampling
+int32_t read_single_channel_fast(uint8_t channel) {
+  const uint8_t channels[4] = {0x01, 0x23, 0x45, 0x67}; // AIN0-1, AIN2-3, AIN4-5, AIN6-7
+  int32_t adc_val = 0;
+  
+  waitforDRDY();
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+  digitalWriteFast(ADS_CS_PIN, LOW);
+  
+  // Set MUX to desired channel
+  SPI.transfer(WREG | MUX);
+  SPI.transfer(0x00);
+  SPI.transfer(channels[channel]);
+  delayMicroseconds(5); // Settling time for load cells
+  SPI.transfer(SYNC);
+  delayMicroseconds(5);
+  SPI.transfer(WAKEUP);
+  
+  digitalWriteFast(ADS_CS_PIN, HIGH);
+  SPI.endTransaction();
+  
+  // Wait for conversion and read
+  waitforDRDY();
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+  digitalWriteFast(ADS_CS_PIN, LOW);
+  
+  SPI.transfer(RDATA);
+  delayMicroseconds(7);
+  adc_val |= SPI.transfer(NOP);
+  adc_val <<= 8;
+  adc_val |= SPI.transfer(NOP);
+  adc_val <<= 8;
+  adc_val |= SPI.transfer(NOP);
+  
+  digitalWriteFast(ADS_CS_PIN, HIGH);
+  SPI.endTransaction();
+  
+  // Convert to signed
+  return (adc_val > 0x7FFFFF) ? adc_val - 0x1000000 : adc_val;
+}
+
+// Stable function for load cell readings with proper settling times (backup)
 void read_four_values() {
-  //datasheet page 21 at the bottom gives the timing
-  int32_t adc_val1 = 0;
-  int32_t adc_val2 = 0;
-  int32_t adc_val3 = 0;
-  int32_t adc_val4 = 0;
-
-  // Read Channel 0,1 (AIN0-AIN1)
-  adc_val1 = read_single_channel(MUX_RESET);  // 0x01 = AIN0-AIN1
+  int32_t adc_val1 = 0, adc_val2 = 0, adc_val3 = 0, adc_val4 = 0;
   
-  // Read Channel 2,3 (AIN2-AIN3)  
-  adc_val2 = read_single_channel(0x23);       // 0x23 = AIN2-AIN3
+  // Channel configurations for differential pairs
+  const uint8_t channels[4] = {0x01, 0x23, 0x45, 0x67}; // AIN0-1, AIN2-3, AIN4-5, AIN6-7
   
-  // Read Channel 4,5 (AIN4-AIN5)
-  adc_val3 = read_single_channel(0x45);       // 0x45 = AIN4-AIN5
+  // Read Channel 1 (AIN0-AIN1) - assume it's already set from previous cycle
+  waitforDRDY();
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+  digitalWriteFast(ADS_CS_PIN, LOW);
   
-  // Read Channel 6,7 (AIN6-AIN7)
-  adc_val4 = read_single_channel(0x67);       // 0x67 = AIN6-AIN7
-
+  SPI.transfer(RDATA);
+  delayMicroseconds(7);
+  adc_val1 |= SPI.transfer(NOP);
+  adc_val1 <<= 8;
+  adc_val1 |= SPI.transfer(NOP);
+  adc_val1 <<= 8;
+  adc_val1 |= SPI.transfer(NOP);
+  
+  // Set MUX to channel 2 (AIN2-AIN3)
+  SPI.transfer(WREG | MUX);
+  SPI.transfer(0x00);
+  SPI.transfer(channels[1]);
+  delayMicroseconds(5); // Proper settling time for load cells
+  SPI.transfer(SYNC);
+  delayMicroseconds(5);
+  SPI.transfer(WAKEUP);
+  
+  digitalWriteFast(ADS_CS_PIN, HIGH);
+  SPI.endTransaction();
+  
+  // Read Channel 2 (AIN2-AIN3)
+  waitforDRDY();
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+  digitalWriteFast(ADS_CS_PIN, LOW);
+  
+  SPI.transfer(RDATA);
+  delayMicroseconds(7);
+  adc_val2 |= SPI.transfer(NOP);
+  adc_val2 <<= 8;
+  adc_val2 |= SPI.transfer(NOP);
+  adc_val2 <<= 8;
+  adc_val2 |= SPI.transfer(NOP);
+  
+  // Set MUX to channel 3 (AIN4-AIN5)
+  SPI.transfer(WREG | MUX);
+  SPI.transfer(0x00);
+  SPI.transfer(channels[2]);
+  delayMicroseconds(5);
+  SPI.transfer(SYNC);
+  delayMicroseconds(5);
+  SPI.transfer(WAKEUP);
+  
+  digitalWriteFast(ADS_CS_PIN, HIGH);
+  SPI.endTransaction();
+  
+  // Read Channel 3 (AIN4-AIN5)
+  waitforDRDY();
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+  digitalWriteFast(ADS_CS_PIN, LOW);
+  
+  SPI.transfer(RDATA);
+  delayMicroseconds(7);
+  adc_val3 |= SPI.transfer(NOP);
+  adc_val3 <<= 8;
+  adc_val3 |= SPI.transfer(NOP);
+  adc_val3 <<= 8;
+  adc_val3 |= SPI.transfer(NOP);
+  
+  // Set MUX to channel 4 (AIN6-AIN7)
+  SPI.transfer(WREG | MUX);
+  SPI.transfer(0x00);
+  SPI.transfer(channels[3]);
+  delayMicroseconds(5);
+  SPI.transfer(SYNC);
+  delayMicroseconds(5);
+  SPI.transfer(WAKEUP);
+  
+  digitalWriteFast(ADS_CS_PIN, HIGH);
+  SPI.endTransaction();
+  
+  // Read Channel 4 (AIN6-AIN7)
+  waitforDRDY();
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
+  digitalWriteFast(ADS_CS_PIN, LOW);
+  
+  SPI.transfer(RDATA);
+  delayMicroseconds(7);
+  adc_val4 |= SPI.transfer(NOP);
+  adc_val4 <<= 8;
+  adc_val4 |= SPI.transfer(NOP);
+  adc_val4 <<= 8;
+  adc_val4 |= SPI.transfer(NOP);
+  
+  // Reset MUX back to channel 1 for next cycle
+  SPI.transfer(WREG | MUX);
+  SPI.transfer(0x00);
+  SPI.transfer(channels[0]);
+  delayMicroseconds(5);
+  SPI.transfer(SYNC);
+  delayMicroseconds(5);
+  SPI.transfer(WAKEUP);
+  
+  digitalWriteFast(ADS_CS_PIN, HIGH);
+  SPI.endTransaction();
+  
   // Convert to signed values (2's complement)
-  if (adc_val1 > 0x7fffff) { //if MSB == 1
-    adc_val1 = adc_val1 - 16777216; //do 2's complement, keep the sign this time!
-  }
-
-  if (adc_val2 > 0x7fffff) { //if MSB == 1
-    adc_val2 = adc_val2 - 16777216; //do 2's complement, keep the sign this time!
-  }
-
-  if (adc_val3 > 0x7fffff) { //if MSB == 1
-    adc_val3 = adc_val3 - 16777216; //do 2's complement, keep the sign this time!
-  }
-
-  if (adc_val4 > 0x7fffff) { //if MSB == 1
-    adc_val4 = adc_val4 - 16777216; //do 2's complement, keep the sign this time!
-  }
-
-  // Store results in global variables
-  val1 = adc_val1;
-  val2 = adc_val2;
-  val3 = adc_val3;
-  val4 = adc_val4;
+  val1 = (adc_val1 > 0x7FFFFF) ? adc_val1 - 0x1000000 : adc_val1;
+  val2 = (adc_val2 > 0x7FFFFF) ? adc_val2 - 0x1000000 : adc_val2;
+  val3 = (adc_val3 > 0x7FFFFF) ? adc_val3 - 0x1000000 : adc_val3;
+  val4 = (adc_val4 > 0x7FFFFF) ? adc_val4 - 0x1000000 : adc_val4;
 }
 
 
