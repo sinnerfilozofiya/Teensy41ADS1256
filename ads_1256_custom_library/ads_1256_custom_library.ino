@@ -1,5 +1,8 @@
 #include <SPI.h>
 
+// Include ADS1256 constants first
+// (These are defined in the ads1256_constants.ino tab)
+
 // ADS1256 pin definitions (SPI0)
 #define ADS_RST_PIN    8  //ADS1256 reset pin (same as Teensy 3.1)
 #define ADS_RDY_PIN    22 //ADS1256 data ready (same as Teensy 3.1) 
@@ -23,6 +26,25 @@
 // TX3 = Pin 34 (to ESP32 GPIO3)
 // RX3 = Pin 35 (from ESP32 GPIO2)
 
+// ============================================================================
+// DATA ACQUISITION STATE MANAGEMENT
+// ============================================================================
+
+enum AcquisitionState {
+  STATE_STOPPED = 0,      // Data acquisition stopped
+  STATE_STARTING = 1,     // Initializing/starting up
+  STATE_RUNNING = 2,      // Active data acquisition
+  STATE_STOPPING = 3,     // Gracefully stopping
+  STATE_ERROR = 4         // Error state
+};
+
+static AcquisitionState current_state = STATE_STOPPED;
+static bool state_changed = true;  // Flag to report state changes
+
+// ============================================================================
+// FORWARD DECLARATIONS AND GLOBAL VARIABLES
+// ============================================================================
+
 // Frame structure constants
 #define FRAME_BYTES 144
 #define SAMPLES_PER_FRAME 10
@@ -43,7 +65,6 @@ struct __attribute__((packed)) Frame {
 };
 static Frame tx;
 
-
 //put the ADC constants here
 double resolution = 8388608.; //2^23-1
 //this needs to match the setting in the ADC init function in the library tab
@@ -51,6 +72,201 @@ double Gain = 64.; //be sure to have a period
 double vRef = 5.0; //reference voltage
 //we'll calculate this in setup
 double bitToVolt = 0.;
+
+// Statistics structure
+struct Stats {
+  uint32_t start_ms=0, last_ms=0;
+  uint32_t frames_sent=0;
+  uint32_t min_xfer_us=UINT32_MAX, max_xfer_us=0;
+} st;
+
+// Sample buffer for 4 channels
+int32_t sample_buffer[CHANNELS][SAMPLES_PER_FRAME];
+uint8_t buffer_index = 0;
+elapsedMillis tick;
+uint16_t frame_idx = 0;
+
+// Load cell values
+int32_t val1;  // Load cell 1 (AIN0-AIN1)
+int32_t val2;  // Load cell 2 (AIN2-AIN3)
+int32_t val3;  // Load cell 3 (AIN4-AIN5)
+int32_t val4;  // Load cell 4 (AIN6-AIN7)
+
+// Forward declarations for functions in other tabs
+void initADS();
+void SendCMD(uint8_t cmd);
+int32_t read_single_channel_fast(uint8_t channel);
+
+// ADS1256 constants (in case they're not loaded yet from constants tab)
+#ifndef SELFCAL
+#define SELFCAL 0xF0  // Self Offset Calibration
+#endif
+
+// ============================================================================
+// COMMAND INTERFACE FUNCTIONS
+// ============================================================================
+
+void send_status_response(const char* command, const char* status) {
+  Serial3.printf("RESP:%s:%s\n", command, status);
+  Serial3.flush();
+}
+
+void send_state_update() {
+  const char* state_names[] = {"STOPPED", "STARTING", "RUNNING", "STOPPING", "ERROR"};
+  Serial3.printf("STATE:%s\n", state_names[current_state]);
+  Serial3.flush();
+  state_changed = false;
+}
+
+bool start_data_acquisition() {
+  if (current_state == STATE_RUNNING) {
+    return true; // Already running
+  }
+  
+  current_state = STATE_STARTING;
+  state_changed = true;
+  
+  Serial.println("[T41] Starting data acquisition...");
+  
+  // Reset frame index and statistics
+  frame_idx = 0;
+  st.start_ms = millis();
+  st.last_ms = st.start_ms;
+  st.frames_sent = 0;
+  st.min_xfer_us = UINT32_MAX;
+  st.max_xfer_us = 0;
+  
+  // Clear sample buffer
+  memset(sample_buffer, 0, sizeof(sample_buffer));
+  buffer_index = 0;
+  
+  // Reset timing
+  tick = 0;
+  
+  current_state = STATE_RUNNING;
+  state_changed = true;
+  
+  Serial.println("[T41] Data acquisition started successfully");
+  return true;
+}
+
+bool stop_data_acquisition() {
+  if (current_state == STATE_STOPPED) {
+    return true; // Already stopped
+  }
+  
+  current_state = STATE_STOPPING;
+  state_changed = true;
+  
+  Serial.println("[T41] Stopping data acquisition...");
+  
+  // Allow current operations to complete gracefully
+  delay(50);
+  
+  current_state = STATE_STOPPED;
+  state_changed = true;
+  
+  Serial.println("[T41] Data acquisition stopped");
+  return true;
+}
+
+bool restart_data_acquisition() {
+  Serial.println("[T41] Restarting data acquisition...");
+  
+  if (!stop_data_acquisition()) {
+    return false;
+  }
+  
+  delay(100); // Brief pause between stop and start
+  
+  return start_data_acquisition();
+}
+
+void handle_esp32_commands() {
+  if (Serial3.available()) {
+    String command = Serial3.readStringUntil('\n');
+    command.trim();
+    command.toUpperCase();
+    
+    Serial.printf("[T41] ESP32 Command: %s\n", command.c_str());
+    
+    if (command == "START") {
+      if (start_data_acquisition()) {
+        send_status_response("START", "OK");
+      } else {
+        send_status_response("START", "ERROR");
+      }
+    }
+    else if (command == "STOP") {
+      if (stop_data_acquisition()) {
+        send_status_response("STOP", "OK");
+      } else {
+        send_status_response("STOP", "ERROR");
+      }
+    }
+    else if (command == "RESTART") {
+      if (restart_data_acquisition()) {
+        send_status_response("RESTART", "OK");
+      } else {
+        send_status_response("RESTART", "ERROR");
+      }
+    }
+    else if (command == "RESET") {
+      send_status_response("RESET", "OK");
+      delay(500);
+      // Software reset
+      SCB_AIRCR = 0x05FA0004; // Teensy software reset
+    }
+    else {
+      send_status_response(command.c_str(), "ERROR");
+    }
+  }
+}
+
+void handle_serial_monitor_commands() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toUpperCase();
+    
+    Serial.printf("[T41] Serial Command: %s\n", command.c_str());
+    
+    if (command == "START") {
+      if (start_data_acquisition()) {
+        Serial.println("[T41] ✓ Data acquisition started");
+      } else {
+        Serial.println("[T41] ✗ Failed to start");
+      }
+    }
+    else if (command == "STOP") {
+      if (stop_data_acquisition()) {
+        Serial.println("[T41] ✓ Data acquisition stopped");
+      } else {
+        Serial.println("[T41] ✗ Failed to stop");
+      }
+    }
+    else if (command == "RESTART") {
+      if (restart_data_acquisition()) {
+        Serial.println("[T41] ✓ Data acquisition restarted");
+      } else {
+        Serial.println("[T41] ✗ Failed to restart");
+      }
+    }
+    else if (command == "RESET") {
+      Serial.println("[T41] Resetting in 1 second...");
+      delay(1000);
+      SCB_AIRCR = 0x05FA0004; // Teensy software reset
+    }
+    else if (command == "") {
+      // Empty command, do nothing
+    }
+    else {
+      Serial.printf("[T41] ✗ Unknown command: '%s'\n", command.c_str());
+      Serial.println("[T41] Available: START, STOP, RESTART, RESET");
+    }
+  }
+}
+
 
 // CRC16 function (CCITT-FALSE)
 static inline uint16_t crc16_ccitt_false(const uint8_t* d, uint32_t n) {
@@ -71,19 +287,6 @@ static inline void pack_int24_le(uint8_t* p, int32_t v) {
   p[1] = (uint8_t)((u >> 8) & 0xFF);
   p[2] = (uint8_t)((u >> 16) & 0xFF);
 }
-
-// Statistics structure
-struct Stats {
-  uint32_t start_ms=0, last_ms=0;
-  uint32_t frames_sent=0;
-  uint32_t min_xfer_us=UINT32_MAX, max_xfer_us=0;
-} st;
-
-// Sample buffer for 4 channels
-int32_t sample_buffer[CHANNELS][SAMPLES_PER_FRAME];
-uint8_t buffer_index = 0;
-elapsedMillis tick;
-uint16_t frame_idx = 0;
 
 void setup() {
   delay(1000);
@@ -114,6 +317,10 @@ void setup() {
   // Initialize sample buffer
   memset(sample_buffer, 0, sizeof(sample_buffer));
   
+  // Initialize in STOPPED state - wait for ESP32 commands
+  current_state = STATE_STOPPED;
+  state_changed = true;
+  
   //determine the conversion factor
   bitToVolt = resolution*Gain/vRef;
   
@@ -121,62 +328,79 @@ void setup() {
   st.start_ms = millis();
   st.last_ms = st.start_ms;
   
-  Serial.println("[T41] Ready - starting 1kHz per channel sampling (4kSPS total) with 10ms frame transmission");
+  Serial.println("[T41] Ready - waiting for commands");
+  Serial.println("[T41] Available commands: START, STOP, RESTART, RESET");
+  Serial.println("[T41] ==========================================");
+  
+  // Send initial state to ESP32
+  send_state_update();
 }
 
-int32_t val1;  // Load cell 1 (AIN0-AIN1)
-int32_t val2;  // Load cell 2 (AIN2-AIN3)
-int32_t val3;  // Load cell 3 (AIN4-AIN5)
-int32_t val4;  // Load cell 4 (AIN6-AIN7)
-
 void loop() {
-  // Sample at 1kHz per channel (4kHz total) - rotate through channels every 250μs
-  static elapsedMicros sample_timer;
-  static uint8_t current_channel = 0;
-  static uint32_t sample_count = 0;
+  // Handle ESP32 commands first
+  handle_esp32_commands();
   
-  if (sample_timer >= 250) {  // 4kHz total sampling rate
-    sample_timer = 0;
+  // Handle Serial Monitor commands for testing
+  handle_serial_monitor_commands();
+  
+  // Send state updates when state changes
+  if (state_changed) {
+    send_state_update();
+  }
+  
+  // Only perform data acquisition if in RUNNING state
+  if (current_state == STATE_RUNNING) {
+    // Sample at 1kHz per channel (4kHz total) - rotate through channels every 250μs
+    static elapsedMicros sample_timer;
+    static uint8_t current_channel = 0;
+    static uint32_t sample_count = 0;
     
-    // Read current channel only
-    int32_t current_value = read_single_channel_fast(current_channel);
-    
-    // Store in appropriate buffer
-    sample_buffer[current_channel][buffer_index] = current_value;
-    
-    // Move to next channel
-    current_channel++;
-    if (current_channel >= CHANNELS) {
-      current_channel = 0;
-      // All 4 channels sampled, increment buffer index
-      buffer_index++;
-      if (buffer_index >= SAMPLES_PER_FRAME) {
-        buffer_index = 0;
+    if (sample_timer >= 250) {  // 4kHz total sampling rate
+      sample_timer = 0;
+      
+      // Read current channel only
+      int32_t current_value = read_single_channel_fast(current_channel);
+      
+      // Store in appropriate buffer
+      sample_buffer[current_channel][buffer_index] = current_value;
+      
+      // Move to next channel
+      current_channel++;
+      if (current_channel >= CHANNELS) {
+        current_channel = 0;
+        // All 4 channels sampled, increment buffer index
+        buffer_index++;
+        if (buffer_index >= SAMPLES_PER_FRAME) {
+          buffer_index = 0;
+        }
+      }
+      
+      sample_count++;
+    }
+
+    // Send frame every 10ms (100 Hz frame rate) for stable transmission
+    if (tick >= 10) {
+      uint32_t actual_interval = tick;
+      tick = 0;
+      send_frame_to_esp32();
+      
+      // Warn if timing is off by more than 1ms
+      if (actual_interval > 11 || actual_interval < 9) {
+        Serial.printf("[T41] WARNING: Frame interval %lums (expected 10ms)\n", actual_interval);
       }
     }
-    
-    sample_count++;
-  }
 
-  // Send frame every 10ms (100 Hz frame rate) for stable transmission
-  if (tick >= 10) {
-    uint32_t actual_interval = tick;
-    tick = 0;
-    send_frame_to_esp32();
-    
-    // Warn if timing is off by more than 1ms
-    if (actual_interval > 11 || actual_interval < 9) {
-      Serial.printf("[T41] WARNING: Frame interval %lums (expected 10ms)\n", actual_interval);
+    // Print statistics every 5 seconds (only when running)
+    uint32_t now_ms = millis();
+    if (now_ms - st.last_ms >= 5000) {
+      print_statistics();
+      st.last_ms = now_ms;
+      st.min_xfer_us = UINT32_MAX; 
+      st.max_xfer_us = 0; // reset window
     }
-  }
-
-  // Print statistics every 5 seconds
-  uint32_t now_ms = millis();
-  if (now_ms - st.last_ms >= 5000) {
-    print_statistics();
-    st.last_ms = now_ms;
-    st.min_xfer_us = UINT32_MAX; 
-    st.max_xfer_us = 0; // reset window
+  } else {
+    // When not running, just handle commands and small delay
+    delay(10);
   }
 }
 
