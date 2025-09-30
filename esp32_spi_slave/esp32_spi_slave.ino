@@ -422,34 +422,81 @@ void handle_serial_commands() {
   if (Serial.available()) {
     String command = Serial.readStringUntil('\n');
     command.trim();
+    command.toUpperCase();
     
-    if (command == "DEBUG_ON") {
+    Serial.printf("[SPI_SLAVE] Command received: %s\n", command.c_str());
+    
+    // Teensy control commands
+    if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET") {
+      Serial.printf("[SPI_SLAVE] Forwarding '%s' to Remote Teensy...\n", command.c_str());
+      Serial1.println(command);
+      Serial1.flush();
+      
+      // Wait for response from Teensy
+      unsigned long timeout = millis() + 2000; // 2 second timeout
+      while (millis() < timeout) {
+        if (Serial1.available()) {
+          String response = Serial1.readStringUntil('\n');
+          Serial.printf("[SPI_SLAVE] Teensy Response: %s\n", response.c_str());
+          break;
+        }
+        delay(10);
+      }
+      if (millis() >= timeout) {
+        Serial.println("[SPI_SLAVE] ⚠ Teensy response timeout");
+      }
+    }
+    // ESP32 control commands
+    else if (command == "DEBUG_ON") {
       output_raw_data = true;
-      Serial.println("[ESP] Raw data output ENABLED");
+      Serial.println("[SPI_SLAVE] ✓ Raw data output enabled");
     } else if (command == "DEBUG_OFF") {
       output_raw_data = false;
-      Serial.println("[ESP] Raw data output DISABLED");
+      Serial.println("[SPI_SLAVE] ✓ Raw data output disabled");
     } else if (command == "STATUS") {
-      Serial.printf("[TX] Status: frames_ok=%lu, net_sent=%lu, output_raw_data=%s\n", 
-                    (unsigned long)frames_ok, (unsigned long)net_sent_ok, 
-                    output_raw_data ? "ON" : "OFF");
+      Serial.printf("[SPI_SLAVE] === ESP32 SPI SLAVE STATUS ===\n");
+      Serial.printf("  Frames OK: %lu\n", (unsigned long)frames_ok);
+      Serial.printf("  Network sent: %lu\n", (unsigned long)net_sent_ok);
+      Serial.printf("  Raw data: %s\n", output_raw_data ? "ON" : "OFF");
 #if USE_WIFI_UDP
-      Serial.printf("[TX] WiFi: %s, IP: %s\n", 
-                    wifi_connected ? "Connected" : "Disconnected",
-                    WiFi.localIP().toString().c_str());
+      Serial.printf("  WiFi: %s\n", wifi_connected ? "Connected" : "Disconnected");
+      if (wifi_connected) {
+        Serial.printf("  IP: %s\n", WiFi.localIP().toString().c_str());
+      }
 #elif USE_ESPNOW
-      Serial.printf("[TX] ESP-NOW: %s, Channel: %d\n",
-                    espnow_initialized ? "Initialized" : "Not initialized",
-                    ESPNOW_CHANNEL);
+      Serial.printf("  ESP-NOW: %s\n", espnow_initialized ? "Initialized" : "Not initialized");
+      Serial.printf("  Channel: %d\n", ESPNOW_CHANNEL);
 #endif
+      Serial.printf("  Free heap: %lu bytes\n", ESP.getFreeHeap());
+      Serial.println("========================================");
     } else if (command == "NET") {
-      Serial.printf("[TX] Network stats: sent_ok=%lu, send_fail=%lu, queue_drops=%lu\n",
-                    (unsigned long)net_sent_ok, (unsigned long)net_send_fail, 
-                    (unsigned long)net_queue_drops);
+      Serial.printf("[SPI_SLAVE] === NETWORK STATISTICS ===\n");
+      Serial.printf("  Sent OK: %lu\n", (unsigned long)net_sent_ok);
+      Serial.printf("  Send fail: %lu\n", (unsigned long)net_send_fail);
+      Serial.printf("  Queue drops: %lu\n", (unsigned long)net_queue_drops);
 #if USE_ESPNOW
-      Serial.printf("[TX] ESP-NOW: success=%lu, fail=%lu\n",
-                    (unsigned long)espnow_send_success, (unsigned long)espnow_send_fail);
+      Serial.printf("  ESP-NOW success: %lu\n", (unsigned long)espnow_send_success);
+      Serial.printf("  ESP-NOW fail: %lu\n", (unsigned long)espnow_send_fail);
 #endif
+      Serial.println("===================================");
+    } else if (command == "HELP") {
+      Serial.println("[SPI_SLAVE] === AVAILABLE COMMANDS ===");
+      Serial.println("  Teensy Control:");
+      Serial.println("    START       - Start Teensy data acquisition");
+      Serial.println("    STOP        - Stop Teensy data acquisition");
+      Serial.println("    RESTART     - Restart Teensy data acquisition");
+      Serial.println("    RESET       - Reset Teensy");
+      Serial.println("  ESP32 Control:");
+      Serial.println("    DEBUG_ON/OFF - Enable/disable raw data output");
+      Serial.println("    STATUS       - Show system status");
+      Serial.println("    NET          - Show network statistics");
+      Serial.println("    HELP         - Show this help");
+      Serial.println("======================================");
+    } else if (command == "") {
+      // Empty command, do nothing
+    } else {
+      Serial.printf("[SPI_SLAVE] ✗ Unknown command: '%s'\n", command.c_str());
+      Serial.println("[SPI_SLAVE] Type 'HELP' for available commands");
     }
   }
 }
@@ -514,7 +561,11 @@ void setup() {
   xTaskCreatePinnedToCore(stats_task,  "stats",  4096, NULL, 3, NULL, 1);
   
   Serial.println("[TX] All systems initialized - ready for Teensy data");
-  Serial.println("[TX] Commands: DEBUG_ON, DEBUG_OFF, STATUS, NET");
+  Serial.println("[SPI_SLAVE] ==========================================");
+  Serial.println("[SPI_SLAVE] ESP32 SPI Slave ready for commands");
+  Serial.println("[SPI_SLAVE] Teensy commands: START, STOP, RESTART, RESET");
+  Serial.println("[SPI_SLAVE] ESP32 commands: DEBUG_ON/OFF, STATUS, NET, HELP");
+  Serial.println("[SPI_SLAVE] ==========================================");
 }
 
 void loop() { 

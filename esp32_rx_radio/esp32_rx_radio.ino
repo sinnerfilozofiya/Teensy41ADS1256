@@ -337,66 +337,70 @@ static void handle_serial_commands() {
     if (Serial.available()) {
         String command = Serial.readStringUntil('\n');
         command.trim();
+        command.toUpperCase();
         
-        if (command == "LOCAL_ON") {
+        Serial.printf("[RX_RADIO] Command received: %s\n", command.c_str());
+        
+        // Teensy control commands
+        if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET") {
+            Serial.printf("[RX_RADIO] Forwarding '%s' to Local Teensy...\n", command.c_str());
+            Serial1.println(command);
+            Serial1.flush();
+            
+            // Wait for response from Teensy
+            unsigned long timeout = millis() + 2000; // 2 second timeout
+            while (millis() < timeout) {
+                if (Serial1.available()) {
+                    String response = Serial1.readStringUntil('\n');
+                    Serial.printf("[RX_RADIO] Teensy Response: %s\n", response.c_str());
+                    break;
+                }
+                delay(10);
+            }
+            if (millis() >= timeout) {
+                Serial.println("[RX_RADIO] ⚠ Teensy response timeout");
+            }
+        }
+        // ESP32 control commands
+        else if (command == "LOCAL_ON") {
             output_local_data = true;
+            Serial.println("[RX_RADIO] ✓ Local data output enabled");
         } else if (command == "LOCAL_OFF") {
             output_local_data = false;
+            Serial.println("[RX_RADIO] ✓ Local data output disabled");
         } else if (command == "REMOTE_ON") {
             output_remote_data = true;
+            Serial.println("[RX_RADIO] ✓ Remote data output enabled");
         } else if (command == "REMOTE_OFF") {
             output_remote_data = false;
-        } else if (command == "MODE_COMPACT") {
-            current_output_mode = MODE_COMPACT_TEXT;
-        } else if (command == "MODE_BINARY") {
-            current_output_mode = MODE_BINARY;
-        } else if (command == "MODE_COMBINED") {
-            current_output_mode = MODE_COMBINED_TEXT;
-        } else if (command == "MODE_COMBINED_BIN") {
-            current_output_mode = MODE_COMBINED_BINARY;
-        } else if (command == "UART_STATS") {
-            Serial.printf("UART Stats: Packets=%lu, Bytes=%lu, Errors=%lu, Buffer=%d\n",
-                         uart_packets_sent, uart_bytes_sent, uart_send_errors, Serial2.availableForWrite());
-        } else if (command == "UART_RESET") {
-            uart_packets_sent = 0;
-            uart_bytes_sent = 0;
-            uart_send_errors = 0;
-            Serial.println("UART statistics reset");
-        } else if (command == "UART_TEST") {
-            // Send a test packet
-            UartPacket test_packet;
-            test_packet.sync[0] = 0xAA;
-            test_packet.sync[1] = 0x55;
-            test_packet.type = 'T';  // Test packet
-            test_packet.frame_idx = 12345;
-            test_packet.sample_idx = 99;
-            test_packet.lc[0] = 1000;
-            test_packet.lc[1] = 2000;
-            test_packet.lc[2] = 3000;
-            test_packet.lc[3] = 4000;
-            test_packet.crc16 = calculate_uart_crc(&test_packet);
-            
-            size_t bytes_sent = Serial2.write((uint8_t*)&test_packet, sizeof(test_packet));
-            Serial.printf("UART Test: Sent %d bytes (expected %d)\n", bytes_sent, sizeof(test_packet));
-        } else if (command == "UART_LOOPBACK") {
-            // Test UART loopback (connect TX to RX on same ESP32)
-            Serial.println("UART Loopback test - connect GPIO17 to GPIO16 temporarily");
-            
-            // Send test data
-            Serial2.write("HELLO");
-            delay(10);
-            
-            // Try to read it back
-            if (Serial2.available()) {
-                String received = Serial2.readString();
-                Serial.printf("Loopback received: '%s'\n", received.c_str());
-            } else {
-                Serial.println("Loopback failed - no data received");
-            }
-        } else if (command == "RAW_HEX") {
-            Serial.println("Will show raw hex data from next frame...");
-            // Set a flag to show raw hex data
-            static bool show_raw_hex = true;
+            Serial.println("[RX_RADIO] ✓ Remote data output disabled");
+        } else if (command == "STATUS") {
+            Serial.printf("[RX_RADIO] === ESP32 RX RADIO STATUS ===\n");
+            Serial.printf("  Local data: %s\n", output_local_data ? "ON" : "OFF");
+            Serial.printf("  Remote data: %s\n", output_remote_data ? "ON" : "OFF");
+            Serial.printf("  Local samples: %lu\n", local_samples_count);
+            Serial.printf("  Remote samples: %lu\n", remote_samples_count);
+            Serial.printf("  UART packets: %lu\n", uart_packets_sent);
+            Serial.printf("  Free heap: %lu bytes\n", ESP.getFreeHeap());
+            Serial.println("=====================================");
+        } else if (command == "HELP") {
+            Serial.println("[RX_RADIO] === AVAILABLE COMMANDS ===");
+            Serial.println("  Teensy Control:");
+            Serial.println("    START    - Start Teensy data acquisition");
+            Serial.println("    STOP     - Stop Teensy data acquisition");
+            Serial.println("    RESTART  - Restart Teensy data acquisition");
+            Serial.println("    RESET    - Reset Teensy");
+            Serial.println("  ESP32 Control:");
+            Serial.println("    LOCAL_ON/OFF  - Enable/disable local data");
+            Serial.println("    REMOTE_ON/OFF - Enable/disable remote data");
+            Serial.println("    STATUS        - Show system status");
+            Serial.println("    HELP          - Show this help");
+            Serial.println("=====================================");
+        } else if (command == "") {
+            // Empty command, do nothing
+        } else {
+            Serial.printf("[RX_RADIO] ✗ Unknown command: '%s'\n", command.c_str());
+            Serial.println("[RX_RADIO] Type 'HELP' for available commands");
         }
     }
 }
@@ -468,6 +472,12 @@ void setup() {
     
     // Start high priority SPI task on Core 1 (max priority is 24)
     xTaskCreatePinnedToCore(spi_rx_task, "spi_rx", 4096, NULL, 24, NULL, 1);
+    
+    Serial.println("[RX_RADIO] ==========================================");
+    Serial.println("[RX_RADIO] ESP32 RX Radio ready for commands");
+    Serial.println("[RX_RADIO] Teensy commands: START, STOP, RESTART, RESET");
+    Serial.println("[RX_RADIO] ESP32 commands: LOCAL_ON/OFF, REMOTE_ON/OFF, STATUS, HELP");
+    Serial.println("[RX_RADIO] ==========================================");
 }
 
 void loop() {
