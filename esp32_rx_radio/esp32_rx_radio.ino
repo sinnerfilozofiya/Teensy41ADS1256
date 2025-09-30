@@ -406,15 +406,32 @@ static void espnow_init() {
 }
 
 static void handle_serial_commands() {
+    // Handle commands from USB Serial Monitor
     if (Serial.available()) {
         String command = Serial.readStringUntil('\n');
         command.trim();
         command.toUpperCase();
         
-        Serial.printf("[RX_RADIO] Command received: %s\n", command.c_str());
+        Serial.printf("[RX_RADIO] USB Command received: %s\n", command.c_str());
+        process_command(command);
+    }
+    
+    // Handle commands from ESP32 BLE Slave via UART2
+    if (Serial2.available()) {
+        String command = Serial2.readStringUntil('\n');
+        command.trim();
+        command.toUpperCase();
         
-        // Local Teensy control commands
-        if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET") {
+        if (command.length() > 0) {
+            Serial.printf("[RX_RADIO] UART Command received from BLE Slave: %s\n", command.c_str());
+            process_command(command);
+        }
+    }
+}
+
+static void process_command(String command) {
+    // Local Teensy control commands
+    if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET") {
             Serial.printf("[RX_RADIO] Forwarding '%s' to Local Teensy...\n", command.c_str());
             Serial1.println(command);
             Serial1.flush();
@@ -432,113 +449,112 @@ static void handle_serial_commands() {
             if (millis() >= timeout) {
                 Serial.println("[RX_RADIO] ⚠ Local Teensy response timeout");
             }
-        }
-        // Remote Teensy control commands (via ESP-NOW)
-        else if (command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET") {
-            String teensy_command = command.substring(7); // Remove "REMOTE_" prefix
-            Serial.printf("[RX_RADIO] Sending '%s' to Remote Teensy via ESP-NOW...\n", teensy_command.c_str());
-            if (send_espnow_command(teensy_command.c_str())) {
-                Serial.printf("[RX_RADIO] ✓ Remote command '%s' sent successfully\n", teensy_command.c_str());
-            } else {
-                Serial.printf("[RX_RADIO] ✗ Failed to send remote command '%s'\n", teensy_command.c_str());
-            }
-        }
-        // ALL commands - control both local and remote Teensy simultaneously
-        else if (command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET") {
-            String teensy_command = command.substring(4); // Remove "ALL_" prefix
-            Serial.printf("[RX_RADIO] Executing '%s' on BOTH Local and Remote Teensy...\n", teensy_command.c_str());
-            
-            bool local_success = false;
-            bool remote_success = false;
-            
-            // Send to Local Teensy first
-            Serial.printf("[RX_RADIO] 1/2 Sending '%s' to Local Teensy...\n", teensy_command.c_str());
-            Serial1.println(teensy_command);
-            Serial1.flush();
-            
-            // Wait for local response
-            unsigned long timeout = millis() + 2000;
-            while (millis() < timeout) {
-                if (Serial1.available()) {
-                    String response = Serial1.readStringUntil('\n');
-                    Serial.printf("[RX_RADIO] Local Teensy Response: %s\n", response.c_str());
-                    local_success = response.indexOf("OK") >= 0;
-                    break;
-                }
-                delay(10);
-            }
-            if (millis() >= timeout) {
-                Serial.println("[RX_RADIO] ⚠ Local Teensy response timeout");
-            }
-            
-            // Send to Remote Teensy via ESP-NOW
-            Serial.printf("[RX_RADIO] 2/2 Sending '%s' to Remote Teensy via ESP-NOW...\n", teensy_command.c_str());
-            remote_success = send_espnow_command(teensy_command.c_str());
-            
-            // Summary
-            Serial.printf("[RX_RADIO] === ALL_%s SUMMARY ===\n", teensy_command.c_str());
-            Serial.printf("  Local Teensy:  %s\n", local_success ? "✓ SUCCESS" : "✗ FAILED");
-            Serial.printf("  Remote Teensy: %s\n", remote_success ? "✓ SUCCESS" : "✗ FAILED");
-            if (local_success && remote_success) {
-                Serial.printf("[RX_RADIO] ✓ ALL_%s completed successfully on BOTH units\n", teensy_command.c_str());
-            } else {
-                Serial.printf("[RX_RADIO] ⚠ ALL_%s partially failed - check individual responses\n", teensy_command.c_str());
-            }
-            Serial.println("=============================");
-        }
-        // ESP32 control commands
-        else if (command == "LOCAL_ON") {
-            output_local_data = true;
-            Serial.println("[RX_RADIO] ✓ Local data output enabled");
-        } else if (command == "LOCAL_OFF") {
-            output_local_data = false;
-            Serial.println("[RX_RADIO] ✓ Local data output disabled");
-        } else if (command == "REMOTE_ON") {
-            output_remote_data = true;
-            Serial.println("[RX_RADIO] ✓ Remote data output enabled");
-        } else if (command == "REMOTE_OFF") {
-            output_remote_data = false;
-            Serial.println("[RX_RADIO] ✓ Remote data output disabled");
-        } else if (command == "STATUS") {
-            Serial.printf("[RX_RADIO] === ESP32 RX RADIO STATUS ===\n");
-            Serial.printf("  Local data: %s\n", output_local_data ? "ON" : "OFF");
-            Serial.printf("  Remote data: %s\n", output_remote_data ? "ON" : "OFF");
-            Serial.printf("  Local samples: %lu\n", local_samples_count);
-            Serial.printf("  Remote samples: %lu\n", remote_samples_count);
-            Serial.printf("  UART packets: %lu\n", uart_packets_sent);
-            Serial.printf("  ESP-NOW commands sent: %lu\n", espnow_commands_sent);
-            Serial.printf("  ESP-NOW command errors: %lu\n", espnow_command_errors);
-            Serial.printf("  Free heap: %lu bytes\n", ESP.getFreeHeap());
-            Serial.println("=====================================");
-        } else if (command == "HELP") {
-            Serial.println("[RX_RADIO] === AVAILABLE COMMANDS ===");
-            Serial.println("  Local Teensy Control:");
-            Serial.println("    START         - Start local Teensy data acquisition");
-            Serial.println("    STOP          - Stop local Teensy data acquisition");
-            Serial.println("    RESTART       - Restart local Teensy data acquisition");
-            Serial.println("    RESET         - Reset local Teensy");
-            Serial.println("  Remote Teensy Control (via ESP-NOW):");
-            Serial.println("    REMOTE_START  - Start remote Teensy data acquisition");
-            Serial.println("    REMOTE_STOP   - Stop remote Teensy data acquisition");
-            Serial.println("    REMOTE_RESTART- Restart remote Teensy data acquisition");
-            Serial.println("    REMOTE_RESET  - Reset remote Teensy");
-            Serial.println("  Dual Teensy Control (Both Local & Remote):");
-            Serial.println("    ALL_START     - Start BOTH Teensy units simultaneously");
-            Serial.println("    ALL_STOP      - Stop BOTH Teensy units simultaneously");
-            Serial.println("    ALL_RESTART   - Restart BOTH Teensy units simultaneously");
-            Serial.println("    ALL_RESET     - Reset BOTH Teensy units simultaneously");
-            Serial.println("  ESP32 Control:");
-            Serial.println("    LOCAL_ON/OFF  - Enable/disable local data");
-            Serial.println("    REMOTE_ON/OFF - Enable/disable remote data");
-            Serial.println("    STATUS        - Show system status");
-            Serial.println("    HELP          - Show this help");
-            Serial.println("=====================================");
-        } else if (command == "") {
-            // Empty command, do nothing
+    }
+    // Remote Teensy control commands (via ESP-NOW)
+    else if (command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET") {
+        String teensy_command = command.substring(7); // Remove "REMOTE_" prefix
+        Serial.printf("[RX_RADIO] Sending '%s' to Remote Teensy via ESP-NOW...\n", teensy_command.c_str());
+        if (send_espnow_command(teensy_command.c_str())) {
+            Serial.printf("[RX_RADIO] ✓ Remote command '%s' sent successfully\n", teensy_command.c_str());
         } else {
-            Serial.printf("[RX_RADIO] ✗ Unknown command: '%s'\n", command.c_str());
-            Serial.println("[RX_RADIO] Type 'HELP' for available commands");
+            Serial.printf("[RX_RADIO] ✗ Failed to send remote command '%s'\n", teensy_command.c_str());
         }
+    }
+    // ALL commands - control both local and remote Teensy simultaneously
+    else if (command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET") {
+        String teensy_command = command.substring(4); // Remove "ALL_" prefix
+        Serial.printf("[RX_RADIO] Executing '%s' on BOTH Local and Remote Teensy...\n", teensy_command.c_str());
+        
+        bool local_success = false;
+        bool remote_success = false;
+        
+        // Send to Local Teensy first
+        Serial.printf("[RX_RADIO] 1/2 Sending '%s' to Local Teensy...\n", teensy_command.c_str());
+        Serial1.println(teensy_command);
+        Serial1.flush();
+        
+        // Wait for local response
+        unsigned long timeout = millis() + 2000;
+        while (millis() < timeout) {
+            if (Serial1.available()) {
+                String response = Serial1.readStringUntil('\n');
+                Serial.printf("[RX_RADIO] Local Teensy Response: %s\n", response.c_str());
+                local_success = response.indexOf("OK") >= 0;
+                break;
+            }
+            delay(10);
+        }
+        if (millis() >= timeout) {
+            Serial.println("[RX_RADIO] ⚠ Local Teensy response timeout");
+        }
+        
+        // Send to Remote Teensy via ESP-NOW
+        Serial.printf("[RX_RADIO] 2/2 Sending '%s' to Remote Teensy via ESP-NOW...\n", teensy_command.c_str());
+        remote_success = send_espnow_command(teensy_command.c_str());
+        
+        // Summary
+        Serial.printf("[RX_RADIO] === ALL_%s SUMMARY ===\n", teensy_command.c_str());
+        Serial.printf("  Local Teensy:  %s\n", local_success ? "✓ SUCCESS" : "✗ FAILED");
+        Serial.printf("  Remote Teensy: %s\n", remote_success ? "✓ SUCCESS" : "✗ FAILED");
+        if (local_success && remote_success) {
+            Serial.printf("[RX_RADIO] ✓ ALL_%s completed successfully on BOTH units\n", teensy_command.c_str());
+        } else {
+            Serial.printf("[RX_RADIO] ⚠ ALL_%s partially failed - check individual responses\n", teensy_command.c_str());
+        }
+        Serial.println("=============================");
+    }
+    // ESP32 control commands
+    else if (command == "LOCAL_ON") {
+        output_local_data = true;
+        Serial.println("[RX_RADIO] ✓ Local data output enabled");
+    } else if (command == "LOCAL_OFF") {
+        output_local_data = false;
+        Serial.println("[RX_RADIO] ✓ Local data output disabled");
+    } else if (command == "REMOTE_ON") {
+        output_remote_data = true;
+        Serial.println("[RX_RADIO] ✓ Remote data output enabled");
+    } else if (command == "REMOTE_OFF") {
+        output_remote_data = false;
+        Serial.println("[RX_RADIO] ✓ Remote data output disabled");
+    } else if (command == "STATUS") {
+        Serial.printf("[RX_RADIO] === ESP32 RX RADIO STATUS ===\n");
+        Serial.printf("  Local data: %s\n", output_local_data ? "ON" : "OFF");
+        Serial.printf("  Remote data: %s\n", output_remote_data ? "ON" : "OFF");
+        Serial.printf("  Local samples: %lu\n", local_samples_count);
+        Serial.printf("  Remote samples: %lu\n", remote_samples_count);
+        Serial.printf("  UART packets: %lu\n", uart_packets_sent);
+        Serial.printf("  ESP-NOW commands sent: %lu\n", espnow_commands_sent);
+        Serial.printf("  ESP-NOW command errors: %lu\n", espnow_command_errors);
+        Serial.printf("  Free heap: %lu bytes\n", ESP.getFreeHeap());
+        Serial.println("=====================================");
+    } else if (command == "HELP") {
+        Serial.println("[RX_RADIO] === AVAILABLE COMMANDS ===");
+        Serial.println("  Local Teensy Control:");
+        Serial.println("    START         - Start local Teensy data acquisition");
+        Serial.println("    STOP          - Stop local Teensy data acquisition");
+        Serial.println("    RESTART       - Restart local Teensy data acquisition");
+        Serial.println("    RESET         - Reset local Teensy");
+        Serial.println("  Remote Teensy Control (via ESP-NOW):");
+        Serial.println("    REMOTE_START  - Start remote Teensy data acquisition");
+        Serial.println("    REMOTE_STOP   - Stop remote Teensy data acquisition");
+        Serial.println("    REMOTE_RESTART- Restart remote Teensy data acquisition");
+        Serial.println("    REMOTE_RESET  - Reset remote Teensy");
+        Serial.println("  Dual Teensy Control (Both Local & Remote):");
+        Serial.println("    ALL_START     - Start BOTH Teensy units simultaneously");
+        Serial.println("    ALL_STOP      - Stop BOTH Teensy units simultaneously");
+        Serial.println("    ALL_RESTART   - Restart BOTH Teensy units simultaneously");
+        Serial.println("    ALL_RESET     - Reset BOTH Teensy units simultaneously");
+        Serial.println("  ESP32 Control:");
+        Serial.println("    LOCAL_ON/OFF  - Enable/disable local data");
+        Serial.println("    REMOTE_ON/OFF - Enable/disable remote data");
+        Serial.println("    STATUS        - Show system status");
+        Serial.println("    HELP          - Show this help");
+        Serial.println("=====================================");
+    } else if (command == "") {
+        // Empty command, do nothing
+    } else {
+        Serial.printf("[RX_RADIO] ✗ Unknown command: '%s'\n", command.c_str());
+        Serial.println("[RX_RADIO] Type 'HELP' for available commands");
     }
 }
 

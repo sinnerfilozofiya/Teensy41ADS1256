@@ -96,6 +96,11 @@ static unsigned long ble_notifications_sent = 0;
 static unsigned long ble_send_errors = 0;
 static unsigned long timer_samples_generated = 0;
 
+// Command forwarding statistics
+static unsigned long commands_forwarded = 0;
+static unsigned long command_responses_received = 0;
+static unsigned long command_timeouts = 0;
+
 // BLE transmission queue - Reduced for Windows BLE compatibility
 #define BLE_QUEUE_SIZE 200   // Smaller queue to prevent Windows BLE overflow
 #define BLE_SAMPLE_DECIMATION 1  // Send every sample for maximum throughput
@@ -504,15 +509,79 @@ static void handle_serial_commands() {
     if (Serial.available()) {
         String command = Serial.readStringUntil('\n');
         command.trim();
+        command.toUpperCase();
         
-        if (command == "STATS") {
+        Serial.printf("[BLE_SLAVE] Command received: %s\n", command.c_str());
+        
+        // Forward Teensy control commands to ESP32 RX Radio
+        if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
+            command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
+            command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET" ||
+            command == "LOCAL_ON" || command == "LOCAL_OFF" || command == "REMOTE_ON" || command == "REMOTE_OFF") {
+            
+            Serial.printf("[BLE_SLAVE] Forwarding '%s' to ESP32 RX Radio...\n", command.c_str());
+            Serial2.println(command);
+            Serial2.flush();
+            commands_forwarded++;
+            
+            // Wait for response from ESP32 RX Radio
+            unsigned long timeout = millis() + 5000; // 5 second timeout for ALL_ commands
+            bool got_response = false;
+            while (millis() < timeout) {
+                if (Serial2.available()) {
+                    String response = Serial2.readStringUntil('\n');
+                    if (response.length() > 0) {
+                        Serial.printf("[BLE_SLAVE] RX Radio Response: %s\n", response.c_str());
+                        got_response = true;
+                        command_responses_received++;
+                        // Continue reading any additional response lines
+                        unsigned long quick_timeout = millis() + 500;
+                        while (millis() < quick_timeout && Serial2.available()) {
+                            String additional = Serial2.readStringUntil('\n');
+                            if (additional.length() > 0) {
+                                Serial.printf("[BLE_SLAVE] RX Radio Response: %s\n", additional.c_str());
+                            }
+                            delay(10);
+                        }
+                        break;
+                    }
+                }
+                delay(10);
+            }
+            if (!got_response) {
+                Serial.println("[BLE_SLAVE] ⚠ No response from ESP32 RX Radio");
+                command_timeouts++;
+            }
+        }
+        // ESP32 RX Radio status commands
+        else if (command == "RX_STATUS") {
+            Serial.println("[BLE_SLAVE] Requesting status from ESP32 RX Radio...");
+            Serial2.println("STATUS");
+            Serial2.flush();
+            
+            // Wait for multi-line status response
+            unsigned long timeout = millis() + 3000;
+            while (millis() < timeout) {
+                if (Serial2.available()) {
+                    String response = Serial2.readStringUntil('\n');
+                    if (response.length() > 0) {
+                        Serial.printf("[BLE_SLAVE] RX Radio: %s\n", response.c_str());
+                    }
+                }
+                delay(10);
+            }
+        }
+        // BLE Slave specific commands
+        else if (command == "STATS") {
             Serial.printf("UART: Packets=%lu, Bytes=%lu, CRC_Err=%lu, Sync_Err=%lu\n",
                          uart_packets_received, uart_bytes_received, uart_crc_errors, uart_sync_errors);
             Serial.printf("Samples: Local=%lu, Remote=%lu, Combined=%lu\n",
                          local_samples_received, remote_samples_received, combined_samples_received);
             Serial.printf("BLE: Connected=%s, Notifications=%lu, Errors=%lu\n",
                          deviceConnected ? "YES" : "NO", ble_notifications_sent, ble_send_errors);
-        } else if (command == "RESET") {
+            Serial.printf("Commands: Forwarded=%lu, Responses=%lu, Timeouts=%lu\n",
+                         commands_forwarded, command_responses_received, command_timeouts);
+        } else if (command == "RESET_STATS") {
             uart_packets_received = 0;
             uart_bytes_received = 0;
             uart_crc_errors = 0;
@@ -522,6 +591,9 @@ static void handle_serial_commands() {
             combined_samples_received = 0;
             ble_notifications_sent = 0;
             ble_send_errors = 0;
+            commands_forwarded = 0;
+            command_responses_received = 0;
+            command_timeouts = 0;
             Serial.println("Statistics reset");
         } else if (command == "BLE_RESTART") {
             BLEDevice::startAdvertising();
@@ -559,6 +631,25 @@ static void handle_serial_commands() {
                              redis_store.last_remote_lc[0], redis_store.last_remote_lc[1], 
                              redis_store.last_remote_lc[2], redis_store.last_remote_lc[3]);
             }
+        } else if (command == "HELP") {
+            Serial.println("[BLE_SLAVE] === AVAILABLE COMMANDS ===");
+            Serial.println("  Teensy Control (forwarded to RX Radio):");
+            Serial.println("    START, STOP, RESTART, RESET");
+            Serial.println("    REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET");
+            Serial.println("    ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET");
+            Serial.println("  ESP32 Control (forwarded to RX Radio):");
+            Serial.println("    LOCAL_ON/OFF, REMOTE_ON/OFF");
+            Serial.println("    RX_STATUS    - Get ESP32 RX Radio status");
+            Serial.println("  BLE Slave Commands:");
+            Serial.println("    STATS        - Show BLE slave statistics");
+            Serial.println("    RESET_STATS  - Reset all statistics");
+            Serial.println("    BLE_RESTART  - Restart BLE advertising");
+            Serial.println("    UART_STATUS  - Show UART status");
+            Serial.println("    BATCH_STATUS - Show BLE batch status");
+            Serial.println("    REDIS_STATUS - Show Redis store status");
+            Serial.println("    DEBUG_QUEUE  - Show queue contents");
+            Serial.println("    HELP         - Show this help");
+            Serial.println("=========================================");
         } else if (command == "DEBUG_QUEUE") {
             Serial.printf("Debug Queue Contents:\n");
             if (redis_store.local_count > 0) {
@@ -573,6 +664,11 @@ static void handle_serial_commands() {
                              sample->lc[0], sample->lc[1], sample->lc[2], sample->lc[3],
                              sample->frame_idx, sample->sample_idx);
             }
+        } else if (command == "") {
+            // Empty command, do nothing
+        } else {
+            Serial.printf("[BLE_SLAVE] ✗ Unknown command: '%s'\n", command.c_str());
+            Serial.println("[BLE_SLAVE] Type 'HELP' for available commands");
         }
     }
 }
@@ -585,8 +681,14 @@ void setup() {
     Serial.begin(921600);
     delay(100);
     
-    Serial.println("ESP32 BLE Slave - Redis-like Load Cell Data Forwarder");
-    Serial.println("Commands: STATS, RESET, BLE_RESTART, UART_STATUS, BATCH_STATUS, REDIS_STATUS");
+    Serial.println("ESP32 BLE Slave - Redis-like Load Cell Data Forwarder + Command Gateway");
+    Serial.println("=== COMMAND FORWARDING ENABLED ===");
+    Serial.println("Teensy Commands: START, STOP, RESTART, RESET");
+    Serial.println("Remote Commands: REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET");
+    Serial.println("Dual Commands: ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET");
+    Serial.println("ESP32 Commands: LOCAL_ON/OFF, REMOTE_ON/OFF, RX_STATUS");
+    Serial.println("BLE Commands: STATS, RESET_STATS, BLE_RESTART, UART_STATUS, BATCH_STATUS, REDIS_STATUS");
+    Serial.println("===================================");
     
     // Initialize UART2 for receiving data from master ESP32
     Serial2.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
