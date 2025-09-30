@@ -16,8 +16,12 @@
 // SPI1 pins for ESP32 communication
 #define PIN_SCK1   27
 #define PIN_MOSI1  26
-#define PIN_MISO1   1   // or 33
+#define PIN_MISO1   1
 #define PIN_CS1     0
+
+// Serial3 pins for ESP32 command interface (Hardware pins - no defines needed)
+// TX3 = Pin 34 (to ESP32 GPIO3)
+// RX3 = Pin 35 (from ESP32 GPIO2)
 
 // Frame structure constants
 #define FRAME_BYTES 144
@@ -102,6 +106,10 @@ void setup() {
   SPI1.setMISO(PIN_MISO1);
   SPI1.begin();
   Serial.println("[T41] SPI1 Master initialized");
+  
+  // Initialize Serial3 for ESP32 command interface
+  Serial3.begin(115200);
+  Serial.println("[T41] Serial3 initialized for ESP32 commands (TX=Pin34, RX=Pin35)");
 
   // Initialize sample buffer
   memset(sample_buffer, 0, sizeof(sample_buffer));

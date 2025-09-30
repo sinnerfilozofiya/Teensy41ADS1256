@@ -12,10 +12,17 @@
 #include <nvs.h>
 #include "common_frame.h"
 
-#define PIN_MOSI 39
-#define PIN_MISO 40
-#define PIN_SCLK 38
-#define PIN_CS   41
+#define PIN_MOSI 11
+#define PIN_MISO 13
+#define PIN_SCLK 12
+#define PIN_CS   10
+
+// UART pins for Teensy communication (Serial1)
+#define TEENSY_UART_TX_PIN 2   // GPIO2 for UART TX to Teensy
+#define TEENSY_UART_RX_PIN 3   // GPIO3 for UART RX from Teensy
+
+// RGB LED pin
+#define RGB_LED_PIN 38         // GPIO38 for WS2812B RGB LED status indicator
 
 #define FRAME_BYTES 144
 #define QUEUED_XFERS 32
@@ -37,11 +44,11 @@
 
 // ESP-NOW Configuration
 #define ESPNOW_CHANNEL 1
-static const uint8_t ESPNOW_PEER_MAC[6] = {0x02, 0xAA, 0xBB, 0x00, 0x00, 0x03};  // Part 2 MAC
+static const uint8_t ESPNOW_PEER_MAC[6] = {0x02, 0xAA, 0xBB, 0x00, 0x00, 0x03};  // RX Radio MAC
 
 // Custom MAC Configuration
 #define USE_CUSTOM_MAC 1
-static const uint8_t CUSTOM_STA_MAC_TX[6] = {0x02, 0xAA, 0xBB, 0x00, 0x00, 0x01};  // TX radio MAC
+static const uint8_t CUSTOM_STA_MAC_TX[6] = {0x02, 0xAA, 0xBB, 0x00, 0x00, 0x01};  // SPI Slave MAC
 
 // Network buffer size
 #define NET_QUEUE_SIZE 64
@@ -494,6 +501,11 @@ void setup() {
   gpio_set_pull_mode((gpio_num_t)PIN_SCLK, GPIO_PULLUP_ONLY);
 
   requeue_all();
+
+  // Initialize Serial1 for Teensy communication
+  Serial1.begin(115200, SERIAL_8N1, TEENSY_UART_RX_PIN, TEENSY_UART_TX_PIN);
+  Serial.printf("[TX] Serial1 initialized at 115200 bps for Teensy communication (TX=%d, RX=%d)\n", 
+                TEENSY_UART_TX_PIN, TEENSY_UART_RX_PIN);
 
   // Start tasks
   t0_ms = millis();

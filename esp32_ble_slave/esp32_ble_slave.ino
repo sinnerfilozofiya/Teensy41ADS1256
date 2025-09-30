@@ -10,8 +10,11 @@
 // ============================================================================
 
 #define UART_BAUD_RATE 921600   // Safe baud rate matching Serial console
-#define UART_RX_PIN 18          // GPIO18 for UART RX
-#define UART_TX_PIN 17          // GPIO17 for UART TX (not used but defined)
+#define UART_RX_PIN 18          // GPIO18 for UART RX from ESP32 RX Radio
+#define UART_TX_PIN 17          // GPIO17 for UART TX to ESP32 RX Radio
+
+// RGB LED pin
+#define RGB_LED_PIN 38          // GPIO38 for WS2812B RGB LED status indicator
 
 // UART packet structure (24 bytes total) - must match master
 struct __attribute__((packed)) UartPacket {
