@@ -85,6 +85,86 @@ static volatile uint32_t net_win_sent = 0;
 static volatile uint32_t net_win_fail = 0;
 static volatile uint32_t net_win_drops = 0;
 
+// ESP-NOW command statistics
+static volatile uint32_t espnow_commands_received = 0;
+static volatile uint32_t espnow_command_errors = 0;
+
+// ============================================================================
+// ESP-NOW COMMAND STRUCTURES AND FUNCTIONS
+// ============================================================================
+
+// ESP-NOW command packet (16 bytes)
+struct __attribute__((packed)) ESPNowCommand {
+    uint8_t magic[2];   // 0xCC, 0xDD (Command magic)
+    uint8_t command[8]; // Command string (null-terminated)
+    uint32_t timestamp; // Timestamp for deduplication
+    uint16_t crc16;     // CRC16 of packet
+};
+
+// Forward declarations
+bool create_espnow_command(ESPNowCommand* cmd, const char* command_str);
+bool validate_espnow_command(const ESPNowCommand* cmd);
+static void process_espnow_command(const ESPNowCommand* cmd);
+
+// ============================================================================
+// ESP-NOW COMMAND PROCESSING
+// ============================================================================
+
+static void process_espnow_command(const ESPNowCommand* cmd) {
+    const char* command_str = (const char*)cmd->command;
+    
+    Serial.printf("[SPI_SLAVE] ESP-NOW Command received: %s\n", command_str);
+    Serial.printf("[SPI_SLAVE] Forwarding '%s' to Remote Teensy...\n", command_str);
+    
+    // Forward command to Teensy via Serial1
+    Serial1.println(command_str);
+    Serial1.flush();
+    
+    // Wait for response from Teensy
+    unsigned long timeout = millis() + 2000; // 2 second timeout
+    while (millis() < timeout) {
+        if (Serial1.available()) {
+            String response = Serial1.readStringUntil('\n');
+            Serial.printf("[SPI_SLAVE] Remote Teensy Response: %s\n", response.c_str());
+            break;
+        }
+        delay(10);
+    }
+    if (millis() >= timeout) {
+        Serial.println("[SPI_SLAVE] ⚠ Remote Teensy response timeout");
+    }
+    
+    espnow_commands_received++;
+}
+
+// ============================================================================
+// ESP-NOW COMMAND HELPER FUNCTION IMPLEMENTATIONS
+// ============================================================================
+
+bool create_espnow_command(ESPNowCommand* cmd, const char* command_str) {
+    if (strlen(command_str) >= 8) return false; // Command too long
+    
+    memset(cmd, 0, sizeof(ESPNowCommand));
+    cmd->magic[0] = 0xCC;
+    cmd->magic[1] = 0xDD;
+    strncpy((char*)cmd->command, command_str, 7);
+    cmd->command[7] = '\0';
+    cmd->timestamp = millis();
+    
+    // Calculate CRC16 of everything except CRC field
+    cmd->crc16 = crc16_ccitt_false((const uint8_t*)cmd, sizeof(ESPNowCommand) - 2);
+    return true;
+}
+
+bool validate_espnow_command(const ESPNowCommand* cmd) {
+    if (cmd->magic[0] != 0xCC || cmd->magic[1] != 0xDD) {
+        return false;
+    }
+    
+    uint16_t expected_crc = crc16_ccitt_false((const uint8_t*)cmd, sizeof(ESPNowCommand) - 2);
+    return cmd->crc16 == expected_crc;
+}
+
 // Network objects
 #if USE_WIFI_UDP
 static WiFiUDP udp;
@@ -208,6 +288,24 @@ static void espnow_send_callback(const wifi_tx_info_t *tx_info, esp_now_send_sta
   }
 }
 
+static void espnow_recv_callback(const esp_now_recv_info *recv_info, const uint8_t *data, int len) {
+  // Check if this is a command packet
+  if (len == sizeof(ESPNowCommand)) {
+    const ESPNowCommand* cmd = (const ESPNowCommand*)data;
+    if (validate_espnow_command(cmd)) {
+      process_espnow_command(cmd);
+      return;
+    } else {
+      espnow_command_errors++;
+      Serial.printf("[SPI_SLAVE] ✗ Invalid ESP-NOW command packet received\n");
+      return;
+    }
+  }
+  
+  // If not a command packet, ignore (we don't expect data frames on SPI slave)
+  Serial.printf("[SPI_SLAVE] Received unexpected ESP-NOW packet (len=%d)\n", len);
+}
+
 static void espnow_init() {
   set_custom_mac_if_enabled();
   
@@ -220,6 +318,7 @@ static void espnow_init() {
   }
   
   esp_now_register_send_cb(espnow_send_callback);
+  esp_now_register_recv_cb(espnow_recv_callback);
   
   // Add peer
   esp_now_peer_info_t peer_info = {};
@@ -458,6 +557,8 @@ void handle_serial_commands() {
       Serial.printf("  Frames OK: %lu\n", (unsigned long)frames_ok);
       Serial.printf("  Network sent: %lu\n", (unsigned long)net_sent_ok);
       Serial.printf("  Raw data: %s\n", output_raw_data ? "ON" : "OFF");
+      Serial.printf("  ESP-NOW commands received: %lu\n", (unsigned long)espnow_commands_received);
+      Serial.printf("  ESP-NOW command errors: %lu\n", (unsigned long)espnow_command_errors);
 #if USE_WIFI_UDP
       Serial.printf("  WiFi: %s\n", wifi_connected ? "Connected" : "Disconnected");
       if (wifi_connected) {

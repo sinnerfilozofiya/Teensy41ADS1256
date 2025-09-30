@@ -20,6 +20,14 @@ struct __attribute__((packed)) RadioHdr {
     uint16_t len;       // Payload length (always 144)
 };
 
+// ESP-NOW command packet (16 bytes)
+struct __attribute__((packed)) ESPNowCommand {
+    uint8_t magic[2];   // 0xCM, 0xD1 (Command magic)
+    uint8_t command[8]; // Command string (null-terminated)
+    uint32_t timestamp; // Timestamp for deduplication
+    uint16_t crc16;     // CRC16 of packet
+};
+
 // Inner frame structure (from Teensy, 144 bytes total)
 struct __attribute__((packed)) InnerFrame {
     uint8_t  sync[2];       // 0xA5, 0x5A
@@ -136,6 +144,31 @@ static inline void extract_load_cell_sample(const uint8_t* sample_data, int samp
     *lc2 = unpack_int24_le(s + 3);
     *lc3 = unpack_int24_le(s + 6);
     *lc4 = unpack_int24_le(s + 9);
+}
+
+// ESP-NOW Command helper functions
+static inline bool create_espnow_command(ESPNowCommand* cmd, const char* command_str) {
+    if (strlen(command_str) >= 8) return false; // Command too long
+    
+    memset(cmd, 0, sizeof(ESPNowCommand));
+    cmd->magic[0] = 0xCM;
+    cmd->magic[1] = 0xD1;
+    strncpy((char*)cmd->command, command_str, 7);
+    cmd->command[7] = '\0';
+    cmd->timestamp = millis();
+    
+    // Calculate CRC16 of everything except CRC field
+    cmd->crc16 = crc16_ccitt_false((const uint8_t*)cmd, sizeof(ESPNowCommand) - 2);
+    return true;
+}
+
+static inline bool validate_espnow_command(const ESPNowCommand* cmd) {
+    if (cmd->magic[0] != 0xCM || cmd->magic[1] != 0xD1) {
+        return false;
+    }
+    
+    uint16_t expected_crc = crc16_ccitt_false((const uint8_t*)cmd, sizeof(ESPNowCommand) - 2);
+    return cmd->crc16 == expected_crc;
 }
 
 #endif // COMMON_FRAME_H

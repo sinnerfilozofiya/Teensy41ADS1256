@@ -23,8 +23,8 @@
 #define PIN_CS1     0
 
 // Serial3 pins for ESP32 command interface (Hardware pins - no defines needed)
-// TX3 = Pin 34 (to ESP32 GPIO3)
-// RX3 = Pin 35 (from ESP32 GPIO2)
+// TX3 = Pin 14 (to ESP32 GPIO3)
+// RX3 = Pin 15 (from ESP32 GPIO2)
 
 // ============================================================================
 // DATA ACQUISITION STATE MANAGEMENT
