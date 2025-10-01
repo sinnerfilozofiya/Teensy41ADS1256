@@ -31,10 +31,12 @@ struct __attribute__((packed)) UartPacket {
 // ============================================================================
 
 #define BLE_SERVICE_UUID        "12345678-1234-1234-1234-123456789abc"
-#define BLE_CHARACTERISTIC_UUID "87654321-4321-4321-4321-cba987654321"
+#define BLE_DATA_CHARACTERISTIC_UUID "87654321-4321-4321-4321-cba987654321"
+#define BLE_COMMAND_CHARACTERISTIC_UUID "11111111-2222-3333-4444-555555555555"
 
 BLEServer* pServer = nullptr;
-BLECharacteristic* pCharacteristic = nullptr;
+BLECharacteristic* pDataCharacteristic = nullptr;    // For sending sensor data
+BLECharacteristic* pCommandCharacteristic = nullptr; // For receiving commands
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
@@ -100,6 +102,10 @@ static unsigned long timer_samples_generated = 0;
 static unsigned long commands_forwarded = 0;
 static unsigned long command_responses_received = 0;
 static unsigned long command_timeouts = 0;
+
+// BLE command statistics
+static unsigned long ble_commands_received = 0;
+static unsigned long ble_command_errors = 0;
 
 // BLE transmission queue - Reduced for Windows BLE compatibility
 #define BLE_QUEUE_SIZE 200   // Smaller queue to prevent Windows BLE overflow
@@ -187,18 +193,92 @@ static inline void process_uart_packet(const UartPacket* packet) {
 }
 
 // ============================================================================
+// BLE COMMAND PROCESSING
+// ============================================================================
+
+static void process_ble_command(String command) {
+    command.trim();
+    command.toUpperCase();
+    
+    if (command.length() == 0) {
+        Serial.println("[BLE_SLAVE] ⚠ Empty BLE command received");
+        ble_command_errors++;
+        return;
+    }
+    
+    Serial.printf("[BLE_SLAVE] BLE Command received: %s\n", command.c_str());
+    ble_commands_received++;
+    
+    // Forward Teensy control commands to ESP32 RX Radio
+    if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
+        command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
+        command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET" ||
+        command == "LOCAL_ON" || command == "LOCAL_OFF" || command == "REMOTE_ON" || command == "REMOTE_OFF" ||
+        command == "STATUS") {
+        
+        Serial.printf("[BLE_SLAVE] Forwarding BLE command '%s' to ESP32 RX Radio...\n", command.c_str());
+        Serial2.println(command);
+        Serial2.flush();
+        commands_forwarded++;
+        
+        // Wait for response from ESP32 RX Radio
+        unsigned long timeout = millis() + 5000; // 5 second timeout for ALL_ commands
+        bool got_response = false;
+        while (millis() < timeout) {
+            if (Serial2.available()) {
+                String response = Serial2.readStringUntil('\n');
+                if (response.length() > 0) {
+                    Serial.printf("[BLE_SLAVE] RX Radio Response: %s\n", response.c_str());
+                    got_response = true;
+                    command_responses_received++;
+                    // Continue reading any additional response lines
+                    unsigned long quick_timeout = millis() + 500;
+                    while (millis() < quick_timeout && Serial2.available()) {
+                        String additional = Serial2.readStringUntil('\n');
+                        if (additional.length() > 0) {
+                            Serial.printf("[BLE_SLAVE] RX Radio Response: %s\n", additional.c_str());
+                        }
+                        delay(10);
+                    }
+                    break;
+                }
+            }
+            delay(10);
+        }
+        if (!got_response) {
+            Serial.println("[BLE_SLAVE] ⚠ No response from ESP32 RX Radio");
+            command_timeouts++;
+        }
+    } else {
+        Serial.printf("[BLE_SLAVE] ✗ Unknown BLE command: '%s'\n", command.c_str());
+        ble_command_errors++;
+    }
+}
+
+// ============================================================================
 // BLE SERVER CALLBACKS
 // ============================================================================
 
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
         deviceConnected = true;
-        Serial.println("BLE Client connected");
+        Serial.println("[BLE_SLAVE] ✓ BLE Client connected");
     };
 
     void onDisconnect(BLEServer* pServer) {
         deviceConnected = false;
-        Serial.println("BLE Client disconnected");
+        Serial.println("[BLE_SLAVE] ✗ BLE Client disconnected");
+    }
+};
+
+class MyCommandCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pCharacteristic) {
+        String command = pCharacteristic->getValue().c_str();
+        
+        if (command.length() > 0) {
+            Serial.printf("[BLE_SLAVE] BLE Write received: '%s' (%d bytes)\n", command.c_str(), command.length());
+            process_ble_command(command);
+        }
     }
 };
 
@@ -372,8 +452,8 @@ static inline void send_current_batch() {
         size_t packet_size = 1 + (current_sample_count * sizeof(LoadCellSample));
         
         try {
-            pCharacteristic->setValue((uint8_t*)&current_ble_packet, packet_size);
-            pCharacteristic->notify();
+            pDataCharacteristic->setValue((uint8_t*)&current_ble_packet, packet_size);
+            pDataCharacteristic->notify();
             ble_notifications_sent++;
             ble_packets_sent++;
             samples_batched += current_sample_count;
@@ -581,6 +661,8 @@ static void handle_serial_commands() {
                          deviceConnected ? "YES" : "NO", ble_notifications_sent, ble_send_errors);
             Serial.printf("Commands: Forwarded=%lu, Responses=%lu, Timeouts=%lu\n",
                          commands_forwarded, command_responses_received, command_timeouts);
+            Serial.printf("BLE Commands: Received=%lu, Errors=%lu\n",
+                         ble_commands_received, ble_command_errors);
         } else if (command == "RESET_STATS") {
             uart_packets_received = 0;
             uart_bytes_received = 0;
@@ -594,6 +676,8 @@ static void handle_serial_commands() {
             commands_forwarded = 0;
             command_responses_received = 0;
             command_timeouts = 0;
+            ble_commands_received = 0;
+            ble_command_errors = 0;
             Serial.println("Statistics reset");
         } else if (command == "BLE_RESTART") {
             BLEDevice::startAdvertising();
@@ -682,13 +766,17 @@ void setup() {
     delay(100);
     
     Serial.println("ESP32 BLE Slave - Redis-like Load Cell Data Forwarder + Command Gateway");
-    Serial.println("=== COMMAND FORWARDING ENABLED ===");
-    Serial.println("Teensy Commands: START, STOP, RESTART, RESET");
-    Serial.println("Remote Commands: REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET");
-    Serial.println("Dual Commands: ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET");
-    Serial.println("ESP32 Commands: LOCAL_ON/OFF, REMOTE_ON/OFF, RX_STATUS");
-    Serial.println("BLE Commands: STATS, RESET_STATS, BLE_RESTART, UART_STATUS, BATCH_STATUS, REDIS_STATUS");
-    Serial.println("===================================");
+    Serial.println("=== BLE COMMAND INTERFACE ENABLED ===");
+    Serial.println("BLE Service UUID: 12345678-1234-1234-1234-123456789abc");
+    Serial.println("Data Characteristic (Notify): 87654321-4321-4321-4321-cba987654321");
+    Serial.println("Command Characteristic (Write): 11111111-2222-3333-4444-555555555555");
+    Serial.println("Available BLE Commands:");
+    Serial.println("  Teensy: START, STOP, RESTART, RESET");
+    Serial.println("  Remote: REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET");
+    Serial.println("  Dual: ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET");
+    Serial.println("  ESP32: LOCAL_ON/OFF, REMOTE_ON/OFF, STATUS");
+    Serial.println("Serial Commands: STATS, RESET_STATS, BLE_RESTART, UART_STATUS, HELP");
+    Serial.println("======================================");
     
     // Initialize UART2 for receiving data from master ESP32
     Serial2.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
@@ -702,14 +790,21 @@ void setup() {
     
     BLEService *pService = pServer->createService(BLE_SERVICE_UUID);
     
-    pCharacteristic = pService->createCharacteristic(
-                        BLE_CHARACTERISTIC_UUID,
+    // Data characteristic for sending sensor data (notifications)
+    pDataCharacteristic = pService->createCharacteristic(
+                        BLE_DATA_CHARACTERISTIC_UUID,
                         BLECharacteristic::PROPERTY_READ |
-                        BLECharacteristic::PROPERTY_WRITE |
                         BLECharacteristic::PROPERTY_NOTIFY
                       );
+    pDataCharacteristic->addDescriptor(new BLE2902());
     
-    pCharacteristic->addDescriptor(new BLE2902());
+    // Command characteristic for receiving commands (write)
+    pCommandCharacteristic = pService->createCharacteristic(
+                        BLE_COMMAND_CHARACTERISTIC_UUID,
+                        BLECharacteristic::PROPERTY_WRITE |
+                        BLECharacteristic::PROPERTY_WRITE_NR
+                      );
+    pCommandCharacteristic->setCallbacks(new MyCommandCallbacks());
     
     pService->start();
     
@@ -719,7 +814,7 @@ void setup() {
     pAdvertising->setMinPreferred(0x0);  // Set value to 0x00 to not advertise this parameter
     BLEDevice::startAdvertising();
     
-    Serial.println("BLE server started, waiting for connections...");
+    Serial.println("BLE server started with command interface, waiting for connections...");
     
     // Initialize hardware timer for 1000Hz sampling (1ms intervals)
     sampling_timer = timerBegin(1000000);  // 1MHz base frequency
