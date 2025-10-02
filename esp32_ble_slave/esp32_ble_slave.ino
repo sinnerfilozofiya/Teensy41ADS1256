@@ -82,6 +82,9 @@ hw_timer_t* sampling_timer = nullptr;
 static volatile bool timer_sample_ready = false;
 static volatile unsigned long timer_interrupts_count = 0;
 
+// OPTIMIZATION: Packet rate control (100 packets/sec instead of 200)
+static int packet_rate_counter = 0;
+
 // ============================================================================
 // DATA BUFFERING AND STATISTICS
 // ============================================================================
@@ -107,12 +110,13 @@ static unsigned long command_timeouts = 0;
 static unsigned long ble_commands_received = 0;
 static unsigned long ble_command_errors = 0;
 
-// BLE transmission queue - Reduced for Windows BLE compatibility
+// BLE transmission queue - Optimized for maximum throughput
 #define BLE_QUEUE_SIZE 200   // Smaller queue to prevent Windows BLE overflow
 #define BLE_SAMPLE_DECIMATION 1  // Send every sample for maximum throughput
+
 // Forward declarations
-struct LoadCellSample;
-struct BLEDataPacket;
+struct CompactLoadCellSample;
+struct OptimizedBLEPacket;
 
 // Statistics
 static unsigned long sample_decimation_counter = 0;
@@ -120,21 +124,23 @@ static unsigned long samples_decimated = 0;
 static unsigned long samples_batched = 0;
 static unsigned long ble_packets_sent = 0;
 
-// 8-channel load cell sample (minimal structure)
-struct __attribute__((packed)) LoadCellSample {
-    int32_t local_lc[4];    // Local load cells 1-4 (16 bytes)
-    int32_t remote_lc[4];   // Remote load cells 5-8 (16 bytes)
-};  // Total: 32 bytes per sample
+// OPTIMIZED: Compact 8-channel load cell sample using 16-bit values
+// Assumes load cell values fit in 16-bit range (-32768 to +32767)
+// This reduces each sample from 32 bytes to 16 bytes (50% reduction!)
+struct __attribute__((packed)) CompactLoadCellSample {
+    int16_t local_lc[4];    // Local load cells 1-4 (8 bytes)
+    int16_t remote_lc[4];   // Remote load cells 5-8 (8 bytes)
+};  // Total: 16 bytes per sample (was 32 bytes)
 
-// BLE packet with multiple 8-channel samples
-#define SAMPLES_PER_BLE_PACKET 5  // 5 samples per packet = 160 bytes + header
-struct __attribute__((packed)) BLEDataPacket {
-    uint8_t sample_count;                           // Number of samples in this packet
-    LoadCellSample samples[SAMPLES_PER_BLE_PACKET]; // Array of 8-channel samples
-};  // Total: 1 + (32 * 5) = 161 bytes
+// OPTIMIZED: More samples per packet with smaller sample size
+#define SAMPLES_PER_BLE_PACKET 10  // 10 samples per packet = 160 bytes + header
+struct __attribute__((packed)) OptimizedBLEPacket {
+    uint8_t sample_count;                                    // Number of samples in this packet (1 byte)
+    CompactLoadCellSample samples[SAMPLES_PER_BLE_PACKET];   // Array of compact 8-channel samples
+};  // Total: 1 + (16 * 10) = 161 bytes (same size but 2x more samples!)
 
 // Batch transmission system (after struct definitions)
-static BLEDataPacket current_ble_packet;
+static OptimizedBLEPacket current_ble_packet;
 static int current_sample_count = 0;
 
 // ============================================================================
@@ -213,6 +219,9 @@ static void process_ble_command(String command) {
     if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
         command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
         command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET" ||
+        command == "ZERO" || command == "ZERO_STATUS" || command == "ZERO_RESET" ||
+        command == "REMOTE_ZERO" || command == "REMOTE_ZERO_STATUS" || command == "REMOTE_ZERO_RESET" ||
+        command == "ALL_ZERO" || command == "ALL_ZERO_STATUS" || command == "ALL_ZERO_RESET" ||
         command == "LOCAL_ON" || command == "LOCAL_OFF" || command == "REMOTE_ON" || command == "REMOTE_OFF" ||
         command == "STATUS") {
         
@@ -221,8 +230,9 @@ static void process_ble_command(String command) {
         Serial2.flush();
         commands_forwarded++;
         
-        // Wait for response from ESP32 RX Radio
-        unsigned long timeout = millis() + 5000; // 5 second timeout for ALL_ commands
+        // Wait for response from ESP32 RX Radio (longer timeout for ZERO commands)
+        bool is_zero_command = (command.indexOf("ZERO") >= 0);
+        unsigned long timeout = millis() + (is_zero_command ? 15000 : 5000); // 15s for ZERO, 5s for others
         bool got_response = false;
         while (millis() < timeout) {
             if (Serial2.available()) {
@@ -426,17 +436,24 @@ static inline void create_8channel_sample_from_redis() {
         return;
     }
     
-    // Add 8-channel sample to current batch
+    // Add 8-channel sample to current batch (OPTIMIZED: Convert int32 to int16)
     if (current_sample_count < SAMPLES_PER_BLE_PACKET) {
-        LoadCellSample* sample = &current_ble_packet.samples[current_sample_count];
-        memcpy(sample->local_lc, local_lc, sizeof(sample->local_lc));
-        memcpy(sample->remote_lc, remote_lc, sizeof(sample->remote_lc));
+        CompactLoadCellSample* sample = &current_ble_packet.samples[current_sample_count];
+        
+        // Convert int32_t to int16_t (with saturation to prevent overflow)
+        for (int i = 0; i < 4; i++) {
+            // Clamp to int16_t range (-32768 to 32767)
+            sample->local_lc[i] = (int16_t)constrain(local_lc[i], -32768, 32767);
+            sample->remote_lc[i] = (int16_t)constrain(remote_lc[i], -32768, 32767);
+        }
         current_sample_count++;
     }
     
-    // Send batch when full
-    if (current_sample_count >= SAMPLES_PER_BLE_PACKET) {
+    // OPTIMIZATION: Send batch when full OR force send every 10 samples for 100 packets/sec
+    packet_rate_counter++;
+    if (current_sample_count >= SAMPLES_PER_BLE_PACKET || packet_rate_counter >= 10) {
         send_current_batch();
+        packet_rate_counter = 0;  // Reset counter after sending
     }
 }
 
@@ -448,8 +465,8 @@ static inline void send_current_batch() {
     if (current_sample_count > 0 && deviceConnected) {
         current_ble_packet.sample_count = current_sample_count;
         
-        // Calculate packet size based on actual sample count
-        size_t packet_size = 1 + (current_sample_count * sizeof(LoadCellSample));
+        // Calculate packet size based on actual sample count (OPTIMIZED: Smaller samples)
+        size_t packet_size = 1 + (current_sample_count * sizeof(CompactLoadCellSample));
         
         try {
             pDataCharacteristic->setValue((uint8_t*)&current_ble_packet, packet_size);
@@ -597,6 +614,9 @@ static void handle_serial_commands() {
         if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
             command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
             command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET" ||
+            command == "ZERO" || command == "ZERO_STATUS" || command == "ZERO_RESET" ||
+            command == "REMOTE_ZERO" || command == "REMOTE_ZERO_STATUS" || command == "REMOTE_ZERO_RESET" ||
+            command == "ALL_ZERO" || command == "ALL_ZERO_STATUS" || command == "ALL_ZERO_RESET" ||
             command == "LOCAL_ON" || command == "LOCAL_OFF" || command == "REMOTE_ON" || command == "REMOTE_OFF") {
             
             Serial.printf("[BLE_SLAVE] Forwarding '%s' to ESP32 RX Radio...\n", command.c_str());
@@ -604,8 +624,9 @@ static void handle_serial_commands() {
             Serial2.flush();
             commands_forwarded++;
             
-            // Wait for response from ESP32 RX Radio
-            unsigned long timeout = millis() + 5000; // 5 second timeout for ALL_ commands
+            // Wait for response from ESP32 RX Radio (longer timeout for ZERO commands)
+            bool is_zero_command = (command.indexOf("ZERO") >= 0);
+            unsigned long timeout = millis() + (is_zero_command ? 15000 : 5000); // 15s for ZERO, 5s for others
             bool got_response = false;
             while (millis() < timeout) {
                 if (Serial2.available()) {
@@ -718,9 +739,9 @@ static void handle_serial_commands() {
         } else if (command == "HELP") {
             Serial.println("[BLE_SLAVE] === AVAILABLE COMMANDS ===");
             Serial.println("  Teensy Control (forwarded to RX Radio):");
-            Serial.println("    START, STOP, RESTART, RESET");
-            Serial.println("    REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET");
-            Serial.println("    ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET");
+            Serial.println("    START, STOP, RESTART, RESET, ZERO, ZERO_STATUS, ZERO_RESET");
+            Serial.println("    REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET, REMOTE_ZERO, REMOTE_ZERO_STATUS, REMOTE_ZERO_RESET");
+            Serial.println("    ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET, ALL_ZERO, ALL_ZERO_STATUS, ALL_ZERO_RESET");
             Serial.println("  ESP32 Control (forwarded to RX Radio):");
             Serial.println("    LOCAL_ON/OFF, REMOTE_ON/OFF");
             Serial.println("    RX_STATUS    - Get ESP32 RX Radio status");
@@ -771,9 +792,9 @@ void setup() {
     Serial.println("Data Characteristic (Notify): 87654321-4321-4321-4321-cba987654321");
     Serial.println("Command Characteristic (Write): 11111111-2222-3333-4444-555555555555");
     Serial.println("Available BLE Commands:");
-    Serial.println("  Teensy: START, STOP, RESTART, RESET");
-    Serial.println("  Remote: REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET");
-    Serial.println("  Dual: ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET");
+    Serial.println("  Teensy: START, STOP, RESTART, RESET, ZERO, ZERO_STATUS, ZERO_RESET");
+    Serial.println("  Remote: REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET, REMOTE_ZERO, REMOTE_ZERO_STATUS, REMOTE_ZERO_RESET");
+    Serial.println("  Dual: ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET, ALL_ZERO, ALL_ZERO_STATUS, ALL_ZERO_RESET");
     Serial.println("  ESP32: LOCAL_ON/OFF, REMOTE_ON/OFF, STATUS");
     Serial.println("Serial Commands: STATS, RESET_STATS, BLE_RESTART, UART_STATUS, HELP");
     Serial.println("======================================");

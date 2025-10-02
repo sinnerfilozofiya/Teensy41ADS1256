@@ -526,13 +526,14 @@ void handle_serial_commands() {
     Serial.printf("[SPI_SLAVE] Command received: %s\n", command.c_str());
     
     // Teensy control commands
-    if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET") {
+    if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
+        command == "ZERO" || command == "ZERO_STATUS" || command == "ZERO_RESET") {
       Serial.printf("[SPI_SLAVE] Forwarding '%s' to Remote Teensy...\n", command.c_str());
       Serial1.println(command);
       Serial1.flush();
       
-      // Wait for response from Teensy
-      unsigned long timeout = millis() + 2000; // 2 second timeout
+      // Wait for response from Teensy (longer timeout for ZERO command)
+      unsigned long timeout = millis() + (command == "ZERO" ? 10000 : 2000); // 10s for ZERO, 2s for others
       while (millis() < timeout) {
         if (Serial1.available()) {
           String response = Serial1.readStringUntil('\n');
@@ -582,11 +583,14 @@ void handle_serial_commands() {
       Serial.println("===================================");
     } else if (command == "HELP") {
       Serial.println("[SPI_SLAVE] === AVAILABLE COMMANDS ===");
-      Serial.println("  Teensy Control:");
-      Serial.println("    START       - Start Teensy data acquisition");
-      Serial.println("    STOP        - Stop Teensy data acquisition");
-      Serial.println("    RESTART     - Restart Teensy data acquisition");
-      Serial.println("    RESET       - Reset Teensy");
+        Serial.println("  Teensy Control:");
+        Serial.println("    START       - Start Teensy data acquisition");
+        Serial.println("    STOP        - Stop Teensy data acquisition");
+        Serial.println("    RESTART     - Restart Teensy data acquisition");
+        Serial.println("    RESET       - Reset Teensy");
+        Serial.println("    ZERO        - Zero Teensy load cells (1500 samples)");
+        Serial.println("    ZERO_STATUS - Show Teensy zeroing status");
+        Serial.println("    ZERO_RESET  - Reset Teensy zero offsets");
       Serial.println("  ESP32 Control:");
       Serial.println("    DEBUG_ON/OFF - Enable/disable raw data output");
       Serial.println("    STATUS       - Show system status");
@@ -664,7 +668,7 @@ void setup() {
   Serial.println("[TX] All systems initialized - ready for Teensy data");
   Serial.println("[SPI_SLAVE] ==========================================");
   Serial.println("[SPI_SLAVE] ESP32 SPI Slave ready for commands");
-  Serial.println("[SPI_SLAVE] Teensy commands: START, STOP, RESTART, RESET");
+  Serial.println("[SPI_SLAVE] Teensy commands: START, STOP, RESTART, RESET, ZERO, ZERO_STATUS, ZERO_RESET");
   Serial.println("[SPI_SLAVE] ESP32 commands: DEBUG_ON/OFF, STATUS, NET, HELP");
   Serial.println("[SPI_SLAVE] ==========================================");
 }

@@ -92,6 +92,19 @@ int32_t val2;  // Load cell 2 (AIN2-AIN3)
 int32_t val3;  // Load cell 3 (AIN4-AIN5)
 int32_t val4;  // Load cell 4 (AIN6-AIN7)
 
+// ============================================================================
+// CALIBRATION AND OFFSET MANAGEMENT
+// ============================================================================
+
+// Zero offsets for each load cell (captured during ZERO command)
+int32_t zero_offsets[CHANNELS] = {0, 0, 0, 0};
+bool offsets_applied = false;
+
+// Calibration state
+bool calibration_mode = false;
+int32_t calibration_samples[CHANNELS][100];  // Store 100 samples for averaging
+uint8_t calibration_sample_count = 0;
+
 // Forward declarations for functions in other tabs
 void initADS();
 void SendCMD(uint8_t cmd);
@@ -101,6 +114,115 @@ int32_t read_single_channel_fast(uint8_t channel);
 #ifndef SELFCAL
 #define SELFCAL 0xF0  // Self Offset Calibration
 #endif
+
+// ============================================================================
+// CALIBRATION FUNCTIONS
+// ============================================================================
+
+void zero_load_cells() {
+  Serial.println("[T41] 🔄 Zeroing load cells - capturing offsets...");
+  
+  // Capture 50 samples from each channel for averaging
+  int32_t temp_offsets[CHANNELS] = {0, 0, 0, 0};
+  const int num_samples = 1500;
+  
+  for (int sample = 0; sample < num_samples; sample++) {
+    for (int ch = 0; ch < CHANNELS; ch++) {
+      int32_t raw_value = read_single_channel_fast(ch);
+      temp_offsets[ch] += raw_value;
+      delay(2);  // Small delay between readings
+    }
+  }
+  
+  // Calculate averages and store as offsets
+  for (int ch = 0; ch < CHANNELS; ch++) {
+    zero_offsets[ch] = temp_offsets[ch] / num_samples;
+    Serial.printf("[T41] LC%d offset: %ld\n", ch + 1, zero_offsets[ch]);
+  }
+  
+  offsets_applied = true;
+  Serial.println("[T41] ✅ Load cells zeroed successfully!");
+}
+
+void start_calibration() {
+  Serial.println("[T41] 🔧 Starting calibration mode...");
+  calibration_mode = true;
+  calibration_sample_count = 0;
+  memset(calibration_samples, 0, sizeof(calibration_samples));
+  Serial.println("[T41] Apply known weight and wait for calibration to complete");
+}
+
+void stop_calibration() {
+  if (!calibration_mode) {
+    Serial.println("[T41] ⚠️ Not in calibration mode");
+    return;
+  }
+  
+  calibration_mode = false;
+  
+  if (calibration_sample_count < 10) {
+    Serial.println("[T41] ❌ Not enough calibration samples collected");
+    return;
+  }
+  
+  Serial.println("[T41] 📊 Calibration results:");
+  
+  // Calculate averages for each channel
+  for (int ch = 0; ch < CHANNELS; ch++) {
+    int32_t sum = 0;
+    for (int i = 0; i < calibration_sample_count; i++) {
+      sum += calibration_samples[ch][i];
+    }
+    int32_t average = sum / calibration_sample_count;
+    int32_t zeroed_value = average - zero_offsets[ch];
+    
+    Serial.printf("[T41] LC%d: Raw=%ld, Zeroed=%ld (%d samples)\n", 
+                  ch + 1, average, zeroed_value, calibration_sample_count);
+  }
+  
+  Serial.println("[T41] ✅ Calibration completed!");
+}
+
+void show_current_values() {
+  Serial.println("[T41] 📊 Current Load Cell Values:");
+  Serial.println("[T41] ================================");
+  
+  for (int ch = 0; ch < CHANNELS; ch++) {
+    int32_t raw_value = read_single_channel_fast(ch);
+    int32_t zeroed_value = raw_value - zero_offsets[ch];
+    double voltage = raw_value / bitToVolt;
+    
+    Serial.printf("[T41] LC%d: Raw=%8ld | Zeroed=%8ld | Voltage=%7.4fV\n", 
+                  ch + 1, raw_value, zeroed_value, voltage);
+    delay(5);
+  }
+  
+  Serial.printf("[T41] Offsets Applied: %s\n", offsets_applied ? "YES" : "NO");
+  Serial.println("[T41] ================================");
+}
+
+void reset_calibration() {
+  Serial.println("[T41] 🔄 Resetting calibration data...");
+  
+  // Reset offsets
+  for (int ch = 0; ch < CHANNELS; ch++) {
+    zero_offsets[ch] = 0;
+  }
+  
+  offsets_applied = false;
+  calibration_mode = false;
+  calibration_sample_count = 0;
+  
+  Serial.println("[T41] ✅ Calibration data reset!");
+}
+
+// Apply offsets to raw reading
+int32_t apply_offset(int32_t raw_value, int channel) {
+  if (offsets_applied && channel >= 0 && channel < CHANNELS) {
+    return raw_value - zero_offsets[channel];
+  }
+  return raw_value;
+}
 
 // ============================================================================
 // COMMAND INTERFACE FUNCTIONS
@@ -217,6 +339,26 @@ void handle_esp32_commands() {
       // Software reset
       SCB_AIRCR = 0x05FA0004; // Teensy software reset
     }
+    else if (command == "ZERO") {
+      zero_load_cells();
+      send_status_response("ZERO", "OK");
+    }
+    else if (command == "CAL_START") {
+      start_calibration();
+      send_status_response("CAL_START", "OK");
+    }
+    else if (command == "CAL_STOP") {
+      stop_calibration();
+      send_status_response("CAL_STOP", "OK");
+    }
+    else if (command == "SHOW_VALUES") {
+      show_current_values();
+      send_status_response("SHOW_VALUES", "OK");
+    }
+    else if (command == "RESET_CAL") {
+      reset_calibration();
+      send_status_response("RESET_CAL", "OK");
+    }
     else {
       send_status_response(command.c_str(), "ERROR");
     }
@@ -257,12 +399,47 @@ void handle_serial_monitor_commands() {
       delay(1000);
       SCB_AIRCR = 0x05FA0004; // Teensy software reset
     }
+    else if (command == "ZERO") {
+      zero_load_cells();
+    }
+    else if (command == "CAL_START") {
+      start_calibration();
+    }
+    else if (command == "CAL_STOP") {
+      stop_calibration();
+    }
+    else if (command == "SHOW_VALUES" || command == "SHOW") {
+      show_current_values();
+    }
+    else if (command == "RESET_CAL") {
+      reset_calibration();
+    }
+    else if (command == "HELP") {
+      Serial.println("[T41] ==========================================");
+      Serial.println("[T41] AVAILABLE COMMANDS:");
+      Serial.println("[T41] ==========================================");
+      Serial.println("[T41] Data Acquisition:");
+      Serial.println("[T41]   START       - Start data acquisition");
+      Serial.println("[T41]   STOP        - Stop data acquisition");
+      Serial.println("[T41]   RESTART     - Restart data acquisition");
+      Serial.println("[T41]   RESET       - Reset Teensy");
+      Serial.println("[T41] ");
+      Serial.println("[T41] Calibration:");
+      Serial.println("[T41]   ZERO        - Zero all load cells (capture offsets)");
+      Serial.println("[T41]   CAL_START   - Start calibration mode");
+      Serial.println("[T41]   CAL_STOP    - Stop calibration and show results");
+      Serial.println("[T41]   SHOW_VALUES - Show current load cell readings");
+      Serial.println("[T41]   RESET_CAL   - Reset all calibration data");
+      Serial.println("[T41] ");
+      Serial.println("[T41]   HELP        - Show this help");
+      Serial.println("[T41] ==========================================");
+    }
     else if (command == "") {
       // Empty command, do nothing
     }
     else {
       Serial.printf("[T41] ✗ Unknown command: '%s'\n", command.c_str());
-      Serial.println("[T41] Available: START, STOP, RESTART, RESET");
+      Serial.println("[T41] Type 'HELP' for available commands");
     }
   }
 }
@@ -329,7 +506,8 @@ void setup() {
   st.last_ms = st.start_ms;
   
   Serial.println("[T41] Ready - waiting for commands");
-  Serial.println("[T41] Available commands: START, STOP, RESTART, RESET");
+  Serial.println("[T41] Type 'HELP' for available commands");
+  Serial.println("[T41] Quick start: ZERO (to zero), START (to begin)");
   Serial.println("[T41] ==========================================");
   
   // Send initial state to ESP32
@@ -359,10 +537,27 @@ void loop() {
       sample_timer = 0;
       
       // Read current channel only
-      int32_t current_value = read_single_channel_fast(current_channel);
+      int32_t raw_value = read_single_channel_fast(current_channel);
+      
+      // Apply offset if enabled
+      int32_t processed_value = apply_offset(raw_value, current_channel);
       
       // Store in appropriate buffer
-      sample_buffer[current_channel][buffer_index] = current_value;
+      sample_buffer[current_channel][buffer_index] = processed_value;
+      
+      // Collect calibration samples if in calibration mode
+      if (calibration_mode && calibration_sample_count < 100) {
+        calibration_samples[current_channel][calibration_sample_count] = raw_value;
+        
+        // Only increment counter when all channels have been sampled
+        if (current_channel == CHANNELS - 1) {
+          calibration_sample_count++;
+          if (calibration_sample_count >= 100) {
+            Serial.println("[T41] 📊 Calibration samples collected (100 samples per channel)");
+            Serial.println("[T41] Use 'CAL_STOP' to finish calibration");
+          }
+        }
+      }
       
       // Move to next channel
       current_channel++;

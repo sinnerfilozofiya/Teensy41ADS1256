@@ -431,13 +431,14 @@ static void handle_serial_commands() {
 
 static void process_command(String command) {
     // Local Teensy control commands
-    if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET") {
+    if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" || 
+        command == "ZERO" || command == "ZERO_STATUS" || command == "ZERO_RESET") {
             Serial.printf("[RX_RADIO] Forwarding '%s' to Local Teensy...\n", command.c_str());
             Serial1.println(command);
             Serial1.flush();
             
-            // Wait for response from Teensy
-            unsigned long timeout = millis() + 2000; // 2 second timeout
+            // Wait for response from Teensy (longer timeout for ZERO command)
+            unsigned long timeout = millis() + (command == "ZERO" ? 10000 : 2000); // 10s for ZERO, 2s for others
             while (millis() < timeout) {
                 if (Serial1.available()) {
                     String response = Serial1.readStringUntil('\n');
@@ -451,7 +452,8 @@ static void process_command(String command) {
             }
     }
     // Remote Teensy control commands (via ESP-NOW)
-    else if (command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET") {
+    else if (command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
+             command == "REMOTE_ZERO" || command == "REMOTE_ZERO_STATUS" || command == "REMOTE_ZERO_RESET") {
         String teensy_command = command.substring(7); // Remove "REMOTE_" prefix
         Serial.printf("[RX_RADIO] Sending '%s' to Remote Teensy via ESP-NOW...\n", teensy_command.c_str());
         if (send_espnow_command(teensy_command.c_str())) {
@@ -461,7 +463,8 @@ static void process_command(String command) {
         }
     }
     // ALL commands - control both local and remote Teensy simultaneously
-    else if (command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET") {
+    else if (command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET" ||
+             command == "ALL_ZERO" || command == "ALL_ZERO_STATUS" || command == "ALL_ZERO_RESET") {
         String teensy_command = command.substring(4); // Remove "ALL_" prefix
         Serial.printf("[RX_RADIO] Executing '%s' on BOTH Local and Remote Teensy...\n", teensy_command.c_str());
         
@@ -473,8 +476,8 @@ static void process_command(String command) {
         Serial1.println(teensy_command);
         Serial1.flush();
         
-        // Wait for local response
-        unsigned long timeout = millis() + 2000;
+        // Wait for local response (longer timeout for ZERO commands)
+        unsigned long timeout = millis() + (teensy_command == "ZERO" ? 10000 : 2000);
         while (millis() < timeout) {
             if (Serial1.available()) {
                 String response = Serial1.readStringUntil('\n');
@@ -534,16 +537,25 @@ static void process_command(String command) {
         Serial.println("    STOP          - Stop local Teensy data acquisition");
         Serial.println("    RESTART       - Restart local Teensy data acquisition");
         Serial.println("    RESET         - Reset local Teensy");
+        Serial.println("    ZERO          - Zero local Teensy load cells (1500 samples)");
+        Serial.println("    ZERO_STATUS   - Show local Teensy zeroing status");
+        Serial.println("    ZERO_RESET    - Reset local Teensy zero offsets");
         Serial.println("  Remote Teensy Control (via ESP-NOW):");
         Serial.println("    REMOTE_START  - Start remote Teensy data acquisition");
         Serial.println("    REMOTE_STOP   - Stop remote Teensy data acquisition");
         Serial.println("    REMOTE_RESTART- Restart remote Teensy data acquisition");
         Serial.println("    REMOTE_RESET  - Reset remote Teensy");
+        Serial.println("    REMOTE_ZERO   - Zero remote Teensy load cells (1500 samples)");
+        Serial.println("    REMOTE_ZERO_STATUS - Show remote Teensy zeroing status");
+        Serial.println("    REMOTE_ZERO_RESET  - Reset remote Teensy zero offsets");
         Serial.println("  Dual Teensy Control (Both Local & Remote):");
         Serial.println("    ALL_START     - Start BOTH Teensy units simultaneously");
         Serial.println("    ALL_STOP      - Stop BOTH Teensy units simultaneously");
         Serial.println("    ALL_RESTART   - Restart BOTH Teensy units simultaneously");
         Serial.println("    ALL_RESET     - Reset BOTH Teensy units simultaneously");
+        Serial.println("    ALL_ZERO      - Zero BOTH Teensy units simultaneously");
+        Serial.println("    ALL_ZERO_STATUS - Show zeroing status for BOTH units");
+        Serial.println("    ALL_ZERO_RESET  - Reset zero offsets for BOTH units");
         Serial.println("  ESP32 Control:");
         Serial.println("    LOCAL_ON/OFF  - Enable/disable local data");
         Serial.println("    REMOTE_ON/OFF - Enable/disable remote data");
@@ -628,9 +640,9 @@ void setup() {
     
     Serial.println("[RX_RADIO] ==========================================");
     Serial.println("[RX_RADIO] ESP32 RX Radio ready for commands");
-    Serial.println("[RX_RADIO] Local Teensy: START, STOP, RESTART, RESET");
-    Serial.println("[RX_RADIO] Remote Teensy: REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET");
-    Serial.println("[RX_RADIO] Both Teensy: ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET");
+        Serial.println("[RX_RADIO] Local Teensy: START, STOP, RESTART, RESET, ZERO, ZERO_STATUS, ZERO_RESET");
+        Serial.println("[RX_RADIO] Remote Teensy: REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET, REMOTE_ZERO, REMOTE_ZERO_STATUS, REMOTE_ZERO_RESET");
+        Serial.println("[RX_RADIO] Both Teensy: ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET, ALL_ZERO, ALL_ZERO_STATUS, ALL_ZERO_RESET");
     Serial.println("[RX_RADIO] ESP32 commands: LOCAL_ON/OFF, REMOTE_ON/OFF, STATUS, HELP");
     Serial.println("[RX_RADIO] ==========================================");
 }
