@@ -18,8 +18,10 @@
 #define PIN_CS   10
 
 // UART pins for Teensy communication (Serial1)
-#define TEENSY_UART_TX_PIN 2   // GPIO2 for UART TX to Teensy
-#define TEENSY_UART_RX_PIN 3   // GPIO3 for UART RX from Teensy
+// ESP32 TX (GPIO2) -> Teensy RX3 (Pin 15) ✓
+// ESP32 RX (GPIO3) -> Teensy TX3 (Pin 14) ✓
+#define TEENSY_UART_TX_PIN 2   // GPIO2 for UART TX to Teensy RX3 (Pin 15)
+#define TEENSY_UART_RX_PIN 3   // GPIO3 for UART RX from Teensy TX3 (Pin 14)
 
 // RGB LED pin
 #define RGB_LED_PIN 38         // GPIO38 for WS2812B RGB LED status indicator
@@ -90,12 +92,41 @@ static volatile uint32_t espnow_commands_received = 0;
 static volatile uint32_t espnow_command_errors = 0;
 
 // ============================================================================
+// STRUCTURED RESPONSE SYSTEM
+// ============================================================================
+
+enum ResponseType {
+    RESP_UNKNOWN = 0,
+    RESP_OK = 1,
+    RESP_ERROR = 2,
+    RESP_STATUS = 3,
+    RESP_ZERO_STATUS = 4,
+    RESP_STATE = 5,
+    RESP_TIMEOUT = 6
+};
+
+struct TeensyResponse {
+    ResponseType type;
+    String command;
+    String status;
+    String data;
+    bool success;
+    unsigned long response_time_ms;
+};
+
+// Response statistics
+static volatile uint32_t total_commands_sent = 0;
+static volatile uint32_t successful_responses = 0;
+static volatile uint32_t failed_responses = 0;
+static volatile uint32_t timeout_responses = 0;
+
+// ============================================================================
 // ESP-NOW COMMAND STRUCTURES AND FUNCTIONS
 // ============================================================================
 
 // ESP-NOW command packet (16 bytes)
 struct __attribute__((packed)) ESPNowCommand {
-    uint8_t magic[2];   // 0xCC, 0xDD (Command magic)
+    uint8_t magic[2];   // 0xCD, 0xD1 (Command magic)
     uint8_t command[8]; // Command string (null-terminated)
     uint32_t timestamp; // Timestamp for deduplication
     uint16_t crc16;     // CRC16 of packet
@@ -105,6 +136,11 @@ struct __attribute__((packed)) ESPNowCommand {
 bool create_espnow_command(ESPNowCommand* cmd, const char* command_str);
 bool validate_espnow_command(const ESPNowCommand* cmd);
 static void process_espnow_command(const ESPNowCommand* cmd);
+
+// Response system forward declarations
+TeensyResponse parse_teensy_response(const String& raw_response, const String& command, unsigned long response_time);
+TeensyResponse send_command_with_response(const String& command, unsigned long timeout_ms = 2000);
+void print_response_summary(const TeensyResponse& response);
 
 // ============================================================================
 // ESP-NOW COMMAND PROCESSING
@@ -116,25 +152,164 @@ static void process_espnow_command(const ESPNowCommand* cmd) {
     Serial.printf("[SPI_SLAVE] ESP-NOW Command received: %s\n", command_str);
     Serial.printf("[SPI_SLAVE] Forwarding '%s' to Remote Teensy...\n", command_str);
     
+    // Debug: Check Serial1 buffer space before sending
+    Serial.printf("[SPI_SLAVE] Serial1 TX buffer space: %d bytes\n", Serial1.availableForWrite());
+    
     // Forward command to Teensy via Serial1
     Serial1.println(command_str);
     Serial1.flush();
+    Serial.printf("[SPI_SLAVE] Command sent, waiting for response...\n");
     
     // Wait for response from Teensy
     unsigned long timeout = millis() + 2000; // 2 second timeout
+    bool response_received = false;
     while (millis() < timeout) {
         if (Serial1.available()) {
             String response = Serial1.readStringUntil('\n');
             Serial.printf("[SPI_SLAVE] Remote Teensy Response: %s\n", response.c_str());
+            response_received = true;
             break;
         }
         delay(10);
     }
-    if (millis() >= timeout) {
-        Serial.println("[SPI_SLAVE] ⚠ Remote Teensy response timeout");
+    if (!response_received) {
+        Serial.printf("[SPI_SLAVE] ⚠ Remote Teensy response timeout after %dms\n", 2000);
+        Serial.printf("[SPI_SLAVE] Debug: Serial1 RX buffer has %d bytes available\n", Serial1.available());
     }
     
     espnow_commands_received++;
+}
+
+// ============================================================================
+// STRUCTURED RESPONSE SYSTEM IMPLEMENTATION
+// ============================================================================
+
+TeensyResponse parse_teensy_response(const String& raw_response, const String& command, unsigned long response_time) {
+    TeensyResponse response;
+    response.command = command;
+    response.response_time_ms = response_time;
+    response.success = false;
+    response.type = RESP_UNKNOWN;
+    
+    if (raw_response.length() == 0) {
+        response.type = RESP_TIMEOUT;
+        response.status = "TIMEOUT";
+        response.data = "";
+        return response;
+    }
+    
+    // Parse different response formats
+    if (raw_response.startsWith("RESP:")) {
+        // Format: RESP:COMMAND:STATUS
+        int first_colon = raw_response.indexOf(':', 5);
+        if (first_colon > 0) {
+            String resp_command = raw_response.substring(5, first_colon);
+            String resp_status = raw_response.substring(first_colon + 1);
+            
+            response.command = resp_command;
+            response.status = resp_status;
+            response.success = (resp_status == "OK");
+            response.type = response.success ? RESP_OK : RESP_ERROR;
+        }
+    }
+    else if (raw_response.startsWith("STATUS:")) {
+        // Format: STATUS:state=RUNNING,frames=123,offsets=applied
+        response.type = RESP_STATUS;
+        response.status = "OK";
+        response.data = raw_response.substring(7);
+        response.success = true;
+    }
+    else if (raw_response.startsWith("ZERO_STATUS:")) {
+        // Format: ZERO_STATUS:offsets_applied=true,lc1=123,lc2=456,lc3=789,lc4=012
+        response.type = RESP_ZERO_STATUS;
+        response.status = "OK";
+        response.data = raw_response.substring(12);
+        response.success = true;
+    }
+    else if (raw_response.startsWith("STATE:")) {
+        // Format: STATE:RUNNING
+        response.type = RESP_STATE;
+        response.status = "OK";
+        response.data = raw_response.substring(6);
+        response.success = true;
+    }
+    else if (raw_response.indexOf("OK") >= 0) {
+        // Generic OK response
+        response.type = RESP_OK;
+        response.status = "OK";
+        response.success = true;
+    }
+    else if (raw_response.indexOf("ERROR") >= 0) {
+        // Generic ERROR response
+        response.type = RESP_ERROR;
+        response.status = "ERROR";
+        response.success = false;
+    }
+    else {
+        // Unknown format - treat as informational
+        response.type = RESP_UNKNOWN;
+        response.status = "UNKNOWN";
+        response.data = raw_response;
+        response.success = false;
+    }
+    
+    return response;
+}
+
+TeensyResponse send_command_with_response(const String& command, unsigned long timeout_ms) {
+    total_commands_sent++;
+    
+    Serial.printf("[SPI_SLAVE] Sending command: %s\n", command.c_str());
+    Serial.printf("[SPI_SLAVE] Serial1 TX buffer space: %d bytes\n", Serial1.availableForWrite());
+    
+    unsigned long start_time = millis();
+    Serial1.println(command);
+    Serial1.flush();
+    
+    unsigned long timeout = millis() + timeout_ms;
+    String raw_response = "";
+    bool response_received = false;
+    
+    while (millis() < timeout) {
+        if (Serial1.available()) {
+            raw_response = Serial1.readStringUntil('\n');
+            response_received = true;
+            break;
+        }
+        delay(10);
+    }
+    
+    unsigned long response_time = millis() - start_time;
+    
+    TeensyResponse response;
+    if (response_received) {
+        response = parse_teensy_response(raw_response, command, response_time);
+        if (response.success) {
+            successful_responses++;
+        } else {
+            failed_responses++;
+        }
+    } else {
+        timeout_responses++;
+        response = parse_teensy_response("", command, response_time);
+        Serial.printf("[SPI_SLAVE] Debug: Serial1 RX buffer has %d bytes available\n", Serial1.available());
+    }
+    
+    return response;
+}
+
+void print_response_summary(const TeensyResponse& response) {
+    const char* type_names[] = {"UNKNOWN", "OK", "ERROR", "STATUS", "ZERO_STATUS", "STATE", "TIMEOUT"};
+    
+    Serial.printf("[SPI_SLAVE] Response Summary:\n");
+    Serial.printf("  Command: %s\n", response.command.c_str());
+    Serial.printf("  Type: %s\n", type_names[response.type]);
+    Serial.printf("  Status: %s\n", response.status.c_str());
+    Serial.printf("  Success: %s\n", response.success ? "YES" : "NO");
+    Serial.printf("  Response Time: %lu ms\n", response.response_time_ms);
+    if (response.data.length() > 0) {
+        Serial.printf("  Data: %s\n", response.data.c_str());
+    }
 }
 
 // ============================================================================
@@ -145,8 +320,8 @@ bool create_espnow_command(ESPNowCommand* cmd, const char* command_str) {
     if (strlen(command_str) >= 8) return false; // Command too long
     
     memset(cmd, 0, sizeof(ESPNowCommand));
-    cmd->magic[0] = 0xCC;
-    cmd->magic[1] = 0xDD;
+    cmd->magic[0] = 0xCD;
+    cmd->magic[1] = 0xD1;
     strncpy((char*)cmd->command, command_str, 7);
     cmd->command[7] = '\0';
     cmd->timestamp = millis();
@@ -157,7 +332,7 @@ bool create_espnow_command(ESPNowCommand* cmd, const char* command_str) {
 }
 
 bool validate_espnow_command(const ESPNowCommand* cmd) {
-    if (cmd->magic[0] != 0xCC || cmd->magic[1] != 0xDD) {
+    if (cmd->magic[0] != 0xCD || cmd->magic[1] != 0xD1) {
         return false;
     }
     
@@ -529,21 +704,18 @@ void handle_serial_commands() {
     if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
         command == "ZERO" || command == "ZERO_STATUS" || command == "ZERO_RESET") {
       Serial.printf("[SPI_SLAVE] Forwarding '%s' to Remote Teensy...\n", command.c_str());
-      Serial1.println(command);
-      Serial1.flush();
       
-      // Wait for response from Teensy (longer timeout for ZERO command)
-      unsigned long timeout = millis() + (command == "ZERO" ? 10000 : 2000); // 10s for ZERO, 2s for others
-      while (millis() < timeout) {
-        if (Serial1.available()) {
-          String response = Serial1.readStringUntil('\n');
-          Serial.printf("[SPI_SLAVE] Teensy Response: %s\n", response.c_str());
-          break;
-        }
-        delay(10);
-      }
-      if (millis() >= timeout) {
-        Serial.println("[SPI_SLAVE] ⚠ Teensy response timeout");
+      // Use structured response system
+      unsigned long timeout_ms = (command == "ZERO" ? 10000 : 2000); // 10s for ZERO, 2s for others
+      TeensyResponse response = send_command_with_response(command, timeout_ms);
+      
+      // Print detailed response information
+      print_response_summary(response);
+      
+      if (response.success) {
+        Serial.printf("[SPI_SLAVE] ✓ Command '%s' executed successfully\n", command.c_str());
+      } else {
+        Serial.printf("[SPI_SLAVE] ✗ Command '%s' failed: %s\n", command.c_str(), response.status.c_str());
       }
     }
     // ESP32 control commands
@@ -560,6 +732,10 @@ void handle_serial_commands() {
       Serial.printf("  Raw data: %s\n", output_raw_data ? "ON" : "OFF");
       Serial.printf("  ESP-NOW commands received: %lu\n", (unsigned long)espnow_commands_received);
       Serial.printf("  ESP-NOW command errors: %lu\n", (unsigned long)espnow_command_errors);
+      Serial.printf("  Teensy commands sent: %lu\n", (unsigned long)total_commands_sent);
+      Serial.printf("  Successful responses: %lu\n", (unsigned long)successful_responses);
+      Serial.printf("  Failed responses: %lu\n", (unsigned long)failed_responses);
+      Serial.printf("  Timeout responses: %lu\n", (unsigned long)timeout_responses);
 #if USE_WIFI_UDP
       Serial.printf("  WiFi: %s\n", wifi_connected ? "Connected" : "Disconnected");
       if (wifi_connected) {
@@ -581,6 +757,55 @@ void handle_serial_commands() {
       Serial.printf("  ESP-NOW fail: %lu\n", (unsigned long)espnow_send_fail);
 #endif
       Serial.println("===================================");
+    } else if (command == "TEST_UART") {
+      Serial.println("[SPI_SLAVE] === UART COMMUNICATION TEST ===");
+      Serial.printf("[SPI_SLAVE] Testing UART communication with Teensy...\n");
+      Serial.printf("[SPI_SLAVE] TX Pin: %d, RX Pin: %d, Baud: 115200\n", TEENSY_UART_TX_PIN, TEENSY_UART_RX_PIN);
+      
+      // Send a simple test command
+      Serial1.println("HELP");
+      Serial1.flush();
+      Serial.printf("[SPI_SLAVE] Sent 'HELP' command, waiting for response...\n");
+      
+      unsigned long timeout = millis() + 3000; // 3 second timeout
+      bool got_response = false;
+      while (millis() < timeout) {
+        if (Serial1.available()) {
+          String response = Serial1.readStringUntil('\n');
+          Serial.printf("[SPI_SLAVE] Teensy: %s\n", response.c_str());
+          got_response = true;
+          // Continue reading until timeout to get full response
+        }
+        delay(10);
+      }
+      
+      if (!got_response) {
+        Serial.println("[SPI_SLAVE] ✗ No response from Teensy - check wiring!");
+        Serial.printf("[SPI_SLAVE] Expected: ESP32 TX(GPIO%d) -> Teensy RX3(Pin15)\n", TEENSY_UART_TX_PIN);
+        Serial.printf("[SPI_SLAVE] Expected: ESP32 RX(GPIO%d) -> Teensy TX3(Pin14)\n", TEENSY_UART_RX_PIN);
+      } else {
+        Serial.println("[SPI_SLAVE] ✓ UART communication working!");
+      }
+      Serial.println("==========================================");
+    } else if (command == "TEST_RESPONSES") {
+      Serial.println("[SPI_SLAVE] === TESTING STRUCTURED RESPONSE SYSTEM ===");
+      
+      String test_commands[] = {"STATUS", "ZERO_STATUS", "START", "STOP"};
+      int num_tests = 4;
+      
+      for (int i = 0; i < num_tests; i++) {
+        Serial.printf("[SPI_SLAVE] Test %d/%d: %s\n", i+1, num_tests, test_commands[i].c_str());
+        TeensyResponse response = send_command_with_response(test_commands[i], 3000);
+        print_response_summary(response);
+        Serial.println("---");
+        delay(500); // Brief pause between tests
+      }
+      
+      Serial.println("[SPI_SLAVE] === RESPONSE SYSTEM TEST COMPLETE ===");
+      Serial.printf("Total Success Rate: %.1f%% (%lu/%lu)\n", 
+                    total_commands_sent > 0 ? (successful_responses * 100.0 / total_commands_sent) : 0.0,
+                    (unsigned long)successful_responses, (unsigned long)total_commands_sent);
+      Serial.println("================================================");
     } else if (command == "HELP") {
       Serial.println("[SPI_SLAVE] === AVAILABLE COMMANDS ===");
         Serial.println("  Teensy Control:");
@@ -595,6 +820,8 @@ void handle_serial_commands() {
       Serial.println("    DEBUG_ON/OFF - Enable/disable raw data output");
       Serial.println("    STATUS       - Show system status");
       Serial.println("    NET          - Show network statistics");
+      Serial.println("    TEST_UART    - Test UART communication with Teensy");
+      Serial.println("    TEST_RESPONSES - Test structured response system");
       Serial.println("    HELP         - Show this help");
       Serial.println("======================================");
     } else if (command == "") {
@@ -658,6 +885,32 @@ void setup() {
   Serial1.begin(115200, SERIAL_8N1, TEENSY_UART_RX_PIN, TEENSY_UART_TX_PIN);
   Serial.printf("[TX] Serial1 initialized at 115200 bps for Teensy communication (TX=%d, RX=%d)\n", 
                 TEENSY_UART_TX_PIN, TEENSY_UART_RX_PIN);
+  
+  // Test UART connection at startup
+  delay(1000); // Give Teensy time to boot
+  Serial.println("[TX] Testing UART connection to Teensy...");
+  Serial1.println("STATUS");
+  Serial1.flush();
+  
+  unsigned long test_timeout = millis() + 2000;
+  bool teensy_responded = false;
+  while (millis() < test_timeout) {
+    if (Serial1.available()) {
+      String response = Serial1.readStringUntil('\n');
+      Serial.printf("[TX] Teensy startup response: %s\n", response.c_str());
+      teensy_responded = true;
+      break;
+    }
+    delay(10);
+  }
+  
+  if (!teensy_responded) {
+    Serial.println("[TX] ⚠ WARNING: No response from Teensy during startup!");
+    Serial.println("[TX] Check UART wiring: ESP32 TX(GPIO2)->Teensy RX3(Pin15), ESP32 RX(GPIO3)->Teensy TX3(Pin14)");
+    Serial.println("[TX] Use 'TEST_UART' command to diagnose communication issues");
+  } else {
+    Serial.println("[TX] ✓ Teensy UART communication verified");
+  }
 
   // Start tasks
   t0_ms = millis();

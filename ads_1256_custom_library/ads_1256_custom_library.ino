@@ -343,6 +343,25 @@ void handle_esp32_commands() {
       zero_load_cells();
       send_status_response("ZERO", "OK");
     }
+    else if (command == "ZERO_STATUS") {
+      Serial3.printf("ZERO_STATUS:offsets_applied=%s,lc1=%ld,lc2=%ld,lc3=%ld,lc4=%ld\n", 
+                     offsets_applied ? "true" : "false",
+                     zero_offsets[0], zero_offsets[1], zero_offsets[2], zero_offsets[3]);
+      Serial3.flush();
+      send_status_response("ZERO_STATUS", "OK");
+    }
+    else if (command == "ZERO_RESET") {
+      reset_calibration();
+      send_status_response("ZERO_RESET", "OK");
+    }
+    else if (command == "STATUS") {
+      const char* state_names[] = {"STOPPED", "STARTING", "RUNNING", "STOPPING", "ERROR"};
+      Serial3.printf("STATUS:state=%s,frames=%lu,offsets=%s\n", 
+                     state_names[current_state], (unsigned long)st.frames_sent,
+                     offsets_applied ? "applied" : "none");
+      Serial3.flush();
+      send_status_response("STATUS", "OK");
+    }
     else if (command == "CAL_START") {
       start_calibration();
       send_status_response("CAL_START", "OK");
@@ -402,6 +421,24 @@ void handle_serial_monitor_commands() {
     else if (command == "ZERO") {
       zero_load_cells();
     }
+    else if (command == "ZERO_STATUS") {
+      Serial.printf("[T41] Zero Status: offsets_applied=%s\n", offsets_applied ? "true" : "false");
+      for (int i = 0; i < CHANNELS; i++) {
+        Serial.printf("[T41] LC%d offset: %ld\n", i + 1, zero_offsets[i]);
+      }
+    }
+    else if (command == "ZERO_RESET") {
+      reset_calibration();
+    }
+    else if (command == "STATUS") {
+      const char* state_names[] = {"STOPPED", "STARTING", "RUNNING", "STOPPING", "ERROR"};
+      Serial.printf("[T41] === TEENSY STATUS ===\n");
+      Serial.printf("[T41] State: %s\n", state_names[current_state]);
+      Serial.printf("[T41] Frames sent: %lu\n", (unsigned long)st.frames_sent);
+      Serial.printf("[T41] Offsets applied: %s\n", offsets_applied ? "YES" : "NO");
+      Serial.printf("[T41] Uptime: %lu ms\n", millis());
+      Serial.println("[T41] =======================");
+    }
     else if (command == "CAL_START") {
       start_calibration();
     }
@@ -426,10 +463,15 @@ void handle_serial_monitor_commands() {
       Serial.println("[T41] ");
       Serial.println("[T41] Calibration:");
       Serial.println("[T41]   ZERO        - Zero all load cells (capture offsets)");
+      Serial.println("[T41]   ZERO_STATUS - Show current zero offsets");
+      Serial.println("[T41]   ZERO_RESET  - Reset zero offsets");
       Serial.println("[T41]   CAL_START   - Start calibration mode");
       Serial.println("[T41]   CAL_STOP    - Stop calibration and show results");
       Serial.println("[T41]   SHOW_VALUES - Show current load cell readings");
       Serial.println("[T41]   RESET_CAL   - Reset all calibration data");
+      Serial.println("[T41] ");
+      Serial.println("[T41] System:");
+      Serial.println("[T41]   STATUS      - Show system status");
       Serial.println("[T41] ");
       Serial.println("[T41]   HELP        - Show this help");
       Serial.println("[T41] ==========================================");

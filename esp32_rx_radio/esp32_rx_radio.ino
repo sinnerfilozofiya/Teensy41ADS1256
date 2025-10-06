@@ -205,7 +205,7 @@ static unsigned long espnow_command_errors = 0;
 
 // ESP-NOW command packet (16 bytes)
 struct __attribute__((packed)) ESPNowCommand {
-    uint8_t magic[2];   // 0xCC, 0xDD (Command magic)
+    uint8_t magic[2];   // 0xCD, 0xD1 (Command magic)
     uint8_t command[8]; // Command string (null-terminated)
     uint32_t timestamp; // Timestamp for deduplication
     uint16_t crc16;     // CRC16 of packet
@@ -247,8 +247,8 @@ bool create_espnow_command(ESPNowCommand* cmd, const char* command_str) {
     if (strlen(command_str) >= 8) return false; // Command too long
     
     memset(cmd, 0, sizeof(ESPNowCommand));
-    cmd->magic[0] = 0xCC;
-    cmd->magic[1] = 0xDD;
+    cmd->magic[0] = 0xCD;
+    cmd->magic[1] = 0xD1;
     strncpy((char*)cmd->command, command_str, 7);
     cmd->command[7] = '\0';
     cmd->timestamp = millis();
@@ -259,7 +259,7 @@ bool create_espnow_command(ESPNowCommand* cmd, const char* command_str) {
 }
 
 bool validate_espnow_command(const ESPNowCommand* cmd) {
-    if (cmd->magic[0] != 0xCC || cmd->magic[1] != 0xDD) {
+    if (cmd->magic[0] != 0xCD || cmd->magic[1] != 0xD1) {
         return false;
     }
     
@@ -434,21 +434,30 @@ static void process_command(String command) {
     if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" || 
         command == "ZERO" || command == "ZERO_STATUS" || command == "ZERO_RESET") {
             Serial.printf("[RX_RADIO] Forwarding '%s' to Local Teensy...\n", command.c_str());
+            
+            // Debug: Check Serial1 buffer space before sending
+            Serial.printf("[RX_RADIO] Serial1 TX buffer space: %d bytes\n", Serial1.availableForWrite());
+            
             Serial1.println(command);
             Serial1.flush();
+            Serial.printf("[RX_RADIO] Command sent, waiting for response...\n");
             
             // Wait for response from Teensy (longer timeout for ZERO command)
-            unsigned long timeout = millis() + (command == "ZERO" ? 10000 : 2000); // 10s for ZERO, 2s for others
+            unsigned long timeout_ms = (command == "ZERO" ? 10000 : 2000); // 10s for ZERO, 2s for others
+            unsigned long timeout = millis() + timeout_ms;
+            bool response_received = false;
             while (millis() < timeout) {
                 if (Serial1.available()) {
                     String response = Serial1.readStringUntil('\n');
                     Serial.printf("[RX_RADIO] Local Teensy Response: %s\n", response.c_str());
+                    response_received = true;
                     break;
                 }
                 delay(10);
             }
-            if (millis() >= timeout) {
-                Serial.println("[RX_RADIO] ⚠ Local Teensy response timeout");
+            if (!response_received) {
+                Serial.printf("[RX_RADIO] ⚠ Local Teensy response timeout after %lums\n", timeout_ms);
+                Serial.printf("[RX_RADIO] Debug: Serial1 RX buffer has %d bytes available\n", Serial1.available());
             }
     }
     // Remote Teensy control commands (via ESP-NOW)
@@ -473,22 +482,31 @@ static void process_command(String command) {
         
         // Send to Local Teensy first
         Serial.printf("[RX_RADIO] 1/2 Sending '%s' to Local Teensy...\n", teensy_command.c_str());
+        
+        // Debug: Check Serial1 buffer space before sending
+        Serial.printf("[RX_RADIO] Serial1 TX buffer space: %d bytes\n", Serial1.availableForWrite());
+        
         Serial1.println(teensy_command);
         Serial1.flush();
+        Serial.printf("[RX_RADIO] Local command sent, waiting for response...\n");
         
         // Wait for local response (longer timeout for ZERO commands)
-        unsigned long timeout = millis() + (teensy_command == "ZERO" ? 10000 : 2000);
+        unsigned long timeout_ms = (teensy_command == "ZERO" ? 10000 : 2000);
+        unsigned long timeout = millis() + timeout_ms;
+        bool local_response_received = false;
         while (millis() < timeout) {
             if (Serial1.available()) {
                 String response = Serial1.readStringUntil('\n');
                 Serial.printf("[RX_RADIO] Local Teensy Response: %s\n", response.c_str());
                 local_success = response.indexOf("OK") >= 0;
+                local_response_received = true;
                 break;
             }
             delay(10);
         }
-        if (millis() >= timeout) {
-            Serial.println("[RX_RADIO] ⚠ Local Teensy response timeout");
+        if (!local_response_received) {
+            Serial.printf("[RX_RADIO] ⚠ Local Teensy response timeout after %lums\n", timeout_ms);
+            Serial.printf("[RX_RADIO] Debug: Serial1 RX buffer has %d bytes available\n", Serial1.available());
         }
         
         // Send to Remote Teensy via ESP-NOW
@@ -519,6 +537,36 @@ static void process_command(String command) {
     } else if (command == "REMOTE_OFF") {
         output_remote_data = false;
         Serial.println("[RX_RADIO] ✓ Remote data output disabled");
+    } else if (command == "TEST_UART") {
+        Serial.println("[RX_RADIO] === UART COMMUNICATION TEST ===");
+        Serial.printf("[RX_RADIO] Testing UART communication with Local Teensy...\n");
+        Serial.printf("[RX_RADIO] TX Pin: %d, RX Pin: %d, Baud: 115200\n", TEENSY_UART_TX_PIN, TEENSY_UART_RX_PIN);
+        
+        // Send a simple test command
+        Serial1.println("HELP");
+        Serial1.flush();
+        Serial.printf("[RX_RADIO] Sent 'HELP' command, waiting for response...\n");
+        
+        unsigned long timeout = millis() + 3000; // 3 second timeout
+        bool got_response = false;
+        while (millis() < timeout) {
+            if (Serial1.available()) {
+                String response = Serial1.readStringUntil('\n');
+                Serial.printf("[RX_RADIO] Local Teensy: %s\n", response.c_str());
+                got_response = true;
+                // Continue reading until timeout to get full response
+            }
+            delay(10);
+        }
+        
+        if (!got_response) {
+            Serial.println("[RX_RADIO] ✗ No response from Local Teensy - check wiring!");
+            Serial.printf("[RX_RADIO] Expected: ESP32 TX(GPIO%d) -> Teensy RX3(Pin15)\n", TEENSY_UART_TX_PIN);
+            Serial.printf("[RX_RADIO] Expected: ESP32 RX(GPIO%d) -> Teensy TX3(Pin14)\n", TEENSY_UART_RX_PIN);
+        } else {
+            Serial.println("[RX_RADIO] ✓ UART communication working!");
+        }
+        Serial.println("==========================================");
     } else if (command == "STATUS") {
         Serial.printf("[RX_RADIO] === ESP32 RX RADIO STATUS ===\n");
         Serial.printf("  Local data: %s\n", output_local_data ? "ON" : "OFF");
@@ -560,6 +608,7 @@ static void process_command(String command) {
         Serial.println("    LOCAL_ON/OFF  - Enable/disable local data");
         Serial.println("    REMOTE_ON/OFF - Enable/disable remote data");
         Serial.println("    STATUS        - Show system status");
+        Serial.println("    TEST_UART     - Test UART communication with local Teensy");
         Serial.println("    HELP          - Show this help");
         Serial.println("=====================================");
     } else if (command == "") {
@@ -587,6 +636,32 @@ void setup() {
     Serial1.begin(115200, SERIAL_8N1, TEENSY_UART_RX_PIN, TEENSY_UART_TX_PIN);
     Serial.printf("Serial1 initialized at 115200 bps for Teensy communication (TX=%d, RX=%d)\n", 
                   TEENSY_UART_TX_PIN, TEENSY_UART_RX_PIN);
+    
+    // Test UART connection at startup
+    delay(1000); // Give Teensy time to boot
+    Serial.println("[RX_RADIO] Testing UART connection to Local Teensy...");
+    Serial1.println("STATUS");
+    Serial1.flush();
+    
+    unsigned long test_timeout = millis() + 2000;
+    bool teensy_responded = false;
+    while (millis() < test_timeout) {
+        if (Serial1.available()) {
+            String response = Serial1.readStringUntil('\n');
+            Serial.printf("[RX_RADIO] Local Teensy startup response: %s\n", response.c_str());
+            teensy_responded = true;
+            break;
+        }
+        delay(10);
+    }
+    
+    if (!teensy_responded) {
+        Serial.println("[RX_RADIO] ⚠ WARNING: No response from Local Teensy during startup!");
+        Serial.println("[RX_RADIO] Check UART wiring: ESP32 TX(GPIO2)->Teensy RX3(Pin15), ESP32 RX(GPIO3)->Teensy TX3(Pin14)");
+        Serial.println("[RX_RADIO] Use 'TEST_UART' command to diagnose communication issues");
+    } else {
+        Serial.println("[RX_RADIO] ✓ Local Teensy UART communication verified");
+    }
     
     // Send a startup test packet
     delay(1000);  // Wait for slave to initialize
