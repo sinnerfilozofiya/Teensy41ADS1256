@@ -91,14 +91,14 @@ ADS1255/6. A shorted sensor produces a very small signal while an open-circuit s
 #define PGA_8
 #define PGA_16
 #define PGA_32
-#define PGA_64 B00100111
+// PGA_64 defined in main file
 
 /*DRATE - A/D Data Rate Register 0 ( see p32)*/
 /* BIT7 - BIT6   -  BIT5   -  BIT4   -  BIT3   -  BIT2   -  BIT1   -  BIT0 */
 /* DR7  - DR6    -  DR5    -  DR4    -  DR3    -  DR2    -  DR1    -  DR0 */
 #define DRATE_RESET 0xF0 // Reset DRATE Register
 /*DR7:0 Data Rate Setting*/
-#define DR_30000 B11110000 //30.000 SPS (default)
+// DR_30000 defined in main file
 #define DR_15000 B11100000 //15.000 SPS
 #define DR_7500  B11010000 //7.500 SPS
 #define DR_3750  B11000000 //3.750 SPS

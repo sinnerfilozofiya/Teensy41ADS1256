@@ -18,6 +18,11 @@ struct ForceData {
 };
 #endif
 
+// Forward declarations for int16 conversion functions (defined in main file)
+int16_t force_to_int16_decigrams(double force_newtons);
+int16_t moment_to_int16_scaled(double moment_nm);
+int16_t cop_to_int16_mm(double cop_mm);
+
 // ============================================================================
 // VALIDATION TEST STRUCTURES
 // ============================================================================
@@ -219,15 +224,18 @@ void show_validation_results() {
   Serial.printf("[VAL]   Max error: %.2f mm\n", validation_results.max_cop_error);
   
   Serial.println("[VAL] ");
-  Serial.println("[VAL] Individual test results:");
-  Serial.println("[VAL] Name                Force(N)  COP(mm)   F.Err(%) C.Err(mm) Status");
+  Serial.println("[VAL] Individual test results (int16 format only):");
+  Serial.println("[VAL] Name                Force   COP(mm)   F.Err(%) C.Err(mm) Status");
   Serial.println("[VAL] ----------------------------------------------------------------");
   
   for (int i = 0; i < validation_results.num_tests; i++) {
     ValidationTest* test = &validation_results.tests[i];
-    Serial.printf("[VAL] %-18s %7.2f  %6.1f,%6.1f %6.2f   %6.2f    %s\n",
-                  test->name, test->measured_force, 
-                  test->measured_cop_x, test->measured_cop_y,
+    int16_t force_int16 = force_to_int16_decigrams(test->measured_force);
+    int16_t cop_x_int16 = cop_to_int16_mm(test->measured_cop_x);
+    int16_t cop_y_int16 = cop_to_int16_mm(test->measured_cop_y);
+    
+    Serial.printf("[VAL] %-18s %5d  %4d,%4d %6.2f   %6.2f    %s\n",
+                  test->name, force_int16, cop_x_int16, cop_y_int16,
                   test->force_error, test->cop_error,
                   test->passed ? "PASS" : "FAIL");
   }

@@ -1,4 +1,5 @@
 #include <SPI.h>
+#include <math.h>
 
 // Include ADS1256 constants first
 // (These are defined in the ads1256_constants.ino tab)
@@ -170,6 +171,163 @@ void update_automated_calibration();
 bool is_auto_calibration_active();
 void handle_auto_cal_continue();
 
+// Forward declarations for noise filtering functions
+struct FilteredReading {
+  int32_t raw;
+  int32_t filtered;
+  bool outlier_detected;
+};
+
+// Filter types and structures (needed for Arduino IDE compilation order)
+enum FilterType {
+  FILTER_NONE = 0,
+  FILTER_SMA = 1,        // Simple Moving Average
+  FILTER_EMA = 2,        // Exponential Moving Average
+  FILTER_MEDIAN = 3,     // Median Filter
+  FILTER_KALMAN = 4,     // Kalman Filter
+  FILTER_ADAPTIVE = 5,   // Adaptive Filter
+  FILTER_COMBINED = 6,   // Combined multi-stage filter
+  FILTER_GAUSSIAN = 7    // Gaussian Filter
+};
+
+enum OutlierMethod {
+  OUTLIER_NONE = 0,
+  OUTLIER_ZSCORE = 1,    // Z-score based
+  OUTLIER_IQR = 2,       // Interquartile Range
+  OUTLIER_MAD = 3,       // Median Absolute Deviation
+  OUTLIER_ADAPTIVE = 4   // Adaptive threshold
+};
+
+struct FilterConfig {
+  FilterType filter_type;
+  OutlierMethod outlier_method;
+  uint8_t window_size;           // Filter window size
+  double outlier_threshold;      // Outlier detection threshold
+  double ema_alpha;              // EMA smoothing factor (0-1)
+  double gaussian_sigma;         // Gaussian filter standard deviation
+  bool enable_preprocessing;     // Enable preprocessing stage
+  bool enable_postprocessing;    // Enable postprocessing stage
+};
+
+// Circular buffer template
+template<typename T, size_t N>
+class CircularBuffer {
+private:
+  T buffer[N];
+  size_t head = 0;
+  size_t count = 0;
+  
+public:
+  void push(T value) {
+    buffer[head] = value;
+    head = (head + 1) % N;
+    if (count < N) count++;
+  }
+  
+  T get(size_t index) const {
+    if (index >= count) return T(0);
+    size_t pos = (head - count + index) % N;
+    return buffer[pos];
+  }
+  
+  size_t size() const { return count; }
+  bool full() const { return count == N; }
+  
+  T newest() const {
+    if (count == 0) return T(0);
+    return buffer[(head - 1 + N) % N];
+  }
+  
+  T oldest() const {
+    if (count == 0) return T(0);
+    return buffer[(head - count + N) % N];
+  }
+  
+  void clear() {
+    head = 0;
+    count = 0;
+  }
+};
+
+// Filter state for each channel
+struct ChannelFilter {
+  CircularBuffer<int32_t, 20> raw_buffer;      // Raw data history
+  CircularBuffer<double, 20> filtered_buffer;  // Filtered data history
+  
+  // EMA state
+  double ema_value;
+  bool ema_initialized;
+  
+  // Kalman filter state
+  double kalman_x;      // State estimate
+  double kalman_P;      // Error covariance
+  double kalman_Q;      // Process noise
+  double kalman_R;      // Measurement noise
+  bool kalman_initialized;
+  
+  // Gaussian filter state
+  double gaussian_weights[11];  // Pre-computed Gaussian weights (up to kernel size 11)
+  uint8_t gaussian_kernel_size; // Current kernel size
+  bool gaussian_initialized;
+  
+  // Statistics for outlier detection
+  double running_mean;
+  double running_variance;
+  double running_mad;   // Median Absolute Deviation
+  uint32_t sample_count;
+  
+  // Adaptive thresholds
+  double adaptive_threshold_high;
+  double adaptive_threshold_low;
+  double noise_level;
+  
+  // Constructor
+  ChannelFilter() {
+    reset();
+  }
+  
+  void reset() {
+    raw_buffer.clear();
+    filtered_buffer.clear();
+    ema_value = 0.0;
+    ema_initialized = false;
+    kalman_x = 0.0;
+    kalman_P = 1.0;
+    kalman_Q = 0.1;
+    kalman_R = 1.0;
+    kalman_initialized = false;
+    gaussian_kernel_size = 0;
+    gaussian_initialized = false;
+    memset(gaussian_weights, 0, sizeof(gaussian_weights));
+    running_mean = 0.0;
+    running_variance = 0.0;
+    running_mad = 0.0;
+    sample_count = 0;
+    adaptive_threshold_high = 5000.0;
+    adaptive_threshold_low = -5000.0;
+    noise_level = 100.0;
+  }
+};
+
+double apply_noise_filter(int32_t raw_value, uint8_t channel);
+int32_t get_filtered_load_cell_reading(uint8_t channel);
+void set_filter_type(int type);
+void set_outlier_method(int method);
+void set_gaussian_sigma(double sigma);
+void set_gaussian_filtering();
+void enable_filtering(bool enable);
+void reset_filters();
+void show_filter_status();
+void set_realtime_filtering();
+void set_high_quality_filtering();
+void set_low_noise_filtering();
+FilteredReading get_filtered_reading_with_info(uint8_t channel);
+
+// Force data conversion functions
+int16_t force_to_int16_decigrams(double force_newtons);
+int16_t moment_to_int16_scaled(double moment_nm);
+int16_t cop_to_int16_mm(double cop_mm);
+
 // ============================================================================
 // CALIBRATION FUNCTIONS
 // ============================================================================
@@ -243,12 +401,13 @@ void show_current_values() {
   Serial.println("[T41] ================================");
   
   for (int ch = 0; ch < CHANNELS; ch++) {
-    int32_t raw_value = read_single_channel_fast(ch);
-    int32_t zeroed_value = raw_value - zero_offsets[ch];
-    double voltage = raw_value / bitToVolt;
+    FilteredReading reading = get_filtered_reading_with_info(ch);
+    int32_t zeroed_filtered = reading.filtered - zero_offsets[ch];
+    double voltage = reading.raw / bitToVolt;
     
-    Serial.printf("[T41] LC%d: Raw=%8ld | Zeroed=%8ld | Voltage=%7.4fV\n", 
-                  ch + 1, raw_value, zeroed_value, voltage);
+    Serial.printf("[T41] LC%d: Raw=%8ld | Filtered=%8ld | Zeroed=%8ld | Voltage=%7.4fV %s\n", 
+                  ch + 1, reading.raw, reading.filtered, zeroed_filtered, voltage,
+                  reading.outlier_detected ? "[OUTLIER]" : "");
     delay(5);
   }
   
@@ -496,11 +655,35 @@ void handle_esp32_commands() {
     else if (command == "CAL_FORCE_DATA") {
       ForceData data = get_calibrated_force_data();
       if (data.valid) {
-        Serial3.printf("FORCE_DATA:fz=%.2f,mx=%.4f,my=%.4f,cop_x=%.1f,cop_y=%.1f\n",
-                       data.fz, data.mx, data.my, data.cop_x, data.cop_y);
+        // Convert to int16 format with 10g precision
+        int16_t fz_10g = force_to_int16_decigrams(data.fz);
+        int16_t mx_scaled = moment_to_int16_scaled(data.mx);
+        int16_t my_scaled = moment_to_int16_scaled(data.my);
+        int16_t cop_x_mm = cop_to_int16_mm(data.cop_x);
+        int16_t cop_y_mm = cop_to_int16_mm(data.cop_y);
+        
+        Serial3.printf("FORCE_DATA:%d,%d,%d,%d,%d\n",
+                       fz_10g, mx_scaled, my_scaled, cop_x_mm, cop_y_mm);
         send_status_response("CAL_FORCE_DATA", "OK");
       } else {
         send_status_response("CAL_FORCE_DATA", "ERROR");
+      }
+    }
+    else if (command == "CAL_FORCE_INT16") {
+      ForceData data = get_calibrated_force_data();
+      if (data.valid) {
+        // Convert to int16 format with 10g precision
+        int16_t fz_10g = force_to_int16_decigrams(data.fz);
+        int16_t mx_scaled = moment_to_int16_scaled(data.mx);
+        int16_t my_scaled = moment_to_int16_scaled(data.my);
+        int16_t cop_x_mm = cop_to_int16_mm(data.cop_x);
+        int16_t cop_y_mm = cop_to_int16_mm(data.cop_y);
+        
+        Serial3.printf("FORCE_INT16:%d,%d,%d,%d,%d\n",
+                       fz_10g, mx_scaled, my_scaled, cop_x_mm, cop_y_mm);
+        send_status_response("CAL_FORCE_INT16", "OK");
+      } else {
+        send_status_response("CAL_FORCE_INT16", "ERROR");
       }
     }
     // ========== VALIDATION AND DIAGNOSTIC COMMANDS ==========
@@ -542,6 +725,35 @@ void handle_esp32_commands() {
       } else {
         send_status_response(command.c_str(), "ERROR");
       }
+    }
+    // ========== NOISE FILTERING COMMANDS ==========
+    else if (command == "FILTER_ENABLE") {
+      enable_filtering(true);
+      send_status_response("FILTER_ENABLE", "OK");
+    }
+    else if (command == "FILTER_DISABLE") {
+      enable_filtering(false);
+      send_status_response("FILTER_DISABLE", "OK");
+    }
+    else if (command == "FILTER_STATUS") {
+      show_filter_status();
+      send_status_response("FILTER_STATUS", "OK");
+    }
+    else if (command == "FILTER_RESET") {
+      reset_filters();
+      send_status_response("FILTER_RESET", "OK");
+    }
+    else if (command == "FILTER_REALTIME") {
+      set_realtime_filtering();
+      send_status_response("FILTER_REALTIME", "OK");
+    }
+    else if (command == "FILTER_HIGH_QUALITY") {
+      set_high_quality_filtering();
+      send_status_response("FILTER_HIGH_QUALITY", "OK");
+    }
+    else if (command == "FILTER_LOW_NOISE") {
+      set_low_noise_filtering();
+      send_status_response("FILTER_LOW_NOISE", "OK");
     }
     else {
       send_status_response(command.c_str(), "ERROR");
@@ -745,11 +957,34 @@ void handle_serial_monitor_commands() {
     else if (command == "CAL_FORCE_DATA") {
       ForceData data = get_calibrated_force_data();
       if (data.valid) {
-        Serial.printf("[T41] Force Data:\n");
-        Serial.printf("[T41]   Fz: %.2f N\n", data.fz);
-        Serial.printf("[T41]   Mx: %.4f N⋅m\n", data.mx);
-        Serial.printf("[T41]   My: %.4f N⋅m\n", data.my);
-        Serial.printf("[T41]   COP: (%.1f, %.1f) mm\n", data.cop_x, data.cop_y);
+        // Convert to int16 format with 10g precision
+        int16_t fz_10g = force_to_int16_decigrams(data.fz);
+        int16_t mx_scaled = moment_to_int16_scaled(data.mx);
+        int16_t my_scaled = moment_to_int16_scaled(data.my);
+        int16_t cop_x_mm = cop_to_int16_mm(data.cop_x);
+        int16_t cop_y_mm = cop_to_int16_mm(data.cop_y);
+        
+        Serial.printf("[T41] Force Data (int16 format, 10g precision):\n");
+        Serial.printf("[T41]   Fz: %d (10g units, max 20000 = 200kg)\n", fz_10g);
+        Serial.printf("[T41]   Mx: %d (scaled moment)\n", mx_scaled);
+        Serial.printf("[T41]   My: %d (scaled moment)\n", my_scaled);
+        Serial.printf("[T41]   COP: (%d, %d) mm\n", cop_x_mm, cop_y_mm);
+      } else {
+        Serial.println("[T41] ✗ No valid calibrated force data available");
+      }
+    }
+    else if (command == "CAL_FORCE_INT16") {
+      ForceData data = get_calibrated_force_data();
+      if (data.valid) {
+        // Convert to int16 format with 10g precision
+        int16_t fz_10g = force_to_int16_decigrams(data.fz);
+        int16_t mx_scaled = moment_to_int16_scaled(data.mx);
+        int16_t my_scaled = moment_to_int16_scaled(data.my);
+        int16_t cop_x_mm = cop_to_int16_mm(data.cop_x);
+        int16_t cop_y_mm = cop_to_int16_mm(data.cop_y);
+        
+        Serial.printf("[T41] %d,%d,%d,%d,%d\n",
+                      fz_10g, mx_scaled, my_scaled, cop_x_mm, cop_y_mm);
       } else {
         Serial.println("[T41] ✗ No valid calibrated force data available");
       }
@@ -832,6 +1067,74 @@ void handle_serial_monitor_commands() {
         Serial.println("[T41] Use 'AUTO_CAL_START' or 'AUTOMATED_CALIBRATION' to begin");
       }
     }
+    // ========== NOISE FILTERING COMMANDS ==========
+    else if (command == "FILTER_ENABLE") {
+      enable_filtering(true);
+      Serial.println("[T41] ✓ Noise filtering enabled");
+    }
+    else if (command == "FILTER_DISABLE") {
+      enable_filtering(false);
+      Serial.println("[T41] ✓ Noise filtering disabled");
+    }
+    else if (command == "FILTER_STATUS") {
+      show_filter_status();
+    }
+    else if (command == "FILTER_RESET") {
+      reset_filters();
+      Serial.println("[T41] ✓ All filters reset");
+    }
+    else if (command == "FILTER_REALTIME") {
+      set_realtime_filtering();
+      Serial.println("[T41] ✓ Real-time filtering preset applied");
+    }
+    else if (command == "FILTER_HIGH_QUALITY") {
+      set_high_quality_filtering();
+      Serial.println("[T41] ✓ High-quality filtering preset applied");
+    }
+    else if (command == "FILTER_LOW_NOISE") {
+      set_low_noise_filtering();
+      Serial.println("[T41] ✓ Low-noise filtering preset applied");
+    }
+    else if (command.startsWith("FILTER_TYPE ")) {
+      int type = command.substring(12).toInt();
+      if (type >= 0 && type <= 7) {
+        set_filter_type(type);
+        Serial.printf("[T41] ✓ Filter type set to: %d\n", type);
+      } else {
+        Serial.println("[T41] ✗ Invalid filter type (0-7)");
+      }
+    }
+    else if (command.startsWith("OUTLIER_METHOD ")) {
+      int method = command.substring(15).toInt();
+      if (method >= 0 && method <= 4) {
+        set_outlier_method(method);
+        Serial.printf("[T41] ✓ Outlier method set to: %d\n", method);
+      } else {
+        Serial.println("[T41] ✗ Invalid outlier method (0-4)");
+      }
+    }
+    else if (command.startsWith("GAUSSIAN_SIGMA ")) {
+      double sigma = command.substring(15).toFloat();
+      if (sigma > 0.0 && sigma <= 5.0) {
+        set_gaussian_sigma(sigma);
+        Serial.printf("[T41] ✓ Gaussian sigma set to: %.2f\n", sigma);
+      } else {
+        Serial.println("[T41] ✗ Invalid sigma value (0.1-5.0)");
+      }
+    }
+    else if (command == "FILTER_GAUSSIAN") {
+      set_gaussian_filtering();
+      Serial.println("[T41] ✓ Gaussian filtering preset applied");
+    }
+    else if (command == "SHOW_FILTERED") {
+      Serial.println("[T41] Raw vs Filtered Load Cell Readings:");
+      for (int ch = 0; ch < 4; ch++) {
+        FilteredReading reading = get_filtered_reading_with_info(ch);
+        Serial.printf("[T41] LC%d: Raw=%ld, Filtered=%ld, Outlier=%s\n",
+                      ch + 1, reading.raw, reading.filtered,
+                      reading.outlier_detected ? "YES" : "NO");
+      }
+    }
     else if (command == "HELP") {
       Serial.println("[T41] ==========================================");
       Serial.println("[T41] AVAILABLE COMMANDS:");
@@ -873,7 +1176,8 @@ void handle_serial_monitor_commands() {
       Serial.println("[T41]   CAL_MATRIX_COMPUTE - Compute matrix coefficients");
       Serial.println("[T41] ");
       Serial.println("[T41] Calibrated Measurements:");
-      Serial.println("[T41]   CAL_FORCE_DATA     - Show calibrated force/COP data");
+      Serial.println("[T41]   CAL_FORCE_DATA     - Show calibrated force/COP data (int16)");
+      Serial.println("[T41]   CAL_FORCE_INT16    - Show force data as int16 only (10g precision)");
       Serial.println("[T41] ");
       Serial.println("[T41] Validation & Testing:");
       Serial.println("[T41]   VAL_START          - Start validation system");
@@ -893,6 +1197,20 @@ void handle_serial_monitor_commands() {
       Serial.println("[T41]   SKIP               - Skip current step");
       Serial.println("[T41]   ABORT              - Abort automated calibration");
       Serial.println("[T41]   STATUS             - Show calibration progress");
+      Serial.println("[T41] ");
+      Serial.println("[T41] 🔧 Noise Filtering:");
+      Serial.println("[T41]   FILTER_ENABLE      - Enable noise filtering");
+      Serial.println("[T41]   FILTER_DISABLE     - Disable noise filtering");
+      Serial.println("[T41]   FILTER_STATUS      - Show filter status");
+      Serial.println("[T41]   FILTER_RESET       - Reset all filters");
+      Serial.println("[T41]   FILTER_REALTIME    - Real-time preset (EMA + Adaptive)");
+      Serial.println("[T41]   FILTER_HIGH_QUALITY - High-quality preset (Combined)");
+      Serial.println("[T41]   FILTER_LOW_NOISE   - Low-noise preset (Median + IQR)");
+      Serial.println("[T41]   FILTER_GAUSSIAN    - Gaussian filter preset");
+      Serial.println("[T41]   FILTER_TYPE <0-7>  - Set filter type");
+      Serial.println("[T41]   OUTLIER_METHOD <0-4> - Set outlier detection");
+      Serial.println("[T41]   GAUSSIAN_SIGMA <0.1-5.0> - Set Gaussian filter sigma");
+      Serial.println("[T41]   SHOW_FILTERED      - Show raw vs filtered readings");
       Serial.println("[T41] ");
       Serial.println("[T41] System:");
       Serial.println("[T41]   STATUS      - Show system status");
@@ -980,6 +1298,12 @@ void setup() {
     Serial.println("[T41] ⚠️ No valid calibration data found - system needs calibration");
   }
   
+  // Initialize noise filtering system
+  Serial.println("[T41] Initializing noise filtering system...");
+  set_realtime_filtering();  // Start with real-time preset
+  enable_filtering(true);    // Enable filtering by default
+  Serial.println("[T41] ✓ Noise filtering enabled (Real-time preset)");
+  
   Serial.println("[T41] Ready - waiting for commands");
   Serial.println("[T41] Type 'HELP' for available commands");
   Serial.println("[T41] Quick start: ZERO (to zero), START (to begin)");
@@ -988,6 +1312,36 @@ void setup() {
   
   // Send initial state to ESP32
   send_state_update();
+}
+
+// ============================================================================
+// FORCE DATA CONVERSION FUNCTIONS
+// ============================================================================
+
+// Convert force in Newtons to int16 with 10g precision (decagram)
+// Example: 22.34 N (2.278 kg) -> 2278 (representing 227.8 * 10g units)
+// Max: 200kg -> 20000 units (1 unit = 10g)
+int16_t force_to_int16_decigrams(double force_newtons) {
+  // Convert N to grams: 1N ≈ 101.97g (1N = 1kg * 9.81m/s² / 9.81m/s² * 1000g/kg / 9.81)
+  // Actually: 1N = 1kg-force / 9.81 * 1000g = 101.97g
+  // But for simplicity: 1N ≈ 102g
+  double force_grams = force_newtons * 101.97;  // Convert N to grams
+  int16_t result = (int16_t)round(force_grams / 10.0);  // Convert to 10g units (1 unit = 10g)
+  return result;
+}
+
+// Convert moment in N⋅m to int16 with appropriate precision
+// Scale moments to fit int16 range appropriately
+int16_t moment_to_int16_scaled(double moment_nm) {
+  // Scale moment to fit reasonable range
+  // Typical moments are small, so multiply by 1000 for precision
+  int16_t result = (int16_t)round(moment_nm * 1000.0);
+  return result;
+}
+
+// Convert COP in mm to int16 (already in mm, just round to integer)
+int16_t cop_to_int16_mm(double cop_mm) {
+  return (int16_t)round(cop_mm);
 }
 
 void loop() {
@@ -1015,18 +1369,18 @@ void loop() {
     if (sample_timer >= 250) {  // 4kHz total sampling rate
       sample_timer = 0;
       
-      // Read current channel only
-      int32_t raw_value = read_single_channel_fast(current_channel);
+      // Read current channel with filtering
+      int32_t filtered_value = get_filtered_load_cell_reading(current_channel);
       
       // Apply offset if enabled
-      int32_t processed_value = apply_offset(raw_value, current_channel);
+      int32_t processed_value = apply_offset(filtered_value, current_channel);
       
       // Store in appropriate buffer
       sample_buffer[current_channel][buffer_index] = processed_value;
       
       // Collect calibration samples if in calibration mode
       if (calibration_mode && calibration_sample_count < 100) {
-        calibration_samples[current_channel][calibration_sample_count] = raw_value;
+        calibration_samples[current_channel][calibration_sample_count] = filtered_value;
         
         // Only increment counter when all channels have been sampled
         if (current_channel == CHANNELS - 1) {
