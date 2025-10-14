@@ -110,6 +110,11 @@ static unsigned long command_timeouts = 0;
 static unsigned long ble_commands_received = 0;
 static unsigned long ble_command_errors = 0;
 
+// Response capture for command forwarding
+static volatile bool command_response_ready = false;
+static String command_response_data = "";
+static SemaphoreHandle_t command_response_mutex = NULL;
+
 // BLE transmission queue - Optimized for maximum throughput
 #define BLE_QUEUE_SIZE 200   // Smaller queue to prevent Windows BLE overflow
 #define BLE_SAMPLE_DECIMATION 1  // Send every sample for maximum throughput
@@ -223,40 +228,77 @@ static void process_ble_command(String command) {
         command == "REMOTE_ZERO" || command == "REMOTE_ZERO_STATUS" || command == "REMOTE_ZERO_RESET" ||
         command == "ALL_ZERO" || command == "ALL_ZERO_STATUS" || command == "ALL_ZERO_RESET" ||
         command == "LOCAL_ON" || command == "LOCAL_OFF" || command == "REMOTE_ON" || command == "REMOTE_OFF" ||
-        command == "STATUS") {
+        command == "STATUS" || command == "REMOTE_PING") {
         
-        Serial.printf("[BLE_SLAVE] Forwarding BLE command '%s' to ESP32 RX Radio...\n", command.c_str());
+        // Special formatting for REMOTE_PING
+        bool is_ping = (command == "REMOTE_PING");
+        if (is_ping) {
+            Serial.println("\n╔════════════════════════════════════════════════════════════════╗");
+            Serial.println("║      REMOTE PING-PONG TEST - BLE SLAVE (via BLE)              ║");
+            Serial.println("╚════════════════════════════════════════════════════════════════╝");
+            Serial.printf("  📤 SENDING: %s\n", command.c_str());
+            Serial.println("  Path: BLE Slave → RX Radio → SPI Slave → Remote Teensy");
+            Serial.println("  ──────────────────────────────────────────────────────────────");
+        } else {
+            Serial.printf("[BLE_SLAVE] Forwarding BLE command '%s' to ESP32 RX Radio...\n", command.c_str());
+        }
+        
+        // Clear previous response
+        if (command_response_mutex != NULL && xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            command_response_ready = false;
+            command_response_data = "";
+            xSemaphoreGive(command_response_mutex);
+        }
+        
+        unsigned long start_time = millis();
         Serial2.println(command);
         Serial2.flush();
         commands_forwarded++;
         
-        // Wait for response from ESP32 RX Radio (longer timeout for ZERO commands)
+        // Wait for response from ESP32 RX Radio (captured by UART RX task)
         bool is_zero_command = (command.indexOf("ZERO") >= 0);
-        unsigned long timeout = millis() + (is_zero_command ? 15000 : 5000); // 15s for ZERO, 5s for others
+        unsigned long timeout_ms = is_zero_command ? 15000 : 5000; // 15s for ZERO, 5s for others
+        unsigned long timeout = millis() + timeout_ms;
         bool got_response = false;
+        String response_text = "";
+        
         while (millis() < timeout) {
-            if (Serial2.available()) {
-                String response = Serial2.readStringUntil('\n');
-                if (response.length() > 0) {
-                    Serial.printf("[BLE_SLAVE] RX Radio Response: %s\n", response.c_str());
+            // Check if UART RX task captured a response
+            if (command_response_mutex != NULL && xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                if (command_response_ready) {
+                    response_text = command_response_data;
+                    command_response_ready = false;
                     got_response = true;
-                    command_responses_received++;
-                    // Continue reading any additional response lines
-                    unsigned long quick_timeout = millis() + 500;
-                    while (millis() < quick_timeout && Serial2.available()) {
-                        String additional = Serial2.readStringUntil('\n');
-                        if (additional.length() > 0) {
-                            Serial.printf("[BLE_SLAVE] RX Radio Response: %s\n", additional.c_str());
-                        }
-                        delay(10);
-                    }
+                    xSemaphoreGive(command_response_mutex);
                     break;
                 }
+                xSemaphoreGive(command_response_mutex);
             }
             delay(10);
         }
-        if (!got_response) {
-            Serial.println("[BLE_SLAVE] ⚠ No response from ESP32 RX Radio");
+        
+        unsigned long round_trip_ms = millis() - start_time;
+        
+        if (got_response) {
+            if (is_ping) {
+                Serial.printf("  📥 RECEIVED: %s\n", response_text.c_str());
+                Serial.printf("  ⏱️  Round-trip time: %lu ms\n", round_trip_ms);
+                Serial.println("  ──────────────────────────────────────────────────────────────");
+                Serial.println("  ✅ PING-PONG TEST SUCCESS!");
+                Serial.println("╚════════════════════════════════════════════════════════════════╝\n");
+            } else {
+                Serial.printf("[BLE_SLAVE] RX Radio Response: %s\n", response_text.c_str());
+            }
+            command_responses_received++;
+        } else {
+            if (is_ping) {
+                Serial.printf("  ⏱️  Timeout after: %lu ms\n", round_trip_ms);
+                Serial.println("  ──────────────────────────────────────────────────────────────");
+                Serial.println("  ❌ PING-PONG TEST FAILED - No response received");
+                Serial.println("╚════════════════════════════════════════════════════════════════╝\n");
+            } else {
+                Serial.println("[BLE_SLAVE] ⚠ No response from ESP32 RX Radio");
+            }
             command_timeouts++;
         }
     } else {
@@ -510,8 +552,29 @@ static void uart_rx_task(void* param) {
             debug_bytes_count += available;
             
             if (!sync_found) {
-                // Look for sync pattern
-                uint8_t byte = Serial2.read();
+                // Check if this might be a text response (not binary packet)
+                uint8_t byte = Serial2.peek();  // Peek without consuming
+                
+                // If it's a printable ASCII character (likely text response), read as string
+                if (byte >= 32 && byte < 127 && byte != 0xAA) {
+                    String text_response = Serial2.readStringUntil('\n');
+                    if (text_response.length() > 0) {
+                        Serial.printf("[BLE_SLAVE] Text response received: %s\n", text_response.c_str());
+                        
+                        // Capture for command handler
+                        if (command_response_mutex != NULL && xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                            command_response_data = text_response;
+                            command_response_ready = true;
+                            xSemaphoreGive(command_response_mutex);
+                            Serial.printf("[BLE_SLAVE] → Response captured for command handler\n");
+                        }
+                    }
+                    bytes_received = 0;  // Reset
+                    continue;  // Skip to next iteration
+                }
+                
+                // Look for binary sync pattern
+                byte = Serial2.read();
                 debug_sync_attempts++;
                 
                 if (bytes_received == 0 && byte == 0xAA) {
@@ -617,40 +680,78 @@ static void handle_serial_commands() {
             command == "ZERO" || command == "ZERO_STATUS" || command == "ZERO_RESET" ||
             command == "REMOTE_ZERO" || command == "REMOTE_ZERO_STATUS" || command == "REMOTE_ZERO_RESET" ||
             command == "ALL_ZERO" || command == "ALL_ZERO_STATUS" || command == "ALL_ZERO_RESET" ||
-            command == "LOCAL_ON" || command == "LOCAL_OFF" || command == "REMOTE_ON" || command == "REMOTE_OFF") {
+            command == "LOCAL_ON" || command == "LOCAL_OFF" || command == "REMOTE_ON" || command == "REMOTE_OFF" ||
+            command == "REMOTE_PING") {
             
-            Serial.printf("[BLE_SLAVE] Forwarding '%s' to ESP32 RX Radio...\n", command.c_str());
+            // Special formatting for REMOTE_PING
+            bool is_ping = (command == "REMOTE_PING");
+            if (is_ping) {
+                Serial.println("\n╔════════════════════════════════════════════════════════════════╗");
+                Serial.println("║         REMOTE PING-PONG TEST - BLE SLAVE                      ║");
+                Serial.println("╚════════════════════════════════════════════════════════════════╝");
+                Serial.printf("  📤 SENDING: %s\n", command.c_str());
+                Serial.println("  Path: BLE Slave → RX Radio → SPI Slave → Remote Teensy");
+                Serial.println("  ──────────────────────────────────────────────────────────────");
+            } else {
+                Serial.printf("[BLE_SLAVE] Forwarding '%s' to ESP32 RX Radio...\n", command.c_str());
+            }
+            
+            // Clear previous response
+            if (command_response_mutex != NULL && xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                command_response_ready = false;
+                command_response_data = "";
+                xSemaphoreGive(command_response_mutex);
+            }
+            
+            unsigned long start_time = millis();
             Serial2.println(command);
             Serial2.flush();
             commands_forwarded++;
             
-            // Wait for response from ESP32 RX Radio (longer timeout for ZERO commands)
+            // Wait for response from ESP32 RX Radio (captured by UART RX task)
             bool is_zero_command = (command.indexOf("ZERO") >= 0);
-            unsigned long timeout = millis() + (is_zero_command ? 15000 : 5000); // 15s for ZERO, 5s for others
+            unsigned long timeout_ms = is_zero_command ? 15000 : 5000; // 15s for ZERO, 5s for others
+            unsigned long timeout = millis() + timeout_ms;
             bool got_response = false;
+            String response_text = "";
+            
             while (millis() < timeout) {
-                if (Serial2.available()) {
-                    String response = Serial2.readStringUntil('\n');
-                    if (response.length() > 0) {
-                        Serial.printf("[BLE_SLAVE] RX Radio Response: %s\n", response.c_str());
+                // Check if UART RX task captured a response
+                if (command_response_mutex != NULL && xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    if (command_response_ready) {
+                        response_text = command_response_data;
+                        command_response_ready = false;
                         got_response = true;
-                        command_responses_received++;
-                        // Continue reading any additional response lines
-                        unsigned long quick_timeout = millis() + 500;
-                        while (millis() < quick_timeout && Serial2.available()) {
-                            String additional = Serial2.readStringUntil('\n');
-                            if (additional.length() > 0) {
-                                Serial.printf("[BLE_SLAVE] RX Radio Response: %s\n", additional.c_str());
-                            }
-                            delay(10);
-                        }
+                        xSemaphoreGive(command_response_mutex);
                         break;
                     }
+                    xSemaphoreGive(command_response_mutex);
                 }
                 delay(10);
             }
-            if (!got_response) {
-                Serial.println("[BLE_SLAVE] ⚠ No response from ESP32 RX Radio");
+            
+            unsigned long round_trip_ms = millis() - start_time;
+            
+            if (got_response) {
+                if (is_ping) {
+                    Serial.printf("  📥 RECEIVED: %s\n", response_text.c_str());
+                    Serial.printf("  ⏱️  Round-trip time: %lu ms\n", round_trip_ms);
+                    Serial.println("  ──────────────────────────────────────────────────────────────");
+                    Serial.println("  ✅ PING-PONG TEST SUCCESS!");
+                    Serial.println("╚════════════════════════════════════════════════════════════════╝\n");
+                } else {
+                    Serial.printf("[BLE_SLAVE] RX Radio Response: %s\n", response_text.c_str());
+                }
+                command_responses_received++;
+            } else {
+                if (is_ping) {
+                    Serial.printf("  ⏱️  Timeout after: %lu ms\n", round_trip_ms);
+                    Serial.println("  ──────────────────────────────────────────────────────────────");
+                    Serial.println("  ❌ PING-PONG TEST FAILED - No response received");
+                    Serial.println("╚════════════════════════════════════════════════════════════════╝\n");
+                } else {
+                    Serial.println("[BLE_SLAVE] ⚠ No response from ESP32 RX Radio");
+                }
                 command_timeouts++;
             }
         }
@@ -745,6 +846,8 @@ static void handle_serial_commands() {
             Serial.println("  ESP32 Control (forwarded to RX Radio):");
             Serial.println("    LOCAL_ON/OFF, REMOTE_ON/OFF");
             Serial.println("    RX_STATUS    - Get ESP32 RX Radio status");
+            Serial.println("  Test Commands:");
+            Serial.println("    REMOTE_PING  - Ping remote Teensy (via RX Radio -> SPI Slave -> Remote Teensy)");
             Serial.println("  BLE Slave Commands:");
             Serial.println("    STATS        - Show BLE slave statistics");
             Serial.println("    RESET_STATS  - Reset all statistics");
@@ -785,6 +888,14 @@ static void handle_serial_commands() {
 void setup() {
     Serial.begin(921600);
     delay(100);
+    
+    // Create command response mutex for response capture
+    command_response_mutex = xSemaphoreCreateMutex();
+    if (command_response_mutex == NULL) {
+        Serial.println("[BLE_SLAVE] ⚠ Failed to create command response mutex!");
+    } else {
+        Serial.println("[BLE_SLAVE] ✓ Command response mutex created");
+    }
     
     Serial.println("ESP32 BLE Slave - Redis-like Load Cell Data Forwarder + Command Gateway");
     Serial.println("=== BLE COMMAND INTERFACE ENABLED ===");

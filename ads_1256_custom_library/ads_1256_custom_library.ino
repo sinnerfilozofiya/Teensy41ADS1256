@@ -822,6 +822,12 @@ void handle_esp32_commands() {
       set_low_noise_filtering();
       send_status_response("FILTER_LOW_NOISE", "OK");
     }
+    else if (command == "PING") {
+      // Simple ping-pong test for communication chain verification
+      Serial3.println("PONG");
+      Serial3.flush();
+      Serial.println("[T41] PING received, responded with PONG");
+    }
     else {
       send_status_response(command.c_str(), "ERROR");
     }

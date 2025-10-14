@@ -199,6 +199,11 @@ static unsigned long remote_frames_count = 0;
 static unsigned long espnow_commands_sent = 0;
 static unsigned long espnow_command_errors = 0;
 
+// Response capture for PING test
+static volatile bool espnow_response_ready = false;
+static String espnow_response_data = "";
+static SemaphoreHandle_t response_mutex = NULL;
+
 // ============================================================================
 // ESP-NOW COMMAND STRUCTURES AND FUNCTIONS
 // ============================================================================
@@ -211,9 +216,17 @@ struct __attribute__((packed)) ESPNowCommand {
     uint16_t crc16;     // CRC16 of packet
 };
 
+// ESP-NOW response packet (64 bytes)
+struct __attribute__((packed)) ESPNowResponse {
+    uint8_t magic[2];   // 0xAB, 0xCD (Response magic)
+    char response[60];  // Response string (null-terminated)
+    uint16_t crc16;     // CRC16 of packet
+};
+
 // Forward declarations
 bool create_espnow_command(ESPNowCommand* cmd, const char* command_str);
 bool validate_espnow_command(const ESPNowCommand* cmd);
+bool validate_espnow_response(const ESPNowResponse* resp);
 
 // ============================================================================
 // ESP-NOW COMMAND FORWARDING
@@ -265,6 +278,15 @@ bool validate_espnow_command(const ESPNowCommand* cmd) {
     
     uint16_t expected_crc = crc16_ccitt_false((const uint8_t*)cmd, sizeof(ESPNowCommand) - 2);
     return cmd->crc16 == expected_crc;
+}
+
+bool validate_espnow_response(const ESPNowResponse* resp) {
+    if (resp->magic[0] != 0xAB || resp->magic[1] != 0xCD) {
+        return false;
+    }
+    
+    uint16_t expected_crc = crc16_ccitt_false((const uint8_t*)resp, sizeof(ESPNowResponse) - 2);
+    return resp->crc16 == expected_crc;
 }
 
 static inline void count_sample(char type, uint16_t frame_idx, uint8_t sample_idx,
@@ -346,8 +368,59 @@ static void spi_rx_task(void* param) {
 static void espnow_rx_callback(const esp_now_recv_info *recv_info, const uint8_t *data, int len) {
     static unsigned long last_debug_time = 0;
     static unsigned long debug_packet_count = 0;
+    static unsigned long response_packet_count = 0;
+    static unsigned long data_frame_count = 0;
+    static unsigned long unknown_packet_count = 0;
     
     debug_packet_count++;
+    
+    // Log ALL packets for debugging
+    Serial.printf("[RX_RADIO] ESP-NOW RX: len=%d bytes from %02X:%02X:%02X:%02X:%02X:%02X\n", 
+                  len,
+                  recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+                  recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+    
+    // Check if this is a response packet (64 bytes)
+    if (len == sizeof(ESPNowResponse)) {
+        response_packet_count++;
+        Serial.printf("[RX_RADIO] → Response packet detected (size=%d)\n", sizeof(ESPNowResponse));
+        const ESPNowResponse* resp = (const ESPNowResponse*)data;
+        Serial.printf("[RX_RADIO] → Magic: %02X %02X (expected AB CD), CRC: %04X\n", 
+                      resp->magic[0], resp->magic[1], resp->crc16);
+        
+        if (validate_espnow_response(resp)) {
+            Serial.printf("[RX_RADIO] ✓ Response validated: '%s'\n", resp->response);
+            
+            // Capture response for PING test
+            if (response_mutex != NULL && xSemaphoreTake(response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                espnow_response_data = String(resp->response);
+                espnow_response_ready = true;
+                xSemaphoreGive(response_mutex);
+                Serial.printf("[RX_RADIO] → Response captured for PING test\n");
+            }
+            
+            // Forward response to BLE Slave via Serial2
+            Serial.printf("[RX_RADIO] → Forwarding to BLE Slave via Serial2...\n");
+            Serial2.println(resp->response);
+            Serial2.flush();
+            Serial.printf("[RX_RADIO] ✓ Response forwarded successfully\n");
+            return;
+        } else {
+            Serial.printf("[RX_RADIO] ✗ Response CRC validation FAILED!\n");
+            uint16_t expected_crc = crc16_ccitt_false((const uint8_t*)resp, sizeof(ESPNowResponse) - 2);
+            Serial.printf("[RX_RADIO] → Expected CRC: %04X, Got: %04X\n", expected_crc, resp->crc16);
+            return;
+        }
+    }
+    
+    // Check if this is a data frame
+    if (len == INNER_FRAME_SIZE) {
+        data_frame_count++;
+    } else {
+        unknown_packet_count++;
+        Serial.printf("[RX_RADIO] ⚠ Unknown packet size: %d (expected %d for data or %d for response)\n", 
+                      len, INNER_FRAME_SIZE, sizeof(ESPNowResponse));
+    }
     
     // Debug output every 5 seconds
     unsigned long now = millis();
@@ -469,6 +542,67 @@ static void process_command(String command) {
             Serial.printf("[RX_RADIO] ✓ Remote command '%s' sent successfully\n", teensy_command.c_str());
         } else {
             Serial.printf("[RX_RADIO] ✗ Failed to send remote command '%s'\n", teensy_command.c_str());
+        }
+    }
+    // Remote PING test
+    else if (command == "REMOTE_PING") {
+        Serial.println("[RX_RADIO] ================================================");
+        Serial.println("[RX_RADIO] REMOTE PING TEST INITIATED");
+        Serial.println("[RX_RADIO] Path: BLE Slave -> RX Radio -> SPI Slave -> Remote Teensy");
+        Serial.println("[RX_RADIO] ================================================");
+        Serial.printf("[RX_RADIO] Step 1/2: Sending 'PING' to Remote Teensy via ESP-NOW...\n");
+        
+        // Clear previous response
+        if (response_mutex != NULL && xSemaphoreTake(response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            espnow_response_ready = false;
+            espnow_response_data = "";
+            xSemaphoreGive(response_mutex);
+        }
+        
+        unsigned long start_time = millis();
+        if (send_espnow_command("PING")) {
+            Serial.printf("[RX_RADIO] ✓ ESP-NOW PING sent successfully\n");
+            Serial.printf("[RX_RADIO] Step 2/2: Waiting for PONG response via ESP-NOW...\n");
+            
+            // Wait for response from SPI Slave (captured by ESP-NOW callback)
+            unsigned long timeout = millis() + 5000; // 5 second timeout
+            bool got_response = false;
+            String response_text = "";
+            
+            while (millis() < timeout) {
+                // Check if ESP-NOW callback captured a response
+                if (response_mutex != NULL && xSemaphoreTake(response_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    if (espnow_response_ready) {
+                        response_text = espnow_response_data;
+                        espnow_response_ready = false;
+                        got_response = true;
+                        xSemaphoreGive(response_mutex);
+                        break;
+                    }
+                    xSemaphoreGive(response_mutex);
+                }
+                delay(10);
+            }
+            
+            if (got_response) {
+                unsigned long round_trip = millis() - start_time;
+                Serial.println("[RX_RADIO] ================================================");
+                Serial.printf("[RX_RADIO] ✓ PONG RECEIVED: %s\n", response_text.c_str());
+                Serial.printf("[RX_RADIO] ✓ Round-trip time: %lu ms\n", round_trip);
+                Serial.println("[RX_RADIO] ✓ REMOTE PING TEST SUCCESS!");
+                Serial.println("[RX_RADIO] ================================================");
+            } else {
+                unsigned long elapsed = millis() - start_time;
+                Serial.println("[RX_RADIO] ================================================");
+                Serial.printf("[RX_RADIO] ✗ No PONG response after %lu ms\n", elapsed);
+                Serial.println("[RX_RADIO] ✗ REMOTE PING TEST FAILED!");
+                Serial.println("[RX_RADIO] ================================================");
+            }
+        } else {
+            Serial.println("[RX_RADIO] ================================================");
+            Serial.printf("[RX_RADIO] ✗ Failed to send ESP-NOW PING\n");
+            Serial.println("[RX_RADIO] ✗ REMOTE PING TEST FAILED!");
+            Serial.println("[RX_RADIO] ================================================");
         }
     }
     // ALL commands - control both local and remote Teensy simultaneously
@@ -604,6 +738,8 @@ static void process_command(String command) {
         Serial.println("    ALL_ZERO      - Zero BOTH Teensy units simultaneously");
         Serial.println("    ALL_ZERO_STATUS - Show zeroing status for BOTH units");
         Serial.println("    ALL_ZERO_RESET  - Reset zero offsets for BOTH units");
+        Serial.println("  Test Commands:");
+        Serial.println("    REMOTE_PING   - Ping remote Teensy (full round-trip test)");
         Serial.println("  ESP32 Control:");
         Serial.println("    LOCAL_ON/OFF  - Enable/disable local data");
         Serial.println("    REMOTE_ON/OFF - Enable/disable remote data");
@@ -626,6 +762,14 @@ static void process_command(String command) {
 void setup() {
     Serial.begin(921600);   // Safer baud rate to prevent USB driver issues
     delay(50);
+    
+    // Create response mutex for PING test synchronization
+    response_mutex = xSemaphoreCreateMutex();
+    if (response_mutex == NULL) {
+        Serial.println("[RX_RADIO] ⚠ Failed to create response mutex!");
+    } else {
+        Serial.println("[RX_RADIO] ✓ Response mutex created");
+    }
     
     // Initialize UART2 for forwarding data to slave ESP32
     Serial2.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
