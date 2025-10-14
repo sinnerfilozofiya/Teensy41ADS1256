@@ -143,14 +143,21 @@ bool perform_adc_self_calibration(uint8_t pga_setting, uint8_t data_rate) {
   SetRegisterValue(DRATE, data_rate);
   
   // Wait for settings to stabilize
+  Serial.println("[CAL] ⏳ Waiting for ADC settings to stabilize...");
   delay(100);
   
   // Perform self-calibration (both offset and gain)
-  Serial.println("[CAL] Performing SELFCAL (offset + gain)...");
+  Serial.println("[CAL] 🔄 Performing SELFCAL (offset + gain)...");
   SendCMD(SELFCAL);
   
-  // Wait for calibration to complete (can take several seconds at low data rates)
-  delay(5000);  // Conservative delay - adjust based on data rate
+  // Wait for calibration to complete with progress updates
+  Serial.println("[CAL] ⏱️  Calibration in progress (up to 5 seconds)...");
+  for (int i = 0; i < 5; i++) {
+    delay(1000);
+    Serial.printf("[CAL] 📊 Progress: %d/5 seconds elapsed\n", i + 1);
+  }
+  
+  Serial.println("[CAL] 📖 Reading calibration results...");
   
   // Read calibration results
   uint32_t ofc = 0, fsc = 0;
@@ -170,7 +177,7 @@ bool perform_adc_self_calibration(uint8_t pga_setting, uint8_t data_rate) {
   cal_data.adc_cal.timestamp = millis();
   cal_data.adc_cal.valid = true;
   
-  Serial.printf("[CAL] ADC Calibration Complete:\n");
+  Serial.printf("[CAL] ✅ ADC Calibration Complete:\n");
   Serial.printf("[CAL]   OFC: 0x%06lX (%ld)\n", ofc, ofc);
   Serial.printf("[CAL]   FSC: 0x%06lX (%ld)\n", fsc, fsc);
   

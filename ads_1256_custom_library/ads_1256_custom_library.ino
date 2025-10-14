@@ -334,8 +334,9 @@ int16_t cop_to_int16_mm(double cop_mm);
 
 void zero_load_cells() {
   Serial.println("[T41] 🔄 Zeroing load cells - capturing offsets...");
+  Serial.printf("[T41] 📊 Collecting %d samples from 4 channels (estimated time: ~12 seconds)\n", 1500);
   
-  // Capture 50 samples from each channel for averaging
+  // Capture 1500 samples from each channel for averaging
   int32_t temp_offsets[CHANNELS] = {0, 0, 0, 0};
   const int num_samples = 1500;
   
@@ -345,7 +346,15 @@ void zero_load_cells() {
       temp_offsets[ch] += raw_value;
       delay(2);  // Small delay between readings
     }
+    
+    // Progress updates every 300 samples (every ~2.4 seconds)
+    if ((sample + 1) % 300 == 0) {
+      float progress = ((float)(sample + 1) / num_samples) * 100.0;
+      Serial.printf("[T41] 📈 Progress: %.1f%% (%d/%d samples)\n", progress, sample + 1, num_samples);
+    }
   }
+  
+  Serial.println("[T41] 🧮 Calculating averages...");
   
   // Calculate averages and store as offsets
   for (int ch = 0; ch < CHANNELS; ch++) {
@@ -445,6 +454,51 @@ int32_t apply_offset(int32_t raw_value, int channel) {
 void send_status_response(const char* command, const char* status) {
   Serial3.printf("RESP:%s:%s\n", command, status);
   Serial3.flush();
+}
+
+// ============================================================================
+// DUAL OUTPUT SYSTEM FOR ESP32 MESSAGE RELAY
+// ============================================================================
+
+// Dual output functions to send messages to both Serial (USB) and Serial3 (ESP32)
+void dual_print(const String& message) {
+  Serial.print(message);
+  Serial3.print(message);
+}
+
+void dual_println(const String& message) {
+  Serial.println(message);
+  Serial3.println(message);
+}
+
+void dual_printf(const char* format, ...) {
+  char buffer[512];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+  
+  Serial.print(buffer);
+  Serial3.print(buffer);
+}
+
+// Auto calibration specific dual output (with AUTO-CAL prefix for ESP32 parsing)
+void auto_cal_println(const String& message) {
+  Serial.println(message);
+  Serial3.println(message);
+  Serial3.flush(); // Ensure immediate transmission to ESP32
+}
+
+void auto_cal_printf(const char* format, ...) {
+  char buffer[512];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+  
+  Serial.print(buffer);
+  Serial3.print(buffer);
+  Serial3.flush(); // Ensure immediate transmission to ESP32
 }
 
 void send_state_update() {
@@ -714,16 +768,24 @@ void handle_esp32_commands() {
       send_status_response("DIAG_ADC", "OK");
     }
     // ========== AUTOMATED CALIBRATION COMMANDS ==========
-    else if (command == "AUTO_CAL_START") {
+    else if (command == "AUTO_CAL_START" || command == "AUTOMATED_CALIBRATION") {
       start_automated_calibration();
       send_status_response("AUTO_CAL_START", "OK");
     }
-    else if (command == "CONTINUE" || command == "SKIP" || command == "ABORT" || command == "STATUS") {
+    else if (command == "CONTINUE" || command == "SKIP" || command == "ABORT") {
       if (is_auto_calibration_active()) {
         handle_auto_cal_input(command);
         send_status_response(command.c_str(), "OK");
       } else {
         send_status_response(command.c_str(), "ERROR");
+      }
+    }
+    else if (command == "AUTO_CAL_STATUS") {
+      if (is_auto_calibration_active()) {
+        show_auto_cal_status();
+        send_status_response("AUTO_CAL_STATUS", "OK");
+      } else {
+        send_status_response("AUTO_CAL_STATUS", "ERROR");
       }
     }
     // ========== NOISE FILTERING COMMANDS ==========
