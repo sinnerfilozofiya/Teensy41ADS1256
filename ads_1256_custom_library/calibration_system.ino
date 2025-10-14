@@ -123,12 +123,12 @@ static CalibrationState current_cal_state = CAL_STATE_IDLE;
 static uint8_t current_cal_channel = 0;
 // static uint8_t current_cal_point = 0;  // Reserved for future use
 
-// Temporary data collection arrays
-static double temp_masses[20];
+// Temporary data collection arrays (global for access from automated calibration)
+double temp_masses[20];
 static double temp_positions_x[20];
 static double temp_positions_y[20];
-static int32_t temp_readings[4][20];  // [channel][point]
-static uint8_t temp_data_count = 0;
+int32_t temp_readings[4][20];  // [channel][point]
+uint8_t temp_data_count = 0;
 
 // ============================================================================
 // STEP A: ADC CALIBRATION FUNCTIONS

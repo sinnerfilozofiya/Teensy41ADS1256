@@ -387,7 +387,6 @@ int32_t read_single_channel(uint8_t mux_setting) {
 // Alternative ultra-fast continuous mode function (experimental)
 void read_four_values_continuous() {
   static bool continuous_mode_active = false;
-  static uint8_t current_channel = 0;
   
   if (!continuous_mode_active) {
     // Initialize continuous mode
@@ -398,7 +397,7 @@ void read_four_values_continuous() {
     digitalWriteFast(ADS_CS_PIN, HIGH);
     SPI.endTransaction();
     continuous_mode_active = true;
-    current_channel = 0;
+    // current_channel = 0;  // Removed - variable not needed
   }
   
   int32_t values[4];

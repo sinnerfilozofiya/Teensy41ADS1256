@@ -788,6 +788,11 @@ void handle_esp32_commands() {
         send_status_response("AUTO_CAL_STATUS", "ERROR");
       }
     }
+    // ========== CALIBRATION CONFIGURATION COMMANDS ==========
+    else if (command.startsWith("CAL_CONFIG_")) {
+      handle_cal_config_command(command);
+      send_status_response("CAL_CONFIG", "OK");
+    }
     // ========== NOISE FILTERING COMMANDS ==========
     else if (command == "FILTER_ENABLE") {
       enable_filtering(true);
@@ -1129,6 +1134,10 @@ void handle_serial_monitor_commands() {
         Serial.println("[T41] Use 'AUTO_CAL_START' or 'AUTOMATED_CALIBRATION' to begin");
       }
     }
+    // ========== CALIBRATION CONFIGURATION COMMANDS ==========
+    else if (command.startsWith("CAL_CONFIG_")) {
+      handle_cal_config_command(command);
+    }
     // ========== NOISE FILTERING COMMANDS ==========
     else if (command == "FILTER_ENABLE") {
       enable_filtering(true);
@@ -1259,6 +1268,15 @@ void handle_serial_monitor_commands() {
       Serial.println("[T41]   SKIP               - Skip current step");
       Serial.println("[T41]   ABORT              - Abort automated calibration");
       Serial.println("[T41]   STATUS             - Show calibration progress");
+      Serial.println("[T41] ");
+      Serial.println("[T41] ⚙️ Calibration Configuration:");
+      Serial.println("[T41]   CAL_CONFIG_SHOW    - Show current calibration settings");
+      Serial.println("[T41]   CAL_CONFIG_MASSES <mass1,mass2,...> - Set custom masses");
+      Serial.println("[T41]   CAL_CONFIG_RESET_MASSES - Reset to default masses");
+      Serial.println("[T41]   CAL_CONFIG_ENABLE_STEP_C - Enable matrix calibration");
+      Serial.println("[T41]   CAL_CONFIG_DISABLE_STEP_C - Disable matrix calibration");
+      Serial.println("[T41]   CAL_CONFIG_CENTER_PLACEMENT - Use center placement");
+      Serial.println("[T41]   CAL_CONFIG_CORNER_PLACEMENT - Use corner placement");
       Serial.println("[T41] ");
       Serial.println("[T41] 🔧 Noise Filtering:");
       Serial.println("[T41]   FILTER_ENABLE      - Enable noise filtering");
