@@ -158,10 +158,15 @@ void print_response_summary(const TeensyResponse& response);
 static void process_espnow_command(const ESPNowCommand* cmd) {
     const char* command_str = (const char*)cmd->command;
     
-    Serial.printf("[SPI_SLAVE] ESP-NOW Command received: %s\n", command_str);
+    // Create a null-terminated copy for safe string operations
+    char safe_command[9];
+    memcpy(safe_command, command_str, 8);
+    safe_command[8] = '\0';
+    
+    Serial.printf("[SPI_SLAVE] ESP-NOW Command received: %s\n", safe_command);
     
     // Special handling for PING command - need to send response back
-    if (strcmp(command_str, "PING") == 0) {
+    if (strcmp(safe_command, "PING") == 0) {
         Serial.println("[SPI_SLAVE] ================================================");
         Serial.println("[SPI_SLAVE] PING REQUEST RECEIVED via ESP-NOW");
         Serial.println("[SPI_SLAVE] ================================================");
@@ -198,9 +203,31 @@ static void process_espnow_command(const ESPNowCommand* cmd) {
             send_espnow_response("PONG_TIMEOUT");
         }
         Serial.println("[SPI_SLAVE] ================================================");
+    }
+    // Calibration commands - translate short ESP-NOW commands to full Teensy commands
+    else if (strcmp(safe_command, "AUTOCAL") == 0) {
+        Serial.printf("[SPI_SLAVE] Calibration command: Translating 'AUTOCAL' to 'AUTO_CAL_START' for Remote Teensy...\n");
+        Serial1.println("AUTO_CAL_START");
+        Serial1.flush();
+        // Note: Calibration messages will be streamed via loop() function
+    }
+    else if (strcmp(safe_command, "CONTINUE") == 0 ||
+             strcmp(safe_command, "SKIP") == 0 ||
+             strcmp(safe_command, "ABORT") == 0) {
+        Serial.printf("[SPI_SLAVE] Calibration command: Forwarding '%s' to Remote Teensy...\n", safe_command);
+        Serial.printf("[SPI_SLAVE] DEBUG: Sending '%s' to Serial1\n", safe_command);
+        Serial1.println(safe_command);
+        Serial1.flush();
+        Serial.printf("[SPI_SLAVE] DEBUG: '%s' sent to Remote Teensy\n", safe_command);
+        // Note: Calibration messages will be streamed via loop() function
+    }
+    else if (strcmp(safe_command, "CALSTAT") == 0) {
+        Serial.printf("[SPI_SLAVE] Calibration command: Translating 'CALSTAT' to 'AUTO_CAL_STATUS' for Remote Teensy...\n");
+        Serial1.println("AUTO_CAL_STATUS");
+        Serial1.flush();
     } else {
         // Regular command handling (no response expected)
-        Serial.printf("[SPI_SLAVE] Forwarding '%s' to Remote Teensy...\n", command_str);
+        Serial.printf("[SPI_SLAVE] Forwarding '%s' to Remote Teensy...\n", safe_command);
         
         // Debug: Check Serial1 buffer space before sending
         Serial.printf("[SPI_SLAVE] Serial1 TX buffer space: %d bytes\n", Serial1.availableForWrite());
@@ -1035,7 +1062,44 @@ void setup() {
   Serial.println("[SPI_SLAVE] ==========================================");
 }
 
-void loop() { 
+void loop() {
+  // Forward calibration messages from Remote Teensy to RX Radio
+  while (Serial1.available()) {
+    String line = Serial1.readStringUntil('\n');
+    if (line.startsWith("[AUTO-CAL]")) {
+      Serial.printf("[SPI_SLAVE] Forwarding calibration message via ESP-NOW: %s\n", line.c_str());
+      
+      // Handle long messages by chunking them
+      if (line.length() > 58) { // Leave room for null terminator
+        // Split long message into chunks
+        int chunk_num = 0;
+        int start_pos = 0;
+        
+        while (start_pos < line.length()) {
+          String chunk = line.substring(start_pos, min(start_pos + 58, (int)line.length()));
+          
+          // Add chunk indicator
+          String chunked_msg = String("[CHUNK:") + chunk_num + ":" + chunk;
+          
+          Serial.printf("[SPI_SLAVE] Sending chunk %d: %s\n", chunk_num, chunked_msg.c_str());
+          send_espnow_response(chunked_msg.c_str());
+          
+          start_pos += 58;
+          chunk_num++;
+          delay(10); // Small delay between chunks
+        }
+        
+        // Send end marker
+        String end_msg = "[CHUNK:END]";
+        Serial.printf("[SPI_SLAVE] Sending end marker: %s\n", end_msg.c_str());
+        send_espnow_response(end_msg.c_str());
+      } else {
+        // Short message, send as-is
+        send_espnow_response(line.c_str());
+      }
+    }
+  }
+  
   handle_serial_commands();
   vTaskDelay(pdMS_TO_TICKS(100)); 
 }

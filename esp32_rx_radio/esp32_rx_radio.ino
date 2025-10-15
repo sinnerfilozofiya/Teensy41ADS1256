@@ -204,6 +204,10 @@ static volatile bool espnow_response_ready = false;
 static String espnow_response_data = "";
 static SemaphoreHandle_t response_mutex = NULL;
 
+// Message chunking for long calibration messages
+static String message_buffer = "";
+static bool receiving_chunks = false;
+
 // ============================================================================
 // ESP-NOW COMMAND STRUCTURES AND FUNCTIONS
 // ============================================================================
@@ -257,13 +261,20 @@ static bool send_espnow_command(const char* command_str) {
 // ============================================================================
 
 bool create_espnow_command(ESPNowCommand* cmd, const char* command_str) {
-    if (strlen(command_str) >= 8) return false; // Command too long
+    if (strlen(command_str) > 8) return false; // Command too long (allow exactly 8 chars)
     
     memset(cmd, 0, sizeof(ESPNowCommand));
     cmd->magic[0] = 0xCD;
     cmd->magic[1] = 0xD1;
-    strncpy((char*)cmd->command, command_str, 7);
-    cmd->command[7] = '\0';
+    
+    // Copy command string - for 8-char commands, don't null terminate (use full buffer)
+    if (strlen(command_str) == 8) {
+        memcpy(cmd->command, command_str, 8); // Copy all 8 chars without null terminator
+    } else {
+        strncpy((char*)cmd->command, command_str, 7); // Copy up to 7 chars
+        cmd->command[7] = '\0'; // Null terminate for shorter commands
+    }
+    
     cmd->timestamp = millis();
     
     // Calculate CRC16 of everything except CRC field
@@ -389,21 +400,57 @@ static void espnow_rx_callback(const esp_now_recv_info *recv_info, const uint8_t
                       resp->magic[0], resp->magic[1], resp->crc16);
         
         if (validate_espnow_response(resp)) {
-            Serial.printf("[RX_RADIO] ✓ Response validated: '%s'\n", resp->response);
+            String response_str = String(resp->response);
+            Serial.printf("[RX_RADIO] ✓ Response validated: '%s'\n", response_str.c_str());
             
-            // Capture response for PING test
-            if (response_mutex != NULL && xSemaphoreTake(response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                espnow_response_data = String(resp->response);
-                espnow_response_ready = true;
-                xSemaphoreGive(response_mutex);
-                Serial.printf("[RX_RADIO] → Response captured for PING test\n");
+            // Handle chunked messages
+            if (response_str.startsWith("[CHUNK:")) {
+                if (response_str.startsWith("[CHUNK:END]")) {
+                    // End of chunked message, send complete message
+                    if (message_buffer.length() > 0) {
+                        Serial.printf("[RX_RADIO] → Complete chunked message: %s\n", message_buffer.c_str());
+                        Serial2.printf("REMOTE:%s\n", message_buffer.c_str());
+                        Serial2.flush();
+                        message_buffer = "";
+                        receiving_chunks = false;
+                    }
+                } else {
+                    // Extract chunk number and content
+                    int colon1 = response_str.indexOf(':', 7); // After "[CHUNK:"
+                    int colon2 = response_str.indexOf(':', colon1 + 1);
+                    
+                    if (colon1 > 0 && colon2 > 0) {
+                        int chunk_num = response_str.substring(7, colon1).toInt();
+                        String chunk_content = response_str.substring(colon2 + 1);
+                        
+                        Serial.printf("[RX_RADIO] → Received chunk %d: %s\n", chunk_num, chunk_content.c_str());
+                        
+                        if (chunk_num == 0) {
+                            // First chunk, start new message
+                            message_buffer = chunk_content;
+                            receiving_chunks = true;
+                        } else {
+                            // Subsequent chunk, append to buffer
+                            message_buffer += chunk_content;
+                        }
+                    }
+                }
+            } else {
+                // Regular (non-chunked) message
+                // Capture response for PING test
+                if (response_mutex != NULL && xSemaphoreTake(response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    espnow_response_data = response_str;
+                    espnow_response_ready = true;
+                    xSemaphoreGive(response_mutex);
+                    Serial.printf("[RX_RADIO] → Response captured for PING test\n");
+                }
+                
+                // Forward response to BLE Slave via Serial2 with REMOTE: prefix
+                Serial.printf("[RX_RADIO] → Forwarding to BLE Slave via Serial2...\n");
+                Serial2.printf("REMOTE:%s\n", response_str.c_str());
+                Serial2.flush();
+                Serial.printf("[RX_RADIO] ✓ Response forwarded successfully: REMOTE:%s\n", response_str.c_str());
             }
-            
-            // Forward response to BLE Slave via Serial2 with REMOTE: prefix
-            Serial.printf("[RX_RADIO] → Forwarding to BLE Slave via Serial2...\n");
-            Serial2.printf("REMOTE:%s\n", resp->response);
-            Serial2.flush();
-            Serial.printf("[RX_RADIO] ✓ Response forwarded successfully: REMOTE:%s\n", resp->response);
             return;
         } else {
             Serial.printf("[RX_RADIO] ✗ Response CRC validation FAILED!\n");
@@ -766,6 +813,53 @@ static void process_command(String command) {
         Serial.printf("  ESP-NOW command errors: %lu\n", espnow_command_errors);
         Serial.printf("  Free heap: %lu bytes\n", ESP.getFreeHeap());
         Serial.println("=====================================");
+    }
+    // Local Teensy Automated Calibration
+    else if (command == "AUTO_CAL_START") {
+        Serial.println("[RX_RADIO] Starting LOCAL Teensy automated calibration...");
+        Serial1.println("AUTO_CAL_START");
+        Serial1.flush();
+    }
+    // Remote Teensy Automated Calibration (ESP-NOW has 8-char limit!)
+    else if (command == "REMOTE_AUTO_CAL") {
+        Serial.println("[RX_RADIO] Starting REMOTE Teensy automated calibration via ESP-NOW...");
+        send_espnow_command("AUTOCAL");  // 7 chars - SPI Slave will translate to AUTO_CAL_START
+    } else if (command == "REMOTE_CONTINUE") {
+        Serial.println("[RX_RADIO] Sending CONTINUE to REMOTE Teensy via ESP-NOW...");
+        Serial.printf("[RX_RADIO] DEBUG: Sending 'CONTINUE' via ESP-NOW\n");
+        send_espnow_command("CONTINUE");  // 8 chars - fits exactly!
+        Serial.printf("[RX_RADIO] DEBUG: CONTINUE sent to REMOTE Teensy via ESP-NOW\n");
+    } else if (command == "REMOTE_SKIP") {
+        Serial.println("[RX_RADIO] Sending SKIP to REMOTE Teensy via ESP-NOW...");
+        Serial.printf("[RX_RADIO] DEBUG: Sending 'SKIP' via ESP-NOW\n");
+        send_espnow_command("SKIP");  // 4 chars
+        Serial.printf("[RX_RADIO] DEBUG: SKIP sent to REMOTE Teensy via ESP-NOW\n");
+    } else if (command == "REMOTE_ABORT") {
+        Serial.println("[RX_RADIO] Sending ABORT to REMOTE Teensy via ESP-NOW...");
+        Serial.printf("[RX_RADIO] DEBUG: Sending 'ABORT' via ESP-NOW\n");
+        send_espnow_command("ABORT");  // 5 chars
+        Serial.printf("[RX_RADIO] DEBUG: ABORT sent to REMOTE Teensy via ESP-NOW\n");
+    } else if (command == "REMOTE_AUTO_CAL_STATUS") {
+        Serial.println("[RX_RADIO] Requesting calibration status from REMOTE Teensy...");
+        send_espnow_command("CALSTAT");  // 7 chars - SPI Slave will translate to AUTO_CAL_STATUS
+    }
+    // Local calibration interactive commands
+    else if (command == "CONTINUE") {
+        Serial.println("[RX_RADIO] Forwarding CONTINUE to LOCAL Teensy...");
+        Serial1.println("CONTINUE");
+        Serial1.flush();
+    } else if (command == "SKIP") {
+        Serial.println("[RX_RADIO] Forwarding SKIP to LOCAL Teensy...");
+        Serial1.println("SKIP");
+        Serial1.flush();
+    } else if (command == "ABORT") {
+        Serial.println("[RX_RADIO] Forwarding ABORT to LOCAL Teensy...");
+        Serial1.println("ABORT");
+        Serial1.flush();
+    } else if (command == "AUTO_CAL_STATUS") {
+        Serial.println("[RX_RADIO] Requesting calibration status from LOCAL Teensy...");
+        Serial1.println("AUTO_CAL_STATUS");
+        Serial1.flush();
     } else if (command == "HELP") {
         Serial.println("[RX_RADIO] === AVAILABLE COMMANDS ===");
         Serial.println("  Local Teensy Control:");
@@ -958,6 +1052,16 @@ void loop() {
         last_combined_count = combined_samples_count;
         last_uart_packets = uart_packets_sent;
         last_uart_bytes = uart_bytes_sent;
+    }
+    
+    // Forward calibration messages from Local Teensy to BLE Slave
+    while (Serial1.available()) {
+        String line = Serial1.readStringUntil('\n');
+        if (line.startsWith("[AUTO-CAL]")) {
+            Serial.printf("[RX_RADIO] Forwarding calibration message to BLE Slave: %s\n", line.c_str());
+            Serial2.printf("LOCAL:%s\n", line.c_str());
+            Serial2.flush();
+        }
     }
     
     handle_serial_commands();
