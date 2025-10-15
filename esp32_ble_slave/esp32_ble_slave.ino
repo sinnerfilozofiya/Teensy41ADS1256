@@ -228,16 +228,27 @@ static void process_ble_command(String command) {
         command == "REMOTE_ZERO" || command == "REMOTE_ZERO_STATUS" || command == "REMOTE_ZERO_RESET" ||
         command == "ALL_ZERO" || command == "ALL_ZERO_STATUS" || command == "ALL_ZERO_RESET" ||
         command == "LOCAL_ON" || command == "LOCAL_OFF" || command == "REMOTE_ON" || command == "REMOTE_OFF" ||
-        command == "STATUS" || command == "REMOTE_PING") {
+        command == "STATUS" || command == "LOCAL_PING" || command == "REMOTE_PING") {
         
-        // Special formatting for REMOTE_PING
-        bool is_ping = (command == "REMOTE_PING");
+        // Special formatting for PING commands
+        bool is_local_ping = (command == "LOCAL_PING");
+        bool is_remote_ping = (command == "REMOTE_PING");
+        bool is_ping = (is_local_ping || is_remote_ping);
+        
         if (is_ping) {
             Serial.println("\n╔════════════════════════════════════════════════════════════════╗");
-            Serial.println("║      REMOTE PING-PONG TEST - BLE SLAVE (via BLE)              ║");
+            if (is_local_ping) {
+                Serial.println("║         LOCAL PING-PONG TEST - BLE SLAVE (via BLE)            ║");
+            } else {
+                Serial.println("║         REMOTE PING-PONG TEST - BLE SLAVE (via BLE)           ║");
+            }
             Serial.println("╚════════════════════════════════════════════════════════════════╝");
             Serial.printf("  📤 SENDING: %s\n", command.c_str());
-            Serial.println("  Path: BLE Slave → RX Radio → SPI Slave → Remote Teensy");
+            if (is_local_ping) {
+                Serial.println("  Path: BLE Slave → RX Radio → Local Teensy");
+            } else {
+                Serial.println("  Path: BLE Slave → RX Radio → SPI Slave → Remote Teensy");
+            }
             Serial.println("  ──────────────────────────────────────────────────────────────");
         } else {
             Serial.printf("[BLE_SLAVE] Forwarding BLE command '%s' to ESP32 RX Radio...\n", command.c_str());
@@ -281,7 +292,19 @@ static void process_ble_command(String command) {
         
         if (got_response) {
             if (is_ping) {
-                Serial.printf("  📥 RECEIVED: %s\n", response_text.c_str());
+                // Parse prefix to determine source
+                String source_indicator = "UNKNOWN";
+                String actual_response = response_text;
+                
+                if (response_text.startsWith("LOCAL:")) {
+                    source_indicator = "🟢 LOCAL TEENSY";
+                    actual_response = response_text.substring(6); // Remove "LOCAL:" prefix
+                } else if (response_text.startsWith("REMOTE:")) {
+                    source_indicator = "🔵 REMOTE TEENSY";
+                    actual_response = response_text.substring(7); // Remove "REMOTE:" prefix
+                }
+                
+                Serial.printf("  📥 RECEIVED: %s (from %s)\n", actual_response.c_str(), source_indicator.c_str());
                 Serial.printf("  ⏱️  Round-trip time: %lu ms\n", round_trip_ms);
                 Serial.println("  ──────────────────────────────────────────────────────────────");
                 Serial.println("  ✅ PING-PONG TEST SUCCESS!");
@@ -681,16 +704,27 @@ static void handle_serial_commands() {
             command == "REMOTE_ZERO" || command == "REMOTE_ZERO_STATUS" || command == "REMOTE_ZERO_RESET" ||
             command == "ALL_ZERO" || command == "ALL_ZERO_STATUS" || command == "ALL_ZERO_RESET" ||
             command == "LOCAL_ON" || command == "LOCAL_OFF" || command == "REMOTE_ON" || command == "REMOTE_OFF" ||
-            command == "REMOTE_PING") {
+            command == "LOCAL_PING" || command == "REMOTE_PING") {
             
-            // Special formatting for REMOTE_PING
-            bool is_ping = (command == "REMOTE_PING");
+            // Special formatting for PING commands
+            bool is_local_ping = (command == "LOCAL_PING");
+            bool is_remote_ping = (command == "REMOTE_PING");
+            bool is_ping = (is_local_ping || is_remote_ping);
+            
             if (is_ping) {
                 Serial.println("\n╔════════════════════════════════════════════════════════════════╗");
-                Serial.println("║         REMOTE PING-PONG TEST - BLE SLAVE                      ║");
+                if (is_local_ping) {
+                    Serial.println("║         LOCAL PING-PONG TEST - BLE SLAVE                       ║");
+                } else {
+                    Serial.println("║         REMOTE PING-PONG TEST - BLE SLAVE                      ║");
+                }
                 Serial.println("╚════════════════════════════════════════════════════════════════╝");
                 Serial.printf("  📤 SENDING: %s\n", command.c_str());
-                Serial.println("  Path: BLE Slave → RX Radio → SPI Slave → Remote Teensy");
+                if (is_local_ping) {
+                    Serial.println("  Path: BLE Slave → RX Radio → Local Teensy");
+                } else {
+                    Serial.println("  Path: BLE Slave → RX Radio → SPI Slave → Remote Teensy");
+                }
                 Serial.println("  ──────────────────────────────────────────────────────────────");
             } else {
                 Serial.printf("[BLE_SLAVE] Forwarding '%s' to ESP32 RX Radio...\n", command.c_str());
@@ -734,7 +768,19 @@ static void handle_serial_commands() {
             
             if (got_response) {
                 if (is_ping) {
-                    Serial.printf("  📥 RECEIVED: %s\n", response_text.c_str());
+                    // Parse prefix to determine source
+                    String source_indicator = "UNKNOWN";
+                    String actual_response = response_text;
+                    
+                    if (response_text.startsWith("LOCAL:")) {
+                        source_indicator = "🟢 LOCAL TEENSY";
+                        actual_response = response_text.substring(6); // Remove "LOCAL:" prefix
+                    } else if (response_text.startsWith("REMOTE:")) {
+                        source_indicator = "🔵 REMOTE TEENSY";
+                        actual_response = response_text.substring(7); // Remove "REMOTE:" prefix
+                    }
+                    
+                    Serial.printf("  📥 RECEIVED: %s (from %s)\n", actual_response.c_str(), source_indicator.c_str());
                     Serial.printf("  ⏱️  Round-trip time: %lu ms\n", round_trip_ms);
                     Serial.println("  ──────────────────────────────────────────────────────────────");
                     Serial.println("  ✅ PING-PONG TEST SUCCESS!");
@@ -847,6 +893,7 @@ static void handle_serial_commands() {
             Serial.println("    LOCAL_ON/OFF, REMOTE_ON/OFF");
             Serial.println("    RX_STATUS    - Get ESP32 RX Radio status");
             Serial.println("  Test Commands:");
+            Serial.println("    LOCAL_PING   - Ping local Teensy (via RX Radio -> Local Teensy)");
             Serial.println("    REMOTE_PING  - Ping remote Teensy (via RX Radio -> SPI Slave -> Remote Teensy)");
             Serial.println("  BLE Slave Commands:");
             Serial.println("    STATS        - Show BLE slave statistics");

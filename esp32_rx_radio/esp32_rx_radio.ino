@@ -399,11 +399,11 @@ static void espnow_rx_callback(const esp_now_recv_info *recv_info, const uint8_t
                 Serial.printf("[RX_RADIO] → Response captured for PING test\n");
             }
             
-            // Forward response to BLE Slave via Serial2
+            // Forward response to BLE Slave via Serial2 with REMOTE: prefix
             Serial.printf("[RX_RADIO] → Forwarding to BLE Slave via Serial2...\n");
-            Serial2.println(resp->response);
+            Serial2.printf("REMOTE:%s\n", resp->response);
             Serial2.flush();
-            Serial.printf("[RX_RADIO] ✓ Response forwarded successfully\n");
+            Serial.printf("[RX_RADIO] ✓ Response forwarded successfully: REMOTE:%s\n", resp->response);
             return;
         } else {
             Serial.printf("[RX_RADIO] ✗ Response CRC validation FAILED!\n");
@@ -532,6 +532,60 @@ static void process_command(String command) {
                 Serial.printf("[RX_RADIO] ⚠ Local Teensy response timeout after %lums\n", timeout_ms);
                 Serial.printf("[RX_RADIO] Debug: Serial1 RX buffer has %d bytes available\n", Serial1.available());
             }
+    }
+    // Local PING test
+    else if (command == "LOCAL_PING") {
+        Serial.println("[RX_RADIO] ================================================");
+        Serial.println("[RX_RADIO] LOCAL PING TEST INITIATED");
+        Serial.println("[RX_RADIO] Path: BLE Slave -> RX Radio -> Local Teensy");
+        Serial.println("[RX_RADIO] ================================================");
+        Serial.printf("[RX_RADIO] Step 1/2: Sending 'PING' to Local Teensy via UART...\n");
+        
+        unsigned long start_time = millis();
+        Serial1.println("PING");
+        Serial1.flush();
+        
+        Serial.printf("[RX_RADIO] ✓ UART PING sent successfully\n");
+        Serial.printf("[RX_RADIO] Step 2/2: Waiting for PONG response via UART...\n");
+        
+        // Wait for response from Local Teensy
+        unsigned long timeout = millis() + 3000; // 3 second timeout
+        bool got_response = false;
+        String response_text = "";
+        
+        while (millis() < timeout) {
+            if (Serial1.available()) {
+                response_text = Serial1.readStringUntil('\n');
+                response_text.trim();
+                got_response = true;
+                break;
+            }
+            delay(10);
+        }
+        
+        unsigned long round_trip = millis() - start_time;
+        
+        if (got_response) {
+            Serial.println("[RX_RADIO] ================================================");
+            Serial.printf("[RX_RADIO] ✓ PONG RECEIVED: %s\n", response_text.c_str());
+            Serial.printf("[RX_RADIO] ✓ Round-trip time: %lu ms\n", round_trip);
+            Serial.println("[RX_RADIO] ✓ LOCAL PING TEST SUCCESS!");
+            Serial.println("[RX_RADIO] ================================================");
+            
+            // Forward to BLE Slave with LOCAL: prefix
+            Serial2.printf("LOCAL:%s\n", response_text.c_str());
+            Serial2.flush();
+            Serial.printf("[RX_RADIO] → Forwarded to BLE Slave: LOCAL:%s\n", response_text.c_str());
+        } else {
+            Serial.println("[RX_RADIO] ================================================");
+            Serial.printf("[RX_RADIO] ✗ No PONG response after %lu ms\n", round_trip);
+            Serial.println("[RX_RADIO] ✗ LOCAL PING TEST FAILED!");
+            Serial.println("[RX_RADIO] ================================================");
+            
+            // Forward timeout to BLE Slave
+            Serial2.println("LOCAL:PONG_TIMEOUT");
+            Serial2.flush();
+        }
     }
     // Remote Teensy control commands (via ESP-NOW)
     else if (command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
@@ -739,7 +793,8 @@ static void process_command(String command) {
         Serial.println("    ALL_ZERO_STATUS - Show zeroing status for BOTH units");
         Serial.println("    ALL_ZERO_RESET  - Reset zero offsets for BOTH units");
         Serial.println("  Test Commands:");
-        Serial.println("    REMOTE_PING   - Ping remote Teensy (full round-trip test)");
+        Serial.println("    LOCAL_PING    - Ping local Teensy (UART round-trip test)");
+        Serial.println("    REMOTE_PING   - Ping remote Teensy (ESP-NOW round-trip test)");
         Serial.println("  ESP32 Control:");
         Serial.println("    LOCAL_ON/OFF  - Enable/disable local data");
         Serial.println("    REMOTE_ON/OFF - Enable/disable remote data");
