@@ -12,6 +12,29 @@
 #include <nvs.h>
 #include "common_frame.h"
 
+// ============================================================================
+// STRUCTURED RESPONSE SYSTEM - FORWARD DECLARATIONS
+// ============================================================================
+
+enum ResponseType {
+    RESP_UNKNOWN = 0,
+    RESP_OK = 1,
+    RESP_ERROR = 2,
+    RESP_STATUS = 3,
+    RESP_ZERO_STATUS = 4,
+    RESP_STATE = 5,
+    RESP_TIMEOUT = 6
+};
+
+struct TeensyResponse {
+    ResponseType type;
+    String command;
+    String status;
+    String data;
+    bool success;
+    unsigned long response_time_ms;
+};
+
 #define PIN_MOSI 11
 #define PIN_MISO 13
 #define PIN_SCLK 12
@@ -71,6 +94,8 @@ static uint32_t t0_ms;
 // Debug mode control
 static volatile bool debug_mode = false;
 static volatile bool output_raw_data = true; // Enable by default for testing
+static volatile bool auto_cal_monitoring = true; // Enable automated calibration monitoring by default
+static volatile bool auto_cal_active = false; // Track if automated calibration is running
 
 // ============================================================================
 // RADIO NETWORKING VARIABLES
@@ -92,27 +117,51 @@ static volatile uint32_t espnow_commands_received = 0;
 static volatile uint32_t espnow_command_errors = 0;
 
 // ============================================================================
-// STRUCTURED RESPONSE SYSTEM
+// AUTOMATED CALIBRATION MONITORING
 // ============================================================================
 
-enum ResponseType {
-    RESP_UNKNOWN = 0,
-    RESP_OK = 1,
-    RESP_ERROR = 2,
-    RESP_STATUS = 3,
-    RESP_ZERO_STATUS = 4,
-    RESP_STATE = 5,
-    RESP_TIMEOUT = 6
-};
+void monitor_automated_calibration() {
+    // This function continuously monitors for automated calibration messages
+    // It should be called from the main loop when automated calibration is active
+    
+    if (!auto_cal_monitoring) return;
+    
+    static unsigned long last_check = 0;
+    unsigned long now = millis();
+    
+    // Check for messages every 100ms
+    if (now - last_check < 100) return;
+    last_check = now;
+    
+    // Read all available messages from Teensy
+    while (Serial1.available()) {
+        String line = Serial1.readStringUntil('\n');
+        line.trim();
+        
+        if (line.length() > 0) {
+            // Check if this is an automated calibration message
+            if (line.startsWith("[AUTO-CAL]")) {
+                Serial.printf("[SPI_SLAVE] %s\n", line.c_str());
+            }
+            // Check if this is a regular Teensy message
+            else if (line.startsWith("[T41]")) {
+                Serial.printf("[SPI_SLAVE] %s\n", line.c_str());
+            }
+            // Check if this is a calibration-related message
+            else if (line.startsWith("[CAL]")) {
+                Serial.printf("[SPI_SLAVE] %s\n", line.c_str());
+            }
+            // Print other messages from Teensy
+            else if (line.length() > 5) { // Avoid printing empty or very short lines
+                Serial.printf("[SPI_SLAVE] Teensy: %s\n", line.c_str());
+            }
+        }
+    }
+}
 
-struct TeensyResponse {
-    ResponseType type;
-    String command;
-    String status;
-    String data;
-    bool success;
-    unsigned long response_time_ms;
-};
+// ============================================================================
+// STRUCTURED RESPONSE SYSTEM
+// ============================================================================
 
 // Response statistics
 static volatile uint32_t total_commands_sent = 0;
@@ -150,6 +199,14 @@ static void process_espnow_command(const ESPNowCommand* cmd);
 TeensyResponse parse_teensy_response(const String& raw_response, const String& command, unsigned long response_time);
 TeensyResponse send_command_with_response(const String& command, unsigned long timeout_ms = 2000);
 void print_response_summary(const TeensyResponse& response);
+
+// Automated calibration command processing
+void process_calibration_command(const String& command);
+void process_automated_calibration_command(const String& command);
+bool is_calibration_command(const String& command);
+bool is_automated_calibration_command(const String& command);
+bool is_data_acquisition_command(const String& command);
+bool is_system_command(const String& command);
 
 // ============================================================================
 // ESP-NOW COMMAND PROCESSING
@@ -360,6 +417,124 @@ void print_response_summary(const TeensyResponse& response) {
     Serial.printf("  Response Time: %lu ms\n", response.response_time_ms);
     if (response.data.length() > 0) {
         Serial.printf("  Data: %s\n", response.data.c_str());
+    }
+}
+
+// ============================================================================
+// COMMAND CATEGORIZATION FUNCTIONS
+// ============================================================================
+
+bool is_calibration_command(const String& command) {
+    return command.startsWith("CAL_") || 
+           command.startsWith("AUTO_CAL_") || 
+           command == "AUTOMATED_CALIBRATION" ||
+           command.startsWith("VAL_") ||
+           command.startsWith("DIAG_") ||
+           command.startsWith("FILTER_") ||
+           command == "ZERO" ||
+           command == "ZERO_STATUS" ||
+           command == "ZERO_RESET" ||
+           command == "SHOW_VALUES" ||
+           command == "RESET_CAL";
+}
+
+bool is_automated_calibration_command(const String& command) {
+    return command == "CONTINUE" ||
+           command == "SKIP" ||
+           command == "ABORT" ||
+           command == "STATUS" ||
+           command.startsWith("CAL_CONFIG_");
+}
+
+bool is_data_acquisition_command(const String& command) {
+    return command == "START" || 
+           command == "STOP" || 
+           command == "RESTART" || 
+           command == "RESET";
+}
+
+bool is_system_command(const String& command) {
+    return command == "STATUS" || 
+           command == "HELP" ||
+           command == "TEST_UART" ||
+           command == "TEST_RESPONSES" ||
+           command == "DEBUG_ON" ||
+           command == "DEBUG_OFF" ||
+           command == "AUTO_CAL_MONITOR_ON" ||
+           command == "AUTO_CAL_MONITOR_OFF" ||
+           command == "NET";
+}
+
+// ============================================================================
+// CALIBRATION COMMAND PROCESSING
+// ============================================================================
+
+void process_calibration_command(const String& command) {
+    Serial.printf("[SPI_SLAVE] Processing calibration command: %s\n", command.c_str());
+    
+    // Determine timeout based on command type
+    unsigned long timeout_ms = 2000; // Default 2 seconds
+    
+    if (command == "ZERO") {
+        timeout_ms = 10000; // 10 seconds for zeroing
+    } else if (command.startsWith("CAL_") || command.startsWith("AUTO_CAL_") || command.startsWith("VAL_")) {
+        timeout_ms = 5000; // 5 seconds for calibration commands
+    } else if (command == "AUTOMATED_CALIBRATION") {
+        timeout_ms = 10000; // 10 seconds for automated calibration start
+    }
+    
+    // Send command with structured response
+    TeensyResponse response = send_command_with_response(command, timeout_ms);
+    
+    // Print detailed response information
+    print_response_summary(response);
+    
+    if (response.success) {
+        Serial.printf("[SPI_SLAVE] ✓ Calibration command '%s' executed successfully\n", command.c_str());
+        
+        // Special handling for specific commands
+        if (command == "ZERO") {
+            Serial.println("[SPI_SLAVE] Load cells have been zeroed. Offsets are now applied to all readings.");
+        } else if (command == "AUTO_CAL_START" || command == "AUTOMATED_CALIBRATION") {
+            Serial.println("[SPI_SLAVE] Automated calibration started. Follow the prompts on the Teensy.");
+            Serial.println("[SPI_SLAVE] Use CONTINUE, SKIP, ABORT, or STATUS commands to control the process.");
+            auto_cal_active = true;
+        } else if (command.startsWith("CAL_FORCE_")) {
+            Serial.println("[SPI_SLAVE] Force data retrieved successfully.");
+        }
+    } else {
+        Serial.printf("[SPI_SLAVE] ✗ Calibration command '%s' failed: %s\n", command.c_str(), response.status.c_str());
+    }
+}
+
+void process_automated_calibration_command(const String& command) {
+    Serial.printf("[SPI_SLAVE] Processing automated calibration command: %s\n", command.c_str());
+    
+    // These commands are sent directly to Teensy without waiting for structured response
+    // because they're part of the interactive calibration process
+    
+    if (command == "CONTINUE" || command == "SKIP" || command == "ABORT" || command == "STATUS") {
+        // Send command directly to Teensy
+        Serial1.println(command);
+        Serial1.flush();
+        Serial.printf("[SPI_SLAVE] Sent '%s' to Teensy for automated calibration\n", command.c_str());
+        
+        if (command == "ABORT") {
+            auto_cal_active = false;
+            Serial.println("[SPI_SLAVE] Automated calibration aborted");
+        }
+    } else if (command.startsWith("CAL_CONFIG_")) {
+        // Configuration commands - send with response
+        TeensyResponse response = send_command_with_response(command, 3000);
+        print_response_summary(response);
+        
+        if (response.success) {
+            Serial.printf("[SPI_SLAVE] ✓ Configuration command '%s' executed successfully\n", command.c_str());
+        } else {
+            Serial.printf("[SPI_SLAVE] ✗ Configuration command '%s' failed: %s\n", command.c_str(), response.status.c_str());
+        }
+    } else {
+        Serial.printf("[SPI_SLAVE] ✗ Unknown automated calibration command: %s\n", command.c_str());
     }
 }
 
@@ -794,9 +969,14 @@ void handle_serial_commands() {
     
     Serial.printf("[SPI_SLAVE] Command received: %s\n", command.c_str());
     
-    // Teensy control commands
-    if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
-        command == "ZERO" || command == "ZERO_STATUS" || command == "ZERO_RESET") {
+    // Categorize and process commands
+    if (is_automated_calibration_command(command)) {
+      process_automated_calibration_command(command);
+    }
+    else if (is_calibration_command(command)) {
+      process_calibration_command(command);
+    }
+    else if (is_data_acquisition_command(command)) {
       Serial.printf("[SPI_SLAVE] Forwarding '%s' to Remote Teensy...\n", command.c_str());
       
       // Use structured response system
@@ -819,11 +999,19 @@ void handle_serial_commands() {
     } else if (command == "DEBUG_OFF") {
       output_raw_data = false;
       Serial.println("[SPI_SLAVE] ✓ Raw data output disabled");
+    } else if (command == "AUTO_CAL_MONITOR_ON") {
+      auto_cal_monitoring = true;
+      Serial.println("[SPI_SLAVE] ✓ Automated calibration monitoring enabled");
+    } else if (command == "AUTO_CAL_MONITOR_OFF") {
+      auto_cal_monitoring = false;
+      Serial.println("[SPI_SLAVE] ✓ Automated calibration monitoring disabled");
     } else if (command == "STATUS") {
       Serial.printf("[SPI_SLAVE] === ESP32 SPI SLAVE STATUS ===\n");
       Serial.printf("  Frames OK: %lu\n", (unsigned long)frames_ok);
       Serial.printf("  Network sent: %lu\n", (unsigned long)net_sent_ok);
       Serial.printf("  Raw data: %s\n", output_raw_data ? "ON" : "OFF");
+      Serial.printf("  Auto-cal monitoring: %s\n", auto_cal_monitoring ? "ON" : "OFF");
+      Serial.printf("  Auto-cal active: %s\n", auto_cal_active ? "YES" : "NO");
       Serial.printf("  ESP-NOW commands received: %lu\n", (unsigned long)espnow_commands_received);
       Serial.printf("  ESP-NOW command errors: %lu\n", (unsigned long)espnow_command_errors);
       Serial.printf("  Teensy commands sent: %lu\n", (unsigned long)total_commands_sent);
@@ -900,6 +1088,21 @@ void handle_serial_commands() {
                     total_commands_sent > 0 ? (successful_responses * 100.0 / total_commands_sent) : 0.0,
                     (unsigned long)successful_responses, (unsigned long)total_commands_sent);
       Serial.println("================================================");
+    } else if (command == "TEST_CALIBRATION") {
+      Serial.println("[SPI_SLAVE] === TESTING CALIBRATION COMMANDS ===");
+      
+      String cal_test_commands[] = {"CAL_SUMMARY", "ZERO_STATUS", "SHOW_VALUES", "CAL_FORCE_DATA"};
+      int num_tests = 4;
+      
+      for (int i = 0; i < num_tests; i++) {
+        Serial.printf("[SPI_SLAVE] Calibration Test %d/%d: %s\n", i+1, num_tests, cal_test_commands[i].c_str());
+        process_calibration_command(cal_test_commands[i]);
+        Serial.println("---");
+        delay(1000); // Brief pause between tests
+      }
+      
+      Serial.println("[SPI_SLAVE] === CALIBRATION TEST COMPLETE ===");
+      Serial.println("================================================");
     } else if (command == "PING") {
       Serial.println("[SPI_SLAVE] === LOCAL PING TEST ===");
       Serial.printf("[SPI_SLAVE] Sending PING to Remote Teensy...\n");
@@ -915,23 +1118,69 @@ void handle_serial_commands() {
       Serial.println("====================================");
     } else if (command == "HELP") {
       Serial.println("[SPI_SLAVE] === AVAILABLE COMMANDS ===");
-        Serial.println("  Teensy Control:");
-        Serial.println("    START       - Start Teensy data acquisition");
-        Serial.println("    STOP        - Stop Teensy data acquisition");
-        Serial.println("    RESTART     - Restart Teensy data acquisition");
-        Serial.println("    RESET       - Reset Teensy");
-        Serial.println("    ZERO        - Zero Teensy load cells (1500 samples)");
-        Serial.println("    ZERO_STATUS - Show Teensy zeroing status");
-        Serial.println("    ZERO_RESET  - Reset Teensy zero offsets");
+      Serial.println("  Data Acquisition:");
+      Serial.println("    START       - Start Teensy data acquisition");
+      Serial.println("    STOP        - Stop Teensy data acquisition");
+      Serial.println("    RESTART     - Restart Teensy data acquisition");
+      Serial.println("    RESET       - Reset Teensy");
+      Serial.println("");
+      Serial.println("  Calibration Commands:");
+      Serial.println("    ZERO        - Zero Teensy load cells (1500 samples)");
+      Serial.println("    ZERO_STATUS - Show Teensy zeroing status");
+      Serial.println("    ZERO_RESET  - Reset Teensy zero offsets");
+      Serial.println("    CAL_SUMMARY - Show calibration summary");
+      Serial.println("    CAL_FORCE_DATA - Get calibrated force data");
+      Serial.println("    CAL_FORCE_INT16 - Get force data as int16");
+      Serial.println("    SHOW_VALUES - Show current load cell values");
+      Serial.println("    RESET_CAL   - Reset all calibration data");
+      Serial.println("");
+      Serial.println("  Automated Calibration:");
+      Serial.println("    AUTOMATED_CALIBRATION - Start automated calibration (main command)");
+      Serial.println("    AUTO_CAL_START        - Start automated calibration (alternative)");
+      Serial.println("    CONTINUE              - Continue current calibration step");
+      Serial.println("    SKIP                  - Skip current calibration step");
+      Serial.println("    ABORT                 - Abort automated calibration");
+      Serial.println("    STATUS                - Show calibration status");
+      Serial.println("");
+      Serial.println("  Calibration Configuration:");
+      Serial.println("    CAL_CONFIG_SHOW       - Show current configuration");
+      Serial.println("    CAL_CONFIG_MASSES <masses> - Set custom masses");
+      Serial.println("    CAL_CONFIG_RESET_MASSES - Reset to default masses");
+      Serial.println("    CAL_CONFIG_ENABLE_STEP_C - Enable matrix calibration");
+      Serial.println("    CAL_CONFIG_DISABLE_STEP_C - Disable matrix calibration");
+      Serial.println("    CAL_CONFIG_CENTER_PLACEMENT - Use center placement");
+      Serial.println("    CAL_CONFIG_CORNER_PLACEMENT - Use corner placement");
+      Serial.println("");
+      Serial.println("  Validation & Diagnostics:");
+      Serial.println("    VAL_CALIBRATION       - Validate calibration");
+      Serial.println("    VAL_FORCE_ACCURACY    - Test force accuracy");
+      Serial.println("    VAL_COP_ACCURACY      - Test COP accuracy");
+      Serial.println("    DIAG_ADC              - ADC diagnostics");
+      Serial.println("    DIAG_LOAD_CELLS       - Load cell diagnostics");
+      Serial.println("    DIAG_CALIBRATION      - Calibration diagnostics");
+      Serial.println("");
+      Serial.println("  Noise Filtering:");
+      Serial.println("    FILTER_OFF            - Disable filtering");
+      Serial.println("    FILTER_LOW_PASS       - Low pass filter");
+      Serial.println("    FILTER_MOVING_AVG     - Moving average filter");
+      Serial.println("    FILTER_MEDIAN         - Median filter");
+      Serial.println("    FILTER_GAUSSIAN       - Gaussian filter");
+      Serial.println("    FILTER_TYPE <0-7>     - Set filter type");
+      Serial.println("    OUTLIER_METHOD <0-4>  - Set outlier detection");
+      Serial.println("    GAUSSIAN_SIGMA <0.1-5.0> - Set Gaussian filter sigma");
+      Serial.println("");
       Serial.println("  Test Commands:");
-      Serial.println("    PING         - Test PING-PONG with Remote Teensy (local)");
+      Serial.println("    PING                  - Test PING-PONG with Remote Teensy");
+      Serial.println("    TEST_UART             - Test UART communication");
+      Serial.println("    TEST_RESPONSES        - Test structured response system");
+      Serial.println("    TEST_CALIBRATION      - Test calibration commands");
+      Serial.println("");
       Serial.println("  ESP32 Control:");
-      Serial.println("    DEBUG_ON/OFF - Enable/disable raw data output");
-      Serial.println("    STATUS       - Show system status");
-      Serial.println("    NET          - Show network statistics");
-      Serial.println("    TEST_UART    - Test UART communication with Teensy");
-      Serial.println("    TEST_RESPONSES - Test structured response system");
-      Serial.println("    HELP         - Show this help");
+      Serial.println("    DEBUG_ON/OFF          - Enable/disable raw data output");
+      Serial.println("    AUTO_CAL_MONITOR_ON/OFF - Enable/disable auto-cal monitoring");
+      Serial.println("    STATUS                - Show system status");
+      Serial.println("    NET                   - Show network statistics");
+      Serial.println("    HELP                  - Show this help");
       Serial.println("======================================");
     } else if (command == "") {
       // Empty command, do nothing
@@ -1030,12 +1279,18 @@ void setup() {
   Serial.println("[TX] All systems initialized - ready for Teensy data");
   Serial.println("[SPI_SLAVE] ==========================================");
   Serial.println("[SPI_SLAVE] ESP32 SPI Slave ready for commands");
-  Serial.println("[SPI_SLAVE] Teensy commands: START, STOP, RESTART, RESET, ZERO, ZERO_STATUS, ZERO_RESET");
-  Serial.println("[SPI_SLAVE] ESP32 commands: DEBUG_ON/OFF, STATUS, NET, HELP");
+  Serial.println("[SPI_SLAVE] Data Acquisition: START, STOP, RESTART, RESET");
+  Serial.println("[SPI_SLAVE] Calibration: ZERO, CAL_*, AUTO_CAL_*, VAL_*, DIAG_*, FILTER_*");
+  Serial.println("[SPI_SLAVE] System: DEBUG_ON/OFF, STATUS, NET, TEST_*, HELP");
+  Serial.println("[SPI_SLAVE] Type 'HELP' for complete command list");
   Serial.println("[SPI_SLAVE] ==========================================");
 }
 
 void loop() { 
   handle_serial_commands();
+  
+  // Monitor for automated calibration messages
+  monitor_automated_calibration();
+  
   vTaskDelay(pdMS_TO_TICKS(100)); 
 }
