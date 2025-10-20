@@ -4,6 +4,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include "common_frame.h"
+#include "./calibration_texts.h"
 
 // ============================================================================
 // UART CONFIGURATION (must match master ESP32)
@@ -126,71 +127,7 @@ enum CalibrationTarget {
     CAL_REMOTE = 2
 };
 
-// Calibration step definition
-struct CalibrationStep {
-    const char* id;
-    const char* description;
-    const char* duration;
-    bool requires_input;
-};
-
-// Complete calibration step database
-static const CalibrationStep cal_steps[] = {
-    // Step A: ADC Calibration
-    {"A.0", "Introduction", "", true},
-    {"A.1", "ADC Self-Calibration (SELFOCAL + SELFGCAL)", "~30 sec", false},
-    
-    // Step B: Load Cell Calibration
-    {"B.0", "Load Cell Calibration Introduction", "", true},
-    {"B.1", "Tare All Load Cells (Zero Calibration)", "~10 sec", false},
-    {"B.2.0", "Span Calibration Setup - Load Cell 1", "", true},
-    {"B.2.1", "LC1: Place 0kg (no load)", "~5 sec", true},
-    {"B.2.2", "LC1: Place 5kg mass", "~5 sec", true},
-    {"B.2.3", "LC1: Place 10kg mass", "~5 sec", true},
-    {"B.2.4", "LC1: Place 15kg mass", "~5 sec", true},
-    {"B.2.5", "LC1: Place 20kg mass", "~5 sec", true},
-    {"B.2.6", "LC1: Compute Span Coefficients", "~2 sec", false},
-    {"B.3.0", "Span Calibration Setup - Load Cell 2", "", true},
-    {"B.3.1", "LC2: Place 0kg (no load)", "~5 sec", true},
-    {"B.3.2", "LC2: Place 5kg mass", "~5 sec", true},
-    {"B.3.3", "LC2: Place 10kg mass", "~5 sec", true},
-    {"B.3.4", "LC2: Place 15kg mass", "~5 sec", true},
-    {"B.3.5", "LC2: Place 20kg mass", "~5 sec", true},
-    {"B.3.6", "LC2: Compute Span Coefficients", "~2 sec", false},
-    {"B.4.0", "Span Calibration Setup - Load Cell 3", "", true},
-    {"B.4.1", "LC3: Place 0kg (no load)", "~5 sec", true},
-    {"B.4.2", "LC3: Place 5kg mass", "~5 sec", true},
-    {"B.4.3", "LC3: Place 10kg mass", "~5 sec", true},
-    {"B.4.4", "LC3: Place 15kg mass", "~5 sec", true},
-    {"B.4.5", "LC3: Place 20kg mass", "~5 sec", true},
-    {"B.4.6", "LC3: Compute Span Coefficients", "~2 sec", false},
-    {"B.5.0", "Span Calibration Setup - Load Cell 4", "", true},
-    {"B.5.1", "LC4: Place 0kg (no load)", "~5 sec", true},
-    {"B.5.2", "LC4: Place 5kg mass", "~5 sec", true},
-    {"B.5.3", "LC4: Place 10kg mass", "~5 sec", true},
-    {"B.5.4", "LC4: Place 15kg mass", "~5 sec", true},
-    {"B.5.5", "LC4: Place 20kg mass", "~5 sec", true},
-    {"B.5.6", "LC4: Compute Span Coefficients", "~2 sec", false},
-    
-    // Step C: Matrix Calibration
-    {"C.0", "Matrix Calibration Introduction", "", true},
-    {"C.1", "Position 1: Center (0, 0 mm)", "~5 sec", true},
-    {"C.2", "Position 2: Front Center (0, +150 mm)", "~5 sec", true},
-    {"C.3", "Position 3: Back Center (0, -150 mm)", "~5 sec", true},
-    {"C.4", "Position 4: Right Center (+150, 0 mm)", "~5 sec", true},
-    {"C.5", "Position 5: Left Center (-150, 0 mm)", "~5 sec", true},
-    {"C.6", "Position 6: Front-Right Corner (+150, +150 mm)", "~5 sec", true},
-    {"C.7", "Position 7: Front-Left Corner (-150, +150 mm)", "~5 sec", true},
-    {"C.8", "Position 8: Back-Right Corner (+150, -150 mm)", "~5 sec", true},
-    {"C.9", "Position 9: Back-Left Corner (-150, -150 mm)", "~5 sec", true},
-    {"C.10", "Compute Matrix Coefficients", "~5 sec", false},
-    
-    // Final Steps
-    {"D.0", "Save Calibration to EEPROM", "~2 sec", false},
-    {"D.1", "Verify Calibration Data", "~2 sec", false},
-    {"D.2", "Calibration Complete", "", true}
-};
-static const int cal_steps_count = sizeof(cal_steps) / sizeof(CalibrationStep);
+// Import calibration texts from header file (generated from calibration_texts.json)
 
 // Calibration session state
 static CalibrationTarget active_calibration = CAL_NONE;
@@ -251,14 +188,157 @@ static int current_sample_count = 0;
 // AUTOMATED CALIBRATION HELPER FUNCTIONS
 // ============================================================================
 
-void display_calibration_header() {
-    Serial.println("\n╔════════════════════════════════════════════════════════════════╗");
-    if (active_calibration == CAL_LOCAL) {
-        Serial.println("║   🟢 LOCAL TEENSY - AUTOMATED CALIBRATION SESSION             ║");
-    } else if (active_calibration == CAL_REMOTE) {
-        Serial.println("║   🔵 REMOTE TEENSY - AUTOMATED CALIBRATION SESSION            ║");
+// Find calibration message by ID (using imported calibration_texts.h)
+const CalibrationMessage* find_calibration_message(const String& id) {
+    for (int i = 0; i < CALIBRATION_MESSAGES_COUNT; i++) {
+        if (String(CALIBRATION_MESSAGES[i].id) == id) {
+            return &CALIBRATION_MESSAGES[i];
+        }
     }
-    Serial.println("╚════════════════════════════════════════════════════════════════╝\n");
+    return nullptr;
+}
+
+// Parse and display structured calibration ID message
+void handle_calibration_id(const String& full_message) {
+    // Parse message format: CAL_STEP_ID:AC.INTRO.HEADER or CAL_PROMPT_ID:AC.INTRO.READY
+    int colon_pos = full_message.indexOf(':');
+    if (colon_pos == -1) {
+        Serial.printf("⚠️  Invalid calibration message format: %s\n", full_message.c_str());
+        return;
+    }
+    
+    String message_type = full_message.substring(0, colon_pos);
+    String step_id = full_message.substring(colon_pos + 1);
+    
+    // Update current step tracking
+    current_step_id = step_id;
+    cal_last_message_time = millis();
+    cal_messages_received++;
+    
+    // Look up message from calibration_texts.json structure
+    const CalibrationMessage* cal_msg = find_calibration_message(step_id);
+    
+    if (cal_msg == nullptr) {
+        // Fallback for unknown messages
+        Serial.printf("\n⚠️  Unknown calibration step: %s\n\n", step_id.c_str());
+        return;
+    }
+    
+    // Determine display style based on message type
+    bool is_header = (String(cal_msg->type) == "header");
+    bool is_prompt = (message_type == "CAL_PROMPT_ID");
+    bool is_success = (message_type == "CAL_SUCCESS_ID");
+    bool is_error = (message_type == "CAL_ERROR_ID");
+    bool is_list = (String(cal_msg->type) == "list");
+    
+    if (is_prompt) {
+        cal_waiting_for_input = true;
+    }
+    
+    // Display message with appropriate formatting
+    if (is_header) {
+        // Header messages get special formatting
+        Serial.println("\n");
+        Serial.println("╔══════════════════════════════════════════════════════════════════════════════╗");
+        for (int i = 0; i < 15 && cal_msg->text_lines[i] != nullptr; i++) {
+            String line = String(cal_msg->text_lines[i]);
+            if (line.length() == 0) {
+                Serial.println("║                                                                              ║");
+            } else {
+                // Center the text for headers
+                int padding = (78 - line.length()) / 2;
+                if (padding < 0) padding = 0;
+                Serial.printf("║%*s%s%*s║\n", padding, "", line.c_str(), 78 - padding - line.length(), "");
+            }
+        }
+        Serial.println("╚══════════════════════════════════════════════════════════════════════════════╝");
+    } else {
+        // Regular messages - clean, end-user format
+        Serial.println();
+        
+        // Add appropriate icon based on message type
+        String icon = "";
+        if (is_prompt) icon = "❓ ";
+        else if (is_success) icon = "✅ ";
+        else if (is_error) icon = "❌ ";
+        else if (is_list) icon = "📝 ";
+        else if (String(cal_msg->type) == "warning") icon = "⚠️  ";
+        else icon = "📋 ";
+        
+        // Display each text line cleanly
+        bool first_line = true;
+        for (int i = 0; i < 15 && cal_msg->text_lines[i] != nullptr; i++) {
+            String line = String(cal_msg->text_lines[i]);
+            
+            if (line.length() == 0) {
+                Serial.println();
+            } else {
+                // Check if this message has placeholders
+                bool has_placeholders = (cal_msg->placeholders[0] != nullptr && line.indexOf('{') >= 0);
+                
+                if (has_placeholders) {
+                    // Show placeholder warning for now - in production you'd substitute real values
+                    if (first_line) {
+                        Serial.printf("%s%s [*needs data*]\n", icon.c_str(), line.c_str());
+                        first_line = false;
+                    } else {
+                        Serial.printf("   %s [*needs data*]\n", line.c_str());
+                    }
+                } else {
+                    // Clean display without technical formatting
+                    if (first_line) {
+                        Serial.printf("%s%s\n", icon.c_str(), line.c_str());
+                        first_line = false;
+                    } else {
+                        // Indent continuation lines for better readability
+                        if (line.startsWith("•") || line.startsWith("-") || line.startsWith("*")) {
+                            Serial.printf("   %s\n", line.c_str());
+                        } else {
+                            Serial.printf("   %s\n", line.c_str());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Show user input prompt if waiting
+    if (is_prompt || cal_waiting_for_input) {
+        Serial.println();
+        Serial.println("┌─ WAITING FOR YOUR RESPONSE ─────────────────────────────────────────────────┐");
+        Serial.println("│                                                                              │");
+        Serial.println("│  Please send one of these commands:                                          │");
+        Serial.println("│                                                                              │");
+        Serial.println("│  📤 CONTINUE  - Proceed to the next step                                    │");
+        Serial.println("│  ⏭️  SKIP      - Skip this step (if allowed)                                │");
+        Serial.println("│  🛑 ABORT     - Cancel the entire calibration                               │");
+        Serial.println("│  📊 CAL_STATUS - Check current progress                                      │");
+        Serial.println("│                                                                              │");
+        Serial.println("└──────────────────────────────────────────────────────────────────────────────┘");
+    }
+    
+    Serial.println();
+}
+
+void display_calibration_header() {
+    Serial.println("\n");
+    Serial.println("╔══════════════════════════════════════════════════════════════════════════════╗");
+    Serial.println("║                                                                              ║");
+    if (active_calibration == CAL_LOCAL) {
+        Serial.println("║                    🟢 LOCAL FORCE PLATE CALIBRATION                         ║");
+    } else if (active_calibration == CAL_REMOTE) {
+        Serial.println("║                   🔵 REMOTE FORCE PLATE CALIBRATION                         ║");
+    }
+    Serial.println("║                                                                              ║");
+    Serial.println("║  Welcome to the automated calibration system. This process will guide you   ║");
+    Serial.println("║  through calibrating your force plate step by step.                         ║");
+    Serial.println("║                                                                              ║");
+    Serial.println("║  📋 The system will show you exactly what to do at each step                ║");
+    Serial.println("║  ⏱️  Estimated time: 60-90 minutes                                          ║");
+    Serial.println("║  🎯 Follow the instructions and respond when prompted                        ║");
+    Serial.println("║                                                                              ║");
+    Serial.println("╚══════════════════════════════════════════════════════════════════════════════╝");
+    Serial.println();
 }
 
 void show_calibration_steps() {
@@ -268,48 +348,37 @@ void show_calibration_steps() {
     
     Serial.println("STEP A: ADC CALIBRATION");
     Serial.println("────────────────────────────────────────────────────────────────");
-    for (int i = 0; i < cal_steps_count; i++) {
-        if (String(cal_steps[i].id).startsWith("A.")) {
-            Serial.printf("  [%s] %s", cal_steps[i].id, cal_steps[i].description);
-            if (strlen(cal_steps[i].duration) > 0) {
-                Serial.printf(" (%s)", cal_steps[i].duration);
-            }
+    for (int i = 0; i < CALIBRATION_MESSAGES_COUNT; i++) {
+        if (String(CALIBRATION_MESSAGES[i].id).startsWith("AC.STEP_A")) {
+            Serial.printf("  [%s] %s", CALIBRATION_MESSAGES[i].id, CALIBRATION_MESSAGES[i].type);
             Serial.println();
         }
     }
     
     Serial.println("\nSTEP B: LOAD CELL CALIBRATION");
     Serial.println("────────────────────────────────────────────────────────────────");
-    for (int i = 0; i < cal_steps_count; i++) {
-        if (String(cal_steps[i].id).startsWith("B.")) {
-            Serial.printf("  [%s] %s", cal_steps[i].id, cal_steps[i].description);
-            if (strlen(cal_steps[i].duration) > 0) {
-                Serial.printf(" (%s)", cal_steps[i].duration);
-            }
+    for (int i = 0; i < CALIBRATION_MESSAGES_COUNT; i++) {
+        if (String(CALIBRATION_MESSAGES[i].id).startsWith("AC.STEP_B")) {
+            Serial.printf("  [%s] %s", CALIBRATION_MESSAGES[i].id, CALIBRATION_MESSAGES[i].type);
             Serial.println();
         }
     }
     
     Serial.println("\nSTEP C: MATRIX CALIBRATION (OPTIONAL)");
     Serial.println("────────────────────────────────────────────────────────────────");
-    for (int i = 0; i < cal_steps_count; i++) {
-        if (String(cal_steps[i].id).startsWith("C.")) {
-            Serial.printf("  [%s] %s", cal_steps[i].id, cal_steps[i].description);
-            if (strlen(cal_steps[i].duration) > 0) {
-                Serial.printf(" (%s)", cal_steps[i].duration);
-            }
+    for (int i = 0; i < CALIBRATION_MESSAGES_COUNT; i++) {
+        if (String(CALIBRATION_MESSAGES[i].id).startsWith("AC.STEP_C")) {
+            Serial.printf("  [%s] %s", CALIBRATION_MESSAGES[i].id, CALIBRATION_MESSAGES[i].type);
             Serial.println();
         }
     }
     
     Serial.println("\nSTEP D: SAVE & VERIFY");
     Serial.println("────────────────────────────────────────────────────────────────");
-    for (int i = 0; i < cal_steps_count; i++) {
-        if (String(cal_steps[i].id).startsWith("D.")) {
-            Serial.printf("  [%s] %s", cal_steps[i].id, cal_steps[i].description);
-            if (strlen(cal_steps[i].duration) > 0) {
-                Serial.printf(" (%s)", cal_steps[i].duration);
-            }
+    for (int i = 0; i < CALIBRATION_MESSAGES_COUNT; i++) {
+        if (String(CALIBRATION_MESSAGES[i].id).startsWith("AC.SAVE") || 
+            String(CALIBRATION_MESSAGES[i].id).startsWith("AC.COMPLETE")) {
+            Serial.printf("  [%s] %s", CALIBRATION_MESSAGES[i].id, CALIBRATION_MESSAGES[i].type);
             Serial.println();
         }
     }
@@ -363,27 +432,61 @@ void handle_calibration_message(const String& message) {
 }
 
 void show_calibration_status() {
-    Serial.println("\n╔════════════════════════════════════════════════════════════════╗");
-    Serial.println("║         AUTOMATED CALIBRATION - STATUS                         ║");
-    Serial.println("╚════════════════════════════════════════════════════════════════╝");
+    Serial.println("\n");
+    Serial.println("╔══════════════════════════════════════════════════════════════════════════════╗");
+    Serial.println("║                            📊 CALIBRATION STATUS                            ║");
+    Serial.println("╠══════════════════════════════════════════════════════════════════════════════╣");
     
     if (active_calibration == CAL_NONE) {
-        Serial.println("  Status: No active calibration");
+        Serial.println("║                                                                              ║");
+        Serial.println("║  🔴 No calibration session is currently active                              ║");
+        Serial.println("║                                                                              ║");
+        Serial.println("║  To start calibration, send:                                                 ║");
+        Serial.println("║  • LOCAL_AUTO_CAL  - for local force plate                                  ║");
+        Serial.println("║  • REMOTE_AUTO_CAL - for remote force plate                                 ║");
+        Serial.println("║                                                                              ║");
     } else {
-        Serial.printf("  Target: %s Teensy\n", 
-                      (active_calibration == CAL_LOCAL) ? "🟢 LOCAL" : "🔵 REMOTE");
-        Serial.printf("  Current Step: %s\n", 
-                      current_step_id.length() > 0 ? current_step_id.c_str() : "Unknown");
-        Serial.printf("  Waiting for Input: %s\n", cal_waiting_for_input ? "YES" : "NO");
+        Serial.println("║                                                                              ║");
+        Serial.printf("║  🎯 Target: %s Force Plate%*s║\n", 
+                      (active_calibration == CAL_LOCAL) ? "🟢 LOCAL" : "🔵 REMOTE",
+                      (active_calibration == CAL_LOCAL) ? 54 : 53, "");
+        
+        if (current_step_id.length() > 0) {
+            // Try to get human-readable step name
+            const CalibrationMessage* cal_msg = find_calibration_message(current_step_id);
+            if (cal_msg != nullptr && cal_msg->text_lines[0] != nullptr) {
+                String step_name = String(cal_msg->text_lines[0]);
+                if (step_name.length() > 50) {
+                    step_name = step_name.substring(0, 47) + "...";
+                }
+                Serial.printf("║  📋 Current: %s%*s║\n", step_name.c_str(), 62 - step_name.length(), "");
+            } else {
+                Serial.printf("║  📋 Current: %s%*s║\n", current_step_id.c_str(), 62 - current_step_id.length(), "");
+            }
+        } else {
+            Serial.println("║  📋 Current: Starting up...                                                  ║");
+        }
         
         unsigned long elapsed = (millis() - cal_step_start_time) / 1000;
-        Serial.printf("  Time Elapsed: %lu seconds\n", elapsed);
+        unsigned long minutes = elapsed / 60;
+        unsigned long seconds = elapsed % 60;
+        Serial.printf("║  ⏱️  Time: %02lu:%02lu elapsed%*s║\n", minutes, seconds, 50, "");
+        
+        if (cal_waiting_for_input) {
+            Serial.println("║  ❓ Status: WAITING FOR YOUR RESPONSE                                        ║");
+        } else {
+            Serial.println("║  🔄 Status: Processing...                                                    ║");
+        }
+        
+        Serial.println("║                                                                              ║");
+        Serial.printf("║  📤 Commands sent: %lu%*s║\n", cal_commands_sent, 60 - String(cal_commands_sent).length(), "");
+        Serial.printf("║  📥 Messages received: %lu%*s║\n", cal_messages_received, 56 - String(cal_messages_received).length(), "");
+        Serial.printf("║  ✅ Sessions completed: %lu%*s║\n", cal_sessions_completed, 55 - String(cal_sessions_completed).length(), "");
+        Serial.println("║                                                                              ║");
     }
     
-    Serial.printf("  Commands Sent: %lu\n", cal_commands_sent);
-    Serial.printf("  Messages Received: %lu\n", cal_messages_received);
-    Serial.printf("  Sessions Completed: %lu\n", cal_sessions_completed);
-    Serial.println("╚════════════════════════════════════════════════════════════════╝\n");
+    Serial.println("╚══════════════════════════════════════════════════════════════════════════════╝");
+    Serial.println();
 }
 
 void calibration_keepalive() {
@@ -837,15 +940,50 @@ static void uart_rx_task(void* param) {
                 
                 // If it's a printable ASCII character (likely text response), read as string
                 if (byte >= 32 && byte < 127 && byte != 0xAA) {
-                    String text_response = Serial2.readStringUntil('\n');
-                    if (text_response.length() > 0) {
-                        // Check if this is a calibration message
-                        if (text_response.startsWith("[AUTO-CAL]") || 
-                            text_response.startsWith("LOCAL:[AUTO-CAL]") ||
-                            text_response.startsWith("REMOTE:[AUTO-CAL]")) {
-                            
-                            // Handle calibration message
-                            handle_calibration_message(text_response);
+                     String text_response = Serial2.readStringUntil('\n');
+                     if (text_response.length() > 0) {
+                         // Check if this is a structured calibration ID
+                         if (text_response.startsWith("LOCAL:CAL_") || text_response.startsWith("REMOTE:CAL_")) {
+                             // Parse prefix and ID
+                             String prefix = "";
+                             String cal_id = "";
+                             
+                             if (text_response.startsWith("LOCAL:")) {
+                                 prefix = "LOCAL";
+                                 cal_id = text_response.substring(6); // Remove "LOCAL:" prefix
+                                 if (active_calibration == CAL_NONE) {
+                                     active_calibration = CAL_LOCAL; // Auto-detect calibration start
+                                 }
+                             } else if (text_response.startsWith("REMOTE:")) {
+                                 prefix = "REMOTE";
+                                 cal_id = text_response.substring(7); // Remove "REMOTE:" prefix
+                                 if (active_calibration == CAL_NONE) {
+                                     active_calibration = CAL_REMOTE; // Auto-detect calibration start
+                                 }
+                             }
+                             
+                             Serial.printf("[BLE_SLAVE] Structured calibration ID from %s: %s\n", prefix.c_str(), cal_id.c_str());
+                             
+                             // Handle structured calibration ID
+                             handle_calibration_id(cal_id);
+                             
+                             // Also capture for command handler if in calibration mode
+                             if (active_calibration != CAL_NONE && 
+                                 command_response_mutex != NULL && 
+                                 xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                                 command_response_data = text_response;
+                                 command_response_ready = true;
+                                 xSemaphoreGive(command_response_mutex);
+                             }
+                         }
+                         // Check if this is a legacy calibration message
+                         else if (text_response.startsWith("[AUTO-CAL]") || 
+                             text_response.startsWith("LOCAL:[AUTO-CAL]") ||
+                             text_response.startsWith("REMOTE:[AUTO-CAL]")) {
+                             
+                             // Handle legacy calibration message (for fallback)
+                             Serial.printf("[BLE_SLAVE] Legacy calibration message: %s\n", text_response.c_str());
+                             handle_calibration_message(text_response);
                             
                             // Also capture for command handler if in calibration mode
                             if (active_calibration != CAL_NONE && 
@@ -1162,29 +1300,33 @@ static void handle_serial_commands() {
         }
         // Calibration Commands
         else if (command == "LOCAL_AUTO_CAL") {
-            Serial.println("[BLE_SLAVE] Starting LOCAL Teensy automated calibration...");
+            Serial.println("\n🚀 STARTING LOCAL FORCE PLATE CALIBRATION...");
             active_calibration = CAL_LOCAL;
             cal_waiting_for_input = false;
-            cal_step_start_time = millis();
-            cal_last_keepalive = millis();
-            current_step_id = "A.0";
-            
-            display_calibration_header();
-            
-            Serial2.println("AUTO_CAL_START");
+             cal_step_start_time = millis();
+             cal_last_keepalive = millis();
+             current_step_id = "";
+             
+             display_calibration_header();
+             Serial.println("🔄 Initializing calibration system...");
+             Serial.println("📡 Connecting to local force plate...");
+             
+             Serial2.println("AUTO_CAL_START");
             Serial2.flush();
             commands_forwarded++;
         } else if (command == "REMOTE_AUTO_CAL") {
-            Serial.println("[BLE_SLAVE] Starting REMOTE Teensy automated calibration...");
+            Serial.println("\n🚀 STARTING REMOTE FORCE PLATE CALIBRATION...");
             active_calibration = CAL_REMOTE;
             cal_waiting_for_input = false;
-            cal_step_start_time = millis();
-            cal_last_keepalive = millis();
-            current_step_id = "A.0";
-            
-            display_calibration_header();
-            
-            Serial2.println("REMOTE_AUTO_CAL");
+             cal_step_start_time = millis();
+             cal_last_keepalive = millis();
+             current_step_id = "";
+             
+             display_calibration_header();
+             Serial.println("🔄 Initializing calibration system...");
+             Serial.println("📡 Connecting to remote force plate...");
+             
+             Serial2.println("REMOTE_AUTO_CAL");
             Serial2.flush();
             commands_forwarded++;
         } else if (command == "CAL_SHOW_STEPS") {
@@ -1192,65 +1334,64 @@ static void handle_serial_commands() {
         } else if (command == "CAL_STATUS") {
             show_calibration_status();
         } else if (command == "CONTINUE" || command == "SKIP" || command == "ABORT") {
-            Serial.printf("[BLE_SLAVE] DEBUG: Processing %s command\n", command.c_str());
-            Serial.printf("[BLE_SLAVE] DEBUG: active_calibration = %d\n", active_calibration);
-            
             if (active_calibration != CAL_NONE) {
-                Serial.printf("[BLE_SLAVE] DEBUG: Processing %s command for %s Teensy\n", 
-                              command.c_str(), 
-                              (active_calibration == CAL_LOCAL) ? "LOCAL" : "REMOTE");
-                Serial.printf("[BLE_SLAVE] DEBUG: cal_waiting_for_input = %s\n", 
-                              cal_waiting_for_input ? "TRUE" : "FALSE");
+                if (command == "CONTINUE") {
+                    Serial.println("📤 Sending CONTINUE command...");
+                    cal_waiting_for_input = false;
+                } else if (command == "SKIP") {
+                    Serial.println("⏭️ Sending SKIP command...");
+                } else if (command == "ABORT") {
+                    Serial.println("🛑 ABORTING CALIBRATION...");
+                    Serial.printf("   Calibration session for %s force plate has been cancelled.\n",
+                                  (active_calibration == CAL_LOCAL) ? "LOCAL" : "REMOTE");
+                }
                 
                 route_calibration_command(command);
                 
-                // Reset waiting flag after sending CONTINUE
-                if (command == "CONTINUE") {
-                    cal_waiting_for_input = false;
-                    Serial.printf("[BLE_SLAVE] DEBUG: Reset cal_waiting_for_input to FALSE\n");
-                }
-                
                 // End calibration session on ABORT
                 if (command == "ABORT") {
-                    Serial.printf("[BLE_SLAVE] Calibration session aborted for %s Teensy\n",
-                                  (active_calibration == CAL_LOCAL) ? "LOCAL" : "REMOTE");
                     active_calibration = CAL_NONE;
                     current_step_id = "";
+                    Serial.println("   You can start a new calibration anytime with LOCAL_AUTO_CAL or REMOTE_AUTO_CAL");
                 }
             } else {
-                Serial.println("[BLE_SLAVE] ⚠ No active calibration session");
-                Serial.println("[BLE_SLAVE] Start with LOCAL_AUTO_CAL or REMOTE_AUTO_CAL");
+                Serial.println("\n⚠️  No calibration session is currently active");
+                Serial.println("   To start calibration, send LOCAL_AUTO_CAL or REMOTE_AUTO_CAL\n");
             }
         } else if (command == "HELP") {
-            Serial.println("[BLE_SLAVE] === AVAILABLE COMMANDS ===");
-            Serial.println("  Teensy Control (forwarded to RX Radio):");
-            Serial.println("    START, STOP, RESTART, RESET, ZERO, ZERO_STATUS, ZERO_RESET");
-            Serial.println("    REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET, REMOTE_ZERO, REMOTE_ZERO_STATUS, REMOTE_ZERO_RESET");
-            Serial.println("    ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET, ALL_ZERO, ALL_ZERO_STATUS, ALL_ZERO_RESET");
-            Serial.println("  ESP32 Control (forwarded to RX Radio):");
-            Serial.println("    LOCAL_ON/OFF, REMOTE_ON/OFF");
-            Serial.println("    RX_STATUS    - Get ESP32 RX Radio status");
-            Serial.println("  Test Commands:");
-            Serial.println("    LOCAL_PING   - Ping local Teensy (via RX Radio -> Local Teensy)");
-            Serial.println("    REMOTE_PING  - Ping remote Teensy (via RX Radio -> SPI Slave -> Remote Teensy)");
-            Serial.println("  Automated Calibration:");
-            Serial.println("    LOCAL_AUTO_CAL  - Start local Teensy calibration (60-90 min)");
-            Serial.println("    REMOTE_AUTO_CAL - Start remote Teensy calibration (60-90 min)");
-            Serial.println("    CAL_SHOW_STEPS  - Display all calibration steps");
-            Serial.println("    CAL_STATUS      - Show current calibration status");
-            Serial.println("    CONTINUE        - Continue to next calibration step (auto-routed)");
-            Serial.println("    SKIP            - Skip current calibration step (auto-routed)");
-            Serial.println("    ABORT           - Abort calibration session (auto-routed)");
-            Serial.println("  BLE Slave Commands:");
-            Serial.println("    STATS        - Show BLE slave statistics");
-            Serial.println("    RESET_STATS  - Reset all statistics");
-            Serial.println("    BLE_RESTART  - Restart BLE advertising");
-            Serial.println("    UART_STATUS  - Show UART status");
-            Serial.println("    BATCH_STATUS - Show BLE batch status");
-            Serial.println("    REDIS_STATUS - Show Redis store status");
-            Serial.println("    DEBUG_QUEUE  - Show queue contents");
-            Serial.println("    HELP         - Show this help");
-            Serial.println("=========================================");
+            Serial.println("\n");
+            Serial.println("╔══════════════════════════════════════════════════════════════════════════════╗");
+            Serial.println("║                              📖 HELP - AVAILABLE COMMANDS                   ║");
+            Serial.println("╠══════════════════════════════════════════════════════════════════════════════╣");
+            Serial.println("║                                                                              ║");
+            Serial.println("║  🎯 CALIBRATION COMMANDS (Main Functions)                                   ║");
+            Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
+            Serial.println("║  • LOCAL_AUTO_CAL   - Start local force plate calibration (60-90 min)      ║");
+            Serial.println("║  • REMOTE_AUTO_CAL  - Start remote force plate calibration (60-90 min)     ║");
+            Serial.println("║  • CAL_STATUS       - Check current calibration progress                    ║");
+            Serial.println("║  • CAL_SHOW_STEPS   - Display detailed calibration steps                    ║");
+            Serial.println("║                                                                              ║");
+            Serial.println("║  🎮 CALIBRATION CONTROL (During Active Session)                             ║");
+            Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
+            Serial.println("║  • CONTINUE         - Proceed to the next calibration step                  ║");
+            Serial.println("║  • SKIP             - Skip current step (if allowed)                        ║");
+            Serial.println("║  • ABORT            - Cancel the entire calibration session                 ║");
+            Serial.println("║                                                                              ║");
+            Serial.println("║  🔧 SYSTEM CONTROL                                                          ║");
+            Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
+            Serial.println("║  • START/STOP       - Control force plate data collection                   ║");
+            Serial.println("║  • ZERO             - Zero/tare the force plate                             ║");
+            Serial.println("║  • RESET            - Reset the force plate system                          ║");
+            Serial.println("║  • STATS            - Show system statistics                                ║");
+            Serial.println("║                                                                              ║");
+            Serial.println("║  🔍 TESTING & DIAGNOSTICS                                                   ║");
+            Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
+            Serial.println("║  • LOCAL_PING       - Test connection to local force plate                  ║");
+            Serial.println("║  • REMOTE_PING      - Test connection to remote force plate                 ║");
+            Serial.println("║  • RX_STATUS        - Check ESP32 radio status                              ║");
+            Serial.println("║                                                                              ║");
+            Serial.println("╚══════════════════════════════════════════════════════════════════════════════╝");
+            Serial.println();
         } else if (command == "DEBUG_QUEUE") {
             Serial.printf("Debug Queue Contents:\n");
             if (redis_store.local_count > 0) {

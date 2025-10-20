@@ -482,11 +482,10 @@ void dual_printf(const char* format, ...) {
   Serial3.print(buffer);
 }
 
-// Auto calibration specific dual output (with AUTO-CAL prefix for ESP32 parsing)
+// Auto calibration output: print locally only; do NOT send raw text to ESP32.
+// ESP32 should receive only CAL_*_ID messages from the automated calibration flow.
 void auto_cal_println(const String& message) {
   Serial.println(message);
-  Serial3.println(message);
-  Serial3.flush(); // Ensure immediate transmission to ESP32
 }
 
 void auto_cal_printf(const char* format, ...) {
@@ -497,8 +496,6 @@ void auto_cal_printf(const char* format, ...) {
   va_end(args);
   
   Serial.print(buffer);
-  Serial3.print(buffer);
-  Serial3.flush(); // Ensure immediate transmission to ESP32
 }
 
 void send_state_update() {
@@ -771,6 +768,7 @@ void handle_esp32_commands() {
     else if (command == "AUTO_CAL_START" || command == "AUTOMATED_CALIBRATION") {
       start_automated_calibration();
       send_status_response("AUTO_CAL_START", "OK");
+      // Note: Step IDs are now sent directly from automated_calibration.ino
     }
     else if (command == "CONTINUE" || command == "SKIP" || command == "ABORT") {
       if (is_auto_calibration_active()) {

@@ -27,6 +27,21 @@ enum AutoCalState {
   AUTO_CAL_ERROR = 14
 };
 
+// ============================================================================
+// CALIBRATION STEP ID SYSTEM
+// ============================================================================
+
+// Forward declarations for step ID functions
+String get_current_step_id();
+void send_step_id_to_esp32(const String& step_id, const String& message_type = "STEP");
+void send_calibration_step_id(const String& step_id);
+void send_calibration_status_id(const String& step_id);
+void send_calibration_error_id(const String& step_id);
+void send_calibration_success_id(const String& step_id);
+void send_calibration_prompt_id(const String& step_id);
+void send_state_change_id();
+void send_contextual_step_id(const String& step_id, const String& context = "");
+
 static AutoCalState auto_cal_state = AUTO_CAL_IDLE;
 static uint32_t auto_cal_timer = 0;
 static uint8_t auto_cal_current_cell = 0;
@@ -75,6 +90,118 @@ static const CalPosition matrix_positions[] = {
   {-150.0, -150.0, "Back-Left Corner"}
 };
 static const uint8_t num_matrix_positions = 9;
+
+// ============================================================================
+// CALIBRATION STEP ID SYSTEM IMPLEMENTATIONS
+// ============================================================================
+
+// Function to get current step ID based on state and context
+String get_current_step_id() {
+  switch (auto_cal_state) {
+    case AUTO_CAL_IDLE:
+      return "AC.IDLE";
+      
+    case AUTO_CAL_INTRO:
+      return "AC.INTRO.HEADER";
+      
+    case AUTO_CAL_STEP_A_INTRO:
+      return "AC.STEP_A.HEADER";
+      
+    case AUTO_CAL_STEP_A_RUNNING:
+      return "AC.STEP_A.RUNNING";
+      
+    case AUTO_CAL_STEP_B_INTRO:
+      return "AC.STEP_B.HEADER";
+      
+    case AUTO_CAL_STEP_B_TARE:
+      return "AC.STEP_B.TARE_HEADER";
+      
+    case AUTO_CAL_STEP_B_SPAN_SETUP:
+      return "AC.STEP_B.SPAN_SETUP_HEADER";
+      
+    case AUTO_CAL_STEP_B_SPAN_COLLECT:
+      if (cal_config.center_placement) {
+        return "AC.STEP_B.SPAN_COLLECT_CENTER_HEADER";
+      } else {
+        return "AC.STEP_B.SPAN_COLLECT_CORNER_HEADER";
+      }
+      
+    case AUTO_CAL_STEP_B_SPAN_COMPUTE:
+      return "AC.STEP_B.SPAN_COMPUTE_HEADER";
+      
+    case AUTO_CAL_STEP_C_INTRO:
+      if (cal_config.step_c_enabled) {
+        return "AC.STEP_C.HEADER_ENABLED";
+      } else {
+        return "AC.STEP_C.HEADER_DISABLED";
+      }
+      
+    case AUTO_CAL_STEP_C_COLLECT:
+      return "AC.STEP_C.COLLECT_HEADER";
+      
+    case AUTO_CAL_STEP_C_COMPUTE:
+      return "AC.STEP_C.COMPUTE_HEADER";
+      
+    case AUTO_CAL_SAVE_VERIFY:
+      return "AC.SAVE.HEADER";
+      
+    case AUTO_CAL_COMPLETE:
+      return "AC.COMPLETE.HEADER";
+      
+    case AUTO_CAL_ERROR:
+      return "AC.ERROR.INVALID_STATE";
+      
+    default:
+      return "AC.ERROR.INVALID_STATE";
+  }
+}
+
+// Function to send step ID to ESP32
+void send_step_id_to_esp32(const String& step_id, const String& message_type = "STEP") {
+  Serial3.printf("CAL_%s_ID:%s\n", message_type.c_str(), step_id.c_str());
+  Serial3.flush();
+}
+
+// Function to send specific step IDs for different calibration phases
+void send_calibration_step_id(const String& step_id) {
+  send_step_id_to_esp32(step_id, "STEP");
+}
+
+// Function to send status updates with step IDs
+void send_calibration_status_id(const String& step_id) {
+  send_step_id_to_esp32(step_id, "STATUS");
+}
+
+// Function to send error IDs
+void send_calibration_error_id(const String& step_id) {
+  send_step_id_to_esp32(step_id, "ERROR");
+}
+
+// Function to send success IDs
+void send_calibration_success_id(const String& step_id) {
+  send_step_id_to_esp32(step_id, "SUCCESS");
+}
+
+// Function to send prompt IDs (when waiting for user input)
+void send_calibration_prompt_id(const String& step_id) {
+  send_step_id_to_esp32(step_id, "PROMPT");
+}
+
+// Function to send step ID when state changes
+void send_state_change_id() {
+  String current_id = get_current_step_id();
+  send_calibration_step_id(current_id);
+}
+
+// Function to send step ID with additional context
+void send_contextual_step_id(const String& step_id, const String& context = "") {
+  if (context.length() > 0) {
+    Serial3.printf("CAL_STEP_ID:%s:%s\n", step_id.c_str(), context.c_str());
+  } else {
+    Serial3.printf("CAL_STEP_ID:%s\n", step_id.c_str());
+  }
+  Serial3.flush();
+}
 
 // ============================================================================
 // CALIBRATION CONFIGURATION FUNCTIONS
@@ -221,28 +348,53 @@ void handle_cal_config_command(String command) {
 // ============================================================================
 
 void start_automated_calibration() {
+  // Send header ID
+  send_calibration_step_id("AC.INTRO.HEADER");
+  delay(50); // Small delay to prevent UART buffer overflow
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] 🚀 AUTOMATED FORCE PLATE CALIBRATION");
   auto_cal_println("[AUTO-CAL] ==========================================");
+  
+  // Send overview ID
+  send_calibration_step_id("AC.INTRO.OVERVIEW");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ");
   auto_cal_println("[AUTO-CAL] This automated system will guide you through");
   auto_cal_println("[AUTO-CAL] the flexible calibration process:");
   auto_cal_println("[AUTO-CAL] ");
   auto_cal_println("[AUTO-CAL] 📋 STEP A: ADC (ADS1256) Calibration");
   auto_cal_println("[AUTO-CAL] 📋 STEP B: Load Cell Calibration (CENTER placement)");
+  
+  // Send Step C status ID
   if (cal_config.step_c_enabled) {
+    send_calibration_step_id("AC.INTRO.STEP_C_ENABLED");
+    delay(50);
     auto_cal_println("[AUTO-CAL] 📋 STEP C: Matrix Calibration (OPTIONAL)");
   } else {
+    send_calibration_step_id("AC.INTRO.STEP_C_DISABLED");
+    delay(50);
     auto_cal_println("[AUTO-CAL] 📋 STEP C: Matrix Calibration (DISABLED)");
   }
   auto_cal_println("[AUTO-CAL] ");
   
-  // Show current configuration
+  // Send configuration header ID
+  send_calibration_step_id("AC.INTRO.CONFIG_HEADER");
+  delay(50);
   auto_cal_println("[AUTO-CAL] 📋 CURRENT CONFIGURATION:");
+  
+  // Send configuration details IDs
+  send_calibration_step_id("AC.INTRO.CONFIG_MASS_PLACEMENT");
+  delay(50);
   auto_cal_printf("[AUTO-CAL]   Mass Placement: %s\n", 
                   cal_config.center_placement ? "CENTER of plate" : "Individual corners");
+  
+  send_calibration_step_id("AC.INTRO.CONFIG_STEP_C");
+  delay(50);
   auto_cal_printf("[AUTO-CAL]   Step C (Matrix): %s\n", 
                   cal_config.step_c_enabled ? "ENABLED" : "DISABLED");
+  
+  send_calibration_step_id("AC.INTRO.CONFIG_MASSES");
+  delay(50);
   auto_cal_printf("[AUTO-CAL]   Calibration Masses (%d): ", cal_config.num_masses);
   for (int i = 0; i < cal_config.num_masses; i++) {
     if (i > 0) auto_cal_printf(", ");
@@ -262,32 +414,63 @@ void start_automated_calibration() {
     estimated_time += 25; // Step C: 25 minutes
   }
   
+  // Send estimated time ID
+  send_calibration_step_id("AC.INTRO.ESTIMATED_TIME");
+  delay(50);
   auto_cal_printf("[AUTO-CAL] ⏱️  ESTIMATED TIME: %d-%d minutes\n", estimated_time, estimated_time + 15);
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send equipment header ID
+  send_calibration_step_id("AC.INTRO.EQUIPMENT_HEADER");
+  delay(50);
   auto_cal_println("[AUTO-CAL] 📦 EQUIPMENT NEEDED:");
+  
+  // Send equipment masses ID
+  send_calibration_step_id("AC.INTRO.EQUIPMENT_MASSES");
+  delay(50);
   auto_cal_printf("[AUTO-CAL]   • Calibrated masses: ");
   for (int i = 1; i < cal_config.num_masses; i++) { // Skip 0kg
     if (i > 1) auto_cal_printf(", ");
     auto_cal_printf("%.1fkg", cal_config.custom_masses[i]);
   }
   auto_cal_println("");
+  
+  // Send measuring tape ID if Step C enabled
   if (cal_config.step_c_enabled) {
+    send_calibration_step_id("AC.INTRO.EQUIPMENT_MEASURING_TAPE");
+    delay(50);
     auto_cal_println("[AUTO-CAL]   • Measuring tape/ruler (for Step C)");
   }
+  
+  // Send general equipment ID
+  send_calibration_step_id("AC.INTRO.EQUIPMENT_GENERAL");
+  delay(50);
   auto_cal_println("[AUTO-CAL]   • Level, stable surface");
   auto_cal_println("[AUTO-CAL]   • Patience and attention to detail");
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send actions ID
+  send_calibration_step_id("AC.INTRO.ACTIONS");
+  delay(50);
   auto_cal_println("[AUTO-CAL] 🎯 At each step, you can:");
   auto_cal_println("[AUTO-CAL]   • Type 'CONTINUE' to proceed");
   auto_cal_println("[AUTO-CAL]   • Type 'SKIP' to skip current step");
   auto_cal_println("[AUTO-CAL]   • Type 'ABORT' to cancel calibration");
   auto_cal_println("[AUTO-CAL]   • Type 'STATUS' to see current progress");
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send config commands ID
+  send_calibration_step_id("AC.INTRO.CONFIG_COMMANDS");
+  delay(50);
   auto_cal_println("[AUTO-CAL] 💡 To change configuration, use:");
   auto_cal_println("[AUTO-CAL]   • 'CAL_CONFIG_SHOW' - Show current settings");
   auto_cal_println("[AUTO-CAL]   • 'CAL_CONFIG_MASSES 5,10,15' - Set custom masses");
   auto_cal_println("[AUTO-CAL]   • 'CAL_CONFIG_DISABLE_STEP_C' - Skip matrix calibration");
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send ready prompt ID
+  send_calibration_prompt_id("AC.INTRO.READY");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] Ready to begin? Type 'CONTINUE' to start...");
   
@@ -313,6 +496,8 @@ void handle_auto_cal_input(String command) {
   }
   
   if (command == "ABORT") {
+    // Send abort ID
+    send_calibration_error_id("AC.ERROR.ABORT");
     auto_cal_println("[AUTO-CAL] ❌ Calibration aborted by user");
     auto_cal_state = AUTO_CAL_IDLE;
     auto_cal_active = false;
@@ -351,6 +536,9 @@ void handle_auto_cal_input(String command) {
 }
 
 void show_auto_cal_status() {
+  // Send status ID
+  send_calibration_status_id("AC.STATUS.HEADER");
+  
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] 📊 CALIBRATION PROGRESS STATUS");
   auto_cal_println("[AUTO-CAL] ==========================================");
@@ -471,20 +659,39 @@ void skip_current_step() {
 // ============================================================================
 
 void start_step_a_intro() {
+  // Send Step A header ID
+  send_calibration_step_id("AC.STEP_A.HEADER");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] 📋 STEP A: ADC (ADS1256) CALIBRATION");
   auto_cal_println("[AUTO-CAL] ==========================================");
+  
+  // Send purpose ID
+  send_calibration_step_id("AC.STEP_A.PURPOSE");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ");
   auto_cal_println("[AUTO-CAL] 🎯 PURPOSE:");
   auto_cal_println("[AUTO-CAL]   Calibrate the ADS1256 ADC for accurate voltage");
   auto_cal_println("[AUTO-CAL]   measurements at your current PGA and data rate");
+  
+  // Send duration ID
+  send_calibration_step_id("AC.STEP_A.DURATION");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ");
   auto_cal_println("[AUTO-CAL] ⏱️  DURATION: ~30 seconds");
+  
+  // Send what happens ID
+  send_calibration_step_id("AC.STEP_A.WHAT_HAPPENS");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ");
   auto_cal_println("[AUTO-CAL] 📋 WHAT WILL HAPPEN:");
   auto_cal_println("[AUTO-CAL]   • SELFOCAL: Offset calibration");
   auto_cal_println("[AUTO-CAL]   • SELFGCAL: Gain calibration");
   auto_cal_println("[AUTO-CAL]   • Store OFC and FSC register values");
+  
+  // Send preparation ID
+  send_calibration_step_id("AC.STEP_A.PREPARATION");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ");
   auto_cal_println("[AUTO-CAL] ✅ PREPARATION:");
   auto_cal_println("[AUTO-CAL]   • Ensure stable power supply");
@@ -494,11 +701,18 @@ void start_step_a_intro() {
   auto_cal_println("[AUTO-CAL] Ready to start ADC calibration?");
   auto_cal_println("[AUTO-CAL] Type 'CONTINUE' to proceed...");
   
+  // Send ready prompt ID
+  send_calibration_prompt_id("AC.STEP_A.READY");
+  delay(50);
+  
   auto_cal_state = AUTO_CAL_STEP_A_INTRO;
   auto_cal_waiting_for_input = true;
 }
 
 void start_step_a_execution() {
+  // Send Step A running ID
+  send_calibration_step_id("AC.STEP_A.RUNNING");
+  
   auto_cal_println("[AUTO-CAL] 🔄 Starting ADC self-calibration...");
   auto_cal_println("[AUTO-CAL] Please wait - this may take up to 30 seconds...");
   
@@ -508,11 +722,15 @@ void start_step_a_execution() {
   
   // Perform ADC calibration
   if (perform_adc_self_calibration(PGA_64, DR_30000)) {
+    // Send success ID
+    send_calibration_success_id("AC.STEP_A.SUCCESS");
     auto_cal_println("[AUTO-CAL] ✅ ADC calibration completed successfully!");
     auto_cal_println("[AUTO-CAL] ");
     delay(2000); // Give user time to read
     start_step_b_intro();
   } else {
+    // Send error ID
+    send_calibration_error_id("AC.STEP_A.FAILURE");
     auto_cal_println("[AUTO-CAL] ❌ ADC calibration failed!");
     auto_cal_println("[AUTO-CAL] Check connections and power supply");
     auto_cal_println("[AUTO-CAL] Type 'CONTINUE' to retry or 'SKIP' to continue anyway...");
@@ -525,10 +743,17 @@ void start_step_a_execution() {
 // ============================================================================
 
 void start_step_b_intro() {
+  // Send Step B header ID
+  send_calibration_step_id("AC.STEP_B.HEADER");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] 📋 STEP B: LOAD CELL CALIBRATION");
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send purpose ID
+  send_calibration_step_id("AC.STEP_B.PURPOSE");
+  delay(50);
   auto_cal_println("[AUTO-CAL] 🎯 PURPOSE:");
   if (cal_config.center_placement) {
     auto_cal_println("[AUTO-CAL]   Calibrate all 4 load cells simultaneously");
@@ -539,13 +764,19 @@ void start_step_b_intro() {
   }
   auto_cal_println("[AUTO-CAL] ");
   
-  // Estimate duration based on placement method
+  // Send duration ID
+  send_calibration_step_id("AC.STEP_B.DURATION");
+  delay(50);
   if (cal_config.center_placement) {
     auto_cal_println("[AUTO-CAL] ⏱️  DURATION: ~15-20 minutes");
   } else {
     auto_cal_println("[AUTO-CAL] ⏱️  DURATION: ~30-40 minutes");
   }
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send what happens ID
+  send_calibration_step_id("AC.STEP_B.WHAT_HAPPENS");
+  delay(50);
   auto_cal_println("[AUTO-CAL] 📋 WHAT WILL HAPPEN:");
   auto_cal_println("[AUTO-CAL]   1. Tare (zero) all 4 load cells");
   
@@ -558,6 +789,10 @@ void start_step_b_intro() {
     auto_cal_println("[AUTO-CAL]   3. Linearity analysis and coefficient calculation");
   }
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send masses needed ID
+  send_calibration_step_id("AC.STEP_B.MASSES_NEEDED");
+  delay(50);
   auto_cal_println("[AUTO-CAL] 📦 MASSES NEEDED:");
   auto_cal_printf("[AUTO-CAL]   • ");
   for (int i = 1; i < cal_config.num_masses; i++) { // Skip 0kg
@@ -572,6 +807,10 @@ void start_step_b_intro() {
     auto_cal_println("[AUTO-CAL]   • Ability to place masses directly above each corner");
   }
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send important ID
+  send_calibration_step_id("AC.STEP_B.IMPORTANT");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ⚠️  IMPORTANT:");
   auto_cal_println("[AUTO-CAL]   • Remove ALL loads from the plate before starting");
   
@@ -588,20 +827,35 @@ void start_step_b_intro() {
   auto_cal_println("[AUTO-CAL] Ready to start load cell calibration?");
   auto_cal_println("[AUTO-CAL] Type 'CONTINUE' to proceed...");
   
+  // Send ready prompt ID
+  send_calibration_prompt_id("AC.STEP_B.READY");
+  delay(50);
+  
   auto_cal_state = AUTO_CAL_STEP_B_INTRO;
   auto_cal_waiting_for_input = true;
 }
 
 void start_step_b_tare() {
+  // Send Step B tare header ID
+  send_calibration_step_id("AC.STEP_B.TARE_HEADER");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] 🔄 STEP B1: TARE (ZERO) ALL LOAD CELLS");
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send ensure ID
+  send_calibration_step_id("AC.STEP_B.TARE_ENSURE");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ✅ ENSURE:");
   auto_cal_println("[AUTO-CAL]   • NO masses or objects on the force plate");
   auto_cal_println("[AUTO-CAL]   • Plate is level and stable");
   auto_cal_println("[AUTO-CAL]   • No external forces applied");
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send taring process ID
+  send_calibration_step_id("AC.STEP_B.TARE_PROCESS");
+  delay(50);
   auto_cal_println("[AUTO-CAL] 🔄 Taring all 4 load cells...");
   
   auto_cal_state = AUTO_CAL_STEP_B_TARE;
@@ -619,11 +873,15 @@ void start_step_b_tare() {
   }
   
   if (all_tared) {
+    // Send success ID
+    send_calibration_success_id("AC.STEP_B.TARE_SUCCESS");
     auto_cal_println("[AUTO-CAL] ✅ All load cells tared successfully!");
     auto_cal_println("[AUTO-CAL] ");
     delay(2000);
     start_step_b_span_setup();
   } else {
+    // Send error ID
+    send_calibration_error_id("AC.STEP_B.TARE_FAILURE");
     auto_cal_println("[AUTO-CAL] ❌ Some load cells failed to tare");
     auto_cal_println("[AUTO-CAL] Type 'CONTINUE' to retry or 'SKIP' to continue anyway...");
     auto_cal_waiting_for_input = true;
@@ -631,10 +889,17 @@ void start_step_b_tare() {
 }
 
 void start_step_b_span_setup() {
+  // Send span setup header ID
+  send_calibration_step_id("AC.STEP_B.SPAN_HEADER");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] 🔄 STEP B2: SPAN CALIBRATION SETUP");
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send span process ID
+  send_calibration_step_id("AC.STEP_B.SPAN_PROCESS");
+  delay(50);
   auto_cal_println("[AUTO-CAL] 📋 SPAN CALIBRATION PROCESS:");
   
   if (cal_config.center_placement) {
@@ -741,6 +1006,9 @@ void handle_step_b_span_collect() {
     // Center placement logic
     if (auto_cal_current_mass_point >= num_cal_masses) {
       // All mass points done, compute coefficients for all cells
+      // Send computing ID
+      send_calibration_step_id("AC.STEP_B.SPAN_COMPUTING");
+      delay(50);
       auto_cal_println("[AUTO-CAL] 🔄 Computing span coefficients for all load cells...");
       
       bool all_computed = true;
@@ -772,6 +1040,11 @@ void handle_step_b_span_collect() {
     auto_cal_println("[AUTO-CAL] ");
     auto_cal_printf("[AUTO-CAL] 📦 MASS POINT %d/%d: %.1f kg\n", 
                   auto_cal_current_mass_point + 1, num_cal_masses, current_mass);
+    
+    // Send mass point ID with context
+    String mass_point_id = "AC.STEP_B.SPAN_COLLECT.MASS_POINT";
+    String context = String(auto_cal_current_mass_point + 1) + "/" + String(num_cal_masses) + ":" + String(current_mass, 1) + "kg";
+    send_contextual_step_id(mass_point_id, context);
     
     if (current_mass == 0.0) {
       auto_cal_println("[AUTO-CAL] 🔄 Remove all masses from the plate");
@@ -1030,10 +1303,17 @@ bool compute_center_calibration(uint8_t channel) {
 void start_step_c_intro() {
   // Check if Step C is enabled
   if (!cal_config.step_c_enabled) {
+    // Send Step C disabled ID
+    send_calibration_step_id("AC.STEP_C.DISABLED_HEADER");
+    delay(50);
     auto_cal_println("[AUTO-CAL] ==========================================");
     auto_cal_println("[AUTO-CAL] 📋 STEP C: MATRIX CALIBRATION (DISABLED)");
     auto_cal_println("[AUTO-CAL] ==========================================");
     auto_cal_println("[AUTO-CAL] ");
+    
+    // Send Step C disabled info ID
+    send_calibration_step_id("AC.STEP_C.DISABLED_INFO");
+    delay(50);
     auto_cal_println("[AUTO-CAL] ⏭️ Step C (Matrix Calibration) is DISABLED");
     auto_cal_println("[AUTO-CAL] Skipping to final save and verification...");
     auto_cal_println("[AUTO-CAL] ");
@@ -1048,23 +1328,42 @@ void start_step_c_intro() {
     return;
   }
   
+  // Send Step C header ID
+  send_calibration_step_id("AC.STEP_C.HEADER");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] 📋 STEP C: MATRIX CALIBRATION (OPTIONAL)");
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send Step C purpose ID
+  send_calibration_step_id("AC.STEP_C.PURPOSE");
+  delay(50);
   auto_cal_println("[AUTO-CAL] 🎯 PURPOSE:");
   auto_cal_println("[AUTO-CAL]   Create mapping from 4 load cell outputs to:");
   auto_cal_println("[AUTO-CAL]   • Total vertical force (Fz)");
   auto_cal_println("[AUTO-CAL]   • Moments about X and Y axes (Mx, My)");
   auto_cal_println("[AUTO-CAL]   • Center of pressure coordinates (COPx, COPy)");
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send Step C duration ID
+  send_calibration_step_id("AC.STEP_C.DURATION");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ⏱️  DURATION: ~20-30 minutes");
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send Step C what happens ID
+  send_calibration_step_id("AC.STEP_C.WHAT_HAPPENS");
+  delay(50);
   auto_cal_println("[AUTO-CAL] 📋 WHAT WILL HAPPEN:");
   auto_cal_println("[AUTO-CAL]   • Place 10kg mass at 9 different positions");
   auto_cal_println("[AUTO-CAL]   • Record load cell responses at each position");
   auto_cal_println("[AUTO-CAL]   • Compute transformation matrix coefficients");
   auto_cal_println("[AUTO-CAL] ");
+  
+  // Send Step C equipment ID
+  send_calibration_step_id("AC.STEP_C.EQUIPMENT");
+  delay(50);
   auto_cal_println("[AUTO-CAL] 📦 EQUIPMENT NEEDED:");
   auto_cal_println("[AUTO-CAL]   • 10kg calibrated mass");
   auto_cal_println("[AUTO-CAL]   • Measuring tape for position verification");
@@ -1113,6 +1412,12 @@ void handle_step_c_collect() {
   auto_cal_printf("[AUTO-CAL] 📍 POSITION %d/%d: %s\n", 
                 auto_cal_current_position + 1, num_matrix_positions, pos->description);
   auto_cal_printf("[AUTO-CAL] 📦 Place 10kg mass at coordinates: (%.0f, %.0f) mm\n", pos->x, pos->y);
+  
+  // Send position ID with context
+  String position_id = "AC.STEP_C.COLLECT_POSITION";
+  String context = String(auto_cal_current_position + 1) + "/" + String(num_matrix_positions) + ":" + String(pos->description);
+  send_contextual_step_id(position_id, context);
+  
   auto_cal_println("[AUTO-CAL] ");
   
   if (pos->x == 0.0 && pos->y == 0.0) {
@@ -1157,6 +1462,9 @@ void handle_step_c_collect_continue() {
 }
 
 void handle_step_c_compute() {
+  // Send Step C compute ID
+  send_calibration_step_id("AC.STEP_C.COMPUTE_HEADER");
+  delay(50);
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] 🔄 STEP C: COMPUTING MATRIX COEFFICIENTS");
   auto_cal_println("[AUTO-CAL] ==========================================");
@@ -1219,6 +1527,9 @@ void start_save_verify() {
 }
 
 void complete_calibration() {
+  // Send completion ID
+  send_calibration_success_id("AC.COMPLETE.HEADER");
+  
   auto_cal_println("[AUTO-CAL] ==========================================");
   auto_cal_println("[AUTO-CAL] 🎉 CALIBRATION COMPLETE!");
   auto_cal_println("[AUTO-CAL] ==========================================");

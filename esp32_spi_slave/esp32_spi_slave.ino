@@ -839,6 +839,18 @@ void handle_serial_commands() {
         Serial.printf("[SPI_SLAVE] ✗ Command '%s' failed: %s\n", command.c_str(), response.status.c_str());
       }
     }
+    // Automated calibration commands (forward to Teensy over UART)
+    else if (command == "AUTO_CAL_START" || command == "AUTOMATED_CALIBRATION") {
+      Serial.println("[SPI_SLAVE] Forwarding AUTO_CAL_START to Remote Teensy (UART)...");
+      Serial1.println("AUTO_CAL_START");
+      Serial1.flush();
+      Serial.println("[SPI_SLAVE] Waiting for CAL_*_ID stream from Teensy...");
+    }
+    else if (command == "CONTINUE" || command == "SKIP" || command == "ABORT" || command == "STATUS") {
+      Serial.printf("[SPI_SLAVE] Forwarding '%s' to Remote Teensy (UART)...\n", command.c_str());
+      Serial1.println(command);
+      Serial1.flush();
+    }
     // ESP32 control commands
     else if (command == "DEBUG_ON") {
       output_raw_data = true;
@@ -1066,37 +1078,12 @@ void loop() {
   // Forward calibration messages from Remote Teensy to RX Radio
   while (Serial1.available()) {
     String line = Serial1.readStringUntil('\n');
-    if (line.startsWith("[AUTO-CAL]")) {
-      Serial.printf("[SPI_SLAVE] Forwarding calibration message via ESP-NOW: %s\n", line.c_str());
-      
-      // Handle long messages by chunking them
-      if (line.length() > 58) { // Leave room for null terminator
-        // Split long message into chunks
-        int chunk_num = 0;
-        int start_pos = 0;
-        
-        while (start_pos < line.length()) {
-          String chunk = line.substring(start_pos, min(start_pos + 58, (int)line.length()));
-          
-          // Add chunk indicator
-          String chunked_msg = String("[CHUNK:") + chunk_num + ":" + chunk;
-          
-          Serial.printf("[SPI_SLAVE] Sending chunk %d: %s\n", chunk_num, chunked_msg.c_str());
-          send_espnow_response(chunked_msg.c_str());
-          
-          start_pos += 58;
-          chunk_num++;
-          delay(10); // Small delay between chunks
-        }
-        
-        // Send end marker
-        String end_msg = "[CHUNK:END]";
-        Serial.printf("[SPI_SLAVE] Sending end marker: %s\n", end_msg.c_str());
-        send_espnow_response(end_msg.c_str());
-      } else {
-        // Short message, send as-is
-        send_espnow_response(line.c_str());
-      }
+    line.trim();
+    // Only forward structured calibration IDs, suppress raw [AUTO-CAL] text
+    if (line.startsWith("CAL_")) {
+      // Minimal indication that we received an ID; forward it
+      Serial.printf("[SPI_SLAVE] ID RX: %s\n", line.c_str());
+      send_espnow_response(line.c_str());
     }
   }
   

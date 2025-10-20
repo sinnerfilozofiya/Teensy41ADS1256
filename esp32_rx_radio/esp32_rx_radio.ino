@@ -815,10 +815,11 @@ static void process_command(String command) {
         Serial.println("=====================================");
     }
     // Local Teensy Automated Calibration
-    else if (command == "AUTO_CAL_START") {
+    else if (command == "AUTO_CAL_START" || command == "AUTOMATED_CALIBRATION") {
         Serial.println("[RX_RADIO] Starting LOCAL Teensy automated calibration...");
         Serial1.println("AUTO_CAL_START");
         Serial1.flush();
+        Serial.println("[RX_RADIO] Waiting for calibration IDs from LOCAL Teensy...");
     }
     // Remote Teensy Automated Calibration (ESP-NOW has 8-char limit!)
     else if (command == "REMOTE_AUTO_CAL") {
@@ -1054,11 +1055,26 @@ void loop() {
         last_uart_bytes = uart_bytes_sent;
     }
     
-    // Forward calibration messages from Local Teensy to BLE Slave
+    // Forward calibration messages and IDs from Local Teensy to BLE Slave
     while (Serial1.available()) {
         String line = Serial1.readStringUntil('\n');
-        if (line.startsWith("[AUTO-CAL]")) {
-            Serial.printf("[RX_RADIO] Forwarding calibration message to BLE Slave: %s\n", line.c_str());
+        line.trim();
+        
+        // Forward structured calibration IDs (new system)
+        if (line.startsWith("CAL_")) {
+            Serial.printf("[RX_RADIO] ID RX: %s\n", line.c_str());
+            Serial2.printf("LOCAL:%s\n", line.c_str());
+            Serial2.flush();
+        }
+        // Also forward raw calibration messages (for debugging/fallback)
+        else if (line.startsWith("[AUTO-CAL]")) {
+            Serial.printf("[RX_RADIO] (raw cal msg): %s\n", line.c_str());
+            Serial2.printf("LOCAL:%s\n", line.c_str());
+            Serial2.flush();
+        }
+        // Forward any other responses from Local Teensy
+        else if (line.length() > 0) {
+            Serial.printf("[RX_RADIO] Local Teensy: %s\n", line.c_str());
             Serial2.printf("LOCAL:%s\n", line.c_str());
             Serial2.flush();
         }
