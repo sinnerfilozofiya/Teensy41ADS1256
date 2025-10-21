@@ -34,10 +34,12 @@ struct __attribute__((packed)) UartPacket {
 #define BLE_SERVICE_UUID        "12345678-1234-1234-1234-123456789abc"
 #define BLE_DATA_CHARACTERISTIC_UUID "87654321-4321-4321-4321-cba987654321"
 #define BLE_COMMAND_CHARACTERISTIC_UUID "11111111-2222-3333-4444-555555555555"
+#define BLE_CALIBRATION_LOG_CHARACTERISTIC_UUID "22222222-3333-4444-5555-666666666666"
 
 BLEServer* pServer = nullptr;
 BLECharacteristic* pDataCharacteristic = nullptr;    // For sending sensor data
 BLECharacteristic* pCommandCharacteristic = nullptr; // For receiving commands
+BLECharacteristic* pCalibrationLogCharacteristic = nullptr; // For sending calibration logs
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
@@ -188,6 +190,18 @@ static int current_sample_count = 0;
 // AUTOMATED CALIBRATION HELPER FUNCTIONS
 // ============================================================================
 
+// Send calibration message to BLE clients
+void send_calibration_log_to_ble(const String& message) {
+    if (deviceConnected && pCalibrationLogCharacteristic != nullptr) {
+        try {
+            pCalibrationLogCharacteristic->setValue(message.c_str());
+            pCalibrationLogCharacteristic->notify();
+        } catch (...) {
+            // Handle BLE send errors gracefully
+        }
+    }
+}
+
 // Find calibration message by ID (using imported calibration_texts.h)
 const CalibrationMessage* find_calibration_message(const String& id) {
     // First try exact match
@@ -260,6 +274,8 @@ void handle_calibration_id(const String& full_message) {
     if (cal_msg == nullptr) {
         // Fallback for unknown messages
         Serial.printf("\n⚠️  Unknown calibration step: %s\n\n", step_id.c_str());
+        // Send error message to BLE clients
+        send_calibration_log_to_ble("ERROR: Unknown calibration step: " + step_id);
         return;
     }
     
@@ -387,6 +403,67 @@ void handle_calibration_id(const String& full_message) {
         Serial.println("└──────────────────────────────────────────────────────────────────────────────┘");
     }
     
+    // Send full formatted calibration message to BLE clients
+    String ble_message = "";
+    
+    // Build the complete message with all text lines
+    for (int i = 0; i < 15 && cal_msg->text_lines[i] != nullptr; i++) {
+        String line = String(cal_msg->text_lines[i]);
+        if (line.length() > 0) {
+            if (ble_message.length() > 0) {
+                ble_message += "\n";
+            }
+            ble_message += line;
+        }
+    }
+    
+    // Add contextual information if present
+    if (context_info.length() > 0) {
+        ble_message += "\n";
+        
+        // Parse different types of contextual information
+        if (base_step_id == "AC.STEP_B.SPAN_COLLECT.MASS_POINT") {
+            // Format: "1/5:0.0kg" -> "Mass Point 1 of 5: 0.0kg"
+            int slash_pos = context_info.indexOf('/');
+            int colon_pos = context_info.indexOf(':');
+            if (slash_pos != -1 && colon_pos != -1) {
+                String current = context_info.substring(0, slash_pos);
+                String total = context_info.substring(slash_pos + 1, colon_pos);
+                String mass = context_info.substring(colon_pos + 1);
+                ble_message += "📊 Mass Point " + current + " of " + total + ": " + mass;
+            }
+        } else if (base_step_id == "AC.STEP_C.COLLECT_POSITION") {
+            // Format: "1/9:Center" -> "Position 1 of 9: Center"
+            int slash_pos = context_info.indexOf('/');
+            int colon_pos = context_info.indexOf(':');
+            if (slash_pos != -1 && colon_pos != -1) {
+                String current = context_info.substring(0, slash_pos);
+                String total = context_info.substring(slash_pos + 1, colon_pos);
+                String position = context_info.substring(colon_pos + 1);
+                ble_message += "📍 Position " + current + " of " + total + ": " + position;
+            }
+        } else {
+            // Generic contextual info display
+            ble_message += "ℹ️ Context: " + context_info;
+        }
+    }
+    
+    // Add message type prefix for BLE client processing
+    String ble_prefix = "";
+    if (is_header) {
+        ble_prefix = "HEADER: ";
+    } else if (is_prompt) {
+        ble_prefix = "PROMPT: ";
+    } else if (is_success) {
+        ble_prefix = "SUCCESS: ";
+    } else if (is_error) {
+        ble_prefix = "ERROR: ";
+    } else {
+        ble_prefix = "INFO: ";
+    }
+    
+    send_calibration_log_to_ble(ble_prefix + ble_message);
+    
     Serial.println();
 }
 
@@ -409,6 +486,19 @@ void display_calibration_header() {
     Serial.println("║                                                                              ║");
     Serial.println("╚══════════════════════════════════════════════════════════════════════════════╝");
     Serial.println();
+    
+    // Send calibration start message to BLE clients
+    String cal_type = (active_calibration == CAL_LOCAL) ? "LOCAL" : "REMOTE";
+    String cal_emoji = (active_calibration == CAL_LOCAL) ? "🟢" : "🔵";
+    
+    String start_message = "CALIBRATION_START: " + cal_emoji + " " + cal_type + " FORCE PLATE CALIBRATION\n";
+    start_message += "Welcome to the automated calibration system. This process will guide you\n";
+    start_message += "through calibrating your force plate step by step.\n\n";
+    start_message += "📋 The system will show you exactly what to do at each step\n";
+    start_message += "⏱️  Estimated time: 60-90 minutes\n";
+    start_message += "🎯 Follow the instructions and respond when prompted";
+    
+    send_calibration_log_to_ble(start_message);
 }
 
 void show_calibration_steps() {
@@ -650,8 +740,80 @@ static void process_ble_command(String command) {
     Serial.printf("[BLE_SLAVE] BLE Command received: %s\n", command.c_str());
     ble_commands_received++;
     
+    // Handle calibration commands locally
+    if (command == "LOCAL_AUTO_CAL" || command == "REMOTE_AUTO_CAL" || 
+        command == "CAL_STATUS" || command == "CAL_SHOW_STEPS" ||
+        command == "CONTINUE" || command == "SKIP" || command == "ABORT") {
+        
+        // Handle calibration commands
+        if (command == "LOCAL_AUTO_CAL") {
+            Serial.println("\n🚀 STARTING LOCAL FORCE PLATE CALIBRATION (via BLE)...");
+            active_calibration = CAL_LOCAL;
+            cal_waiting_for_input = false;
+            cal_step_start_time = millis();
+            cal_last_keepalive = millis();
+            current_step_id = "";
+            
+            display_calibration_header();
+            Serial.println("🔄 Initializing calibration system...");
+            Serial.println("📡 Connecting to local force plate...");
+            
+            Serial2.println("AUTO_CAL_START");
+            Serial2.flush();
+            commands_forwarded++;
+            
+        } else if (command == "REMOTE_AUTO_CAL") {
+            Serial.println("\n🚀 STARTING REMOTE FORCE PLATE CALIBRATION (via BLE)...");
+            active_calibration = CAL_REMOTE;
+            cal_waiting_for_input = false;
+            cal_step_start_time = millis();
+            cal_last_keepalive = millis();
+            current_step_id = "";
+            
+            display_calibration_header();
+            Serial.println("🔄 Initializing calibration system...");
+            Serial.println("📡 Connecting to remote force plate...");
+            
+            Serial2.println("REMOTE_AUTO_CAL");
+            Serial2.flush();
+            commands_forwarded++;
+            
+        } else if (command == "CAL_STATUS") {
+            show_calibration_status();
+            
+        } else if (command == "CAL_SHOW_STEPS") {
+            show_calibration_steps();
+            
+        } else if (command == "CONTINUE" || command == "SKIP" || command == "ABORT") {
+            if (active_calibration != CAL_NONE) {
+                if (command == "CONTINUE") {
+                    Serial.println("📤 Sending CONTINUE command (via BLE)...");
+                    cal_waiting_for_input = false;
+                } else if (command == "SKIP") {
+                    Serial.println("⏭️ Sending SKIP command (via BLE)...");
+                } else if (command == "ABORT") {
+                    Serial.println("🛑 ABORTING CALIBRATION (via BLE)...");
+                    Serial.printf("   Calibration session for %s force plate has been cancelled.\n",
+                                  (active_calibration == CAL_LOCAL) ? "LOCAL" : "REMOTE");
+                }
+                
+                route_calibration_command(command);
+                
+                // End calibration session on ABORT
+                if (command == "ABORT") {
+                    active_calibration = CAL_NONE;
+                    current_step_id = "";
+                    Serial.println("   You can start a new calibration anytime with LOCAL_AUTO_CAL or REMOTE_AUTO_CAL");
+                }
+            } else {
+                Serial.println("\n⚠️  No calibration session is currently active");
+                Serial.println("   To start calibration, send LOCAL_AUTO_CAL or REMOTE_AUTO_CAL\n");
+            }
+        }
+        
+    }
     // Forward Teensy control commands to ESP32 RX Radio
-    if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
+    else if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
         command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
         command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET" ||
         command == "ZERO" || command == "ZERO_STATUS" || command == "ZERO_RESET" ||
@@ -1506,10 +1668,12 @@ void setup() {
     Serial.println("BLE Service UUID: 12345678-1234-1234-1234-123456789abc");
     Serial.println("Data Characteristic (Notify): 87654321-4321-4321-4321-cba987654321");
     Serial.println("Command Characteristic (Write): 11111111-2222-3333-4444-555555555555");
+    Serial.println("Calibration Log Characteristic (Notify): 22222222-3333-4444-5555-666666666666");
     Serial.println("Available BLE Commands:");
     Serial.println("  Teensy: START, STOP, RESTART, RESET, ZERO, ZERO_STATUS, ZERO_RESET");
     Serial.println("  Remote: REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET, REMOTE_ZERO, REMOTE_ZERO_STATUS, REMOTE_ZERO_RESET");
     Serial.println("  Dual: ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET, ALL_ZERO, ALL_ZERO_STATUS, ALL_ZERO_RESET");
+    Serial.println("  Calibration: LOCAL_AUTO_CAL, REMOTE_AUTO_CAL, CONTINUE, SKIP, ABORT, CAL_STATUS, CAL_SHOW_STEPS");
     Serial.println("  ESP32: LOCAL_ON/OFF, REMOTE_ON/OFF, STATUS");
     Serial.println("Serial Commands: STATS, RESET_STATS, BLE_RESTART, UART_STATUS, HELP");
     Serial.println("======================================");
@@ -1541,6 +1705,14 @@ void setup() {
                         BLECharacteristic::PROPERTY_WRITE_NR
                       );
     pCommandCharacteristic->setCallbacks(new MyCommandCallbacks());
+    
+    // Calibration log characteristic for sending calibration messages (notifications)
+    pCalibrationLogCharacteristic = pService->createCharacteristic(
+                        BLE_CALIBRATION_LOG_CHARACTERISTIC_UUID,
+                        BLECharacteristic::PROPERTY_READ |
+                        BLECharacteristic::PROPERTY_NOTIFY
+                      );
+    pCalibrationLogCharacteristic->addDescriptor(new BLE2902());
     
     pService->start();
     

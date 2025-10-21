@@ -35,6 +35,7 @@ from matplotlib.figure import Figure
 SERVICE_UUID       = "12345678-1234-1234-1234-123456789abc"
 DATA_CHAR_UUID     = "87654321-4321-4321-4321-cba987654321"  # Notify + Read
 COMMAND_CHAR_UUID  = "11111111-2222-3333-4444-555555555555"  # Write
+CALIBRATION_LOG_CHAR_UUID = "22222222-3333-4444-5555-666666666666"  # Notify + Read
 
 DEFAULT_DEVICE_NAME = "LoadCell_BLE_Server"
 
@@ -46,6 +47,7 @@ COMMAND_GROUPS = {
     "Zero (Local)": ["ZERO", "ZERO_STATUS", "ZERO_RESET"],
     "Zero (Remote)": ["REMOTE_ZERO", "REMOTE_ZERO_STATUS", "REMOTE_ZERO_RESET"],
     "Zero (All)": ["ALL_ZERO", "ALL_ZERO_STATUS", "ALL_ZERO_RESET"],
+    "Calibration": ["LOCAL_AUTO_CAL", "REMOTE_AUTO_CAL", "CONTINUE", "SKIP", "ABORT", "CAL_STATUS", "CAL_SHOW_STEPS"],
     "System": ["STATUS", "LOCAL_ON", "LOCAL_OFF", "REMOTE_ON", "REMOTE_OFF"],
 }
 
@@ -185,6 +187,7 @@ class BLEWorker:
             await self.client.connect()
             self.send_ui("status", f"Connected: {self.selected_address}")
             await self.client.start_notify(DATA_CHAR_UUID, self._notification_handler)
+            await self.client.start_notify(CALIBRATION_LOG_CHAR_UUID, self._calibration_log_handler)
             self.packet_counter = 0
             self.send_ui("status", "Notifications enabled.")
         except BleakError as e:
@@ -198,6 +201,7 @@ class BLEWorker:
         try:
             if self.client and self.client.is_connected:
                 await self.client.stop_notify(DATA_CHAR_UUID)
+                await self.client.stop_notify(CALIBRATION_LOG_CHAR_UUID)
                 await self.client.disconnect()
                 self.send_ui("status", "Disconnected.")
         except Exception as e:
@@ -242,6 +246,271 @@ class BLEWorker:
         self.send_ui("data", line1)
         self.send_ui("data", line2)
 
+    def _calibration_log_handler(self, sender, data: bytearray):
+        try:
+            # Decode calibration log message
+            message = data.decode('utf-8').strip()
+            if message:
+                self.send_ui("calibration_log", message)
+        except Exception as e:
+            self.send_ui("log", f"Calibration log decode error: {e}")
+
+# ===== Calibration Window =====
+class CalibrationWindow(tk.Toplevel):
+    def __init__(self, parent, ble_worker):
+        super().__init__(parent)
+        self.parent = parent
+        self.ble = ble_worker
+        self.title("Force Plate Calibration Monitor")
+        self.geometry("1000x700")
+        
+        # Make window modal
+        self.transient(parent)
+        self.grab_set()
+        
+        # Calibration log queue
+        self.cal_log_queue = queue.Queue()
+        
+        # Current calibration status
+        self.cal_status_var = tk.StringVar(value="No calibration active")
+        self.cal_type_var = tk.StringVar(value="None")
+        
+        # Build UI
+        self._build_ui()
+        
+        # Start processing calibration logs
+        self.after(100, self._process_calibration_logs)
+        
+        # Center the window
+        self._center_window()
+    
+    def _center_window(self):
+        """Center the calibration window on the parent"""
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - (1000 // 2)
+        y = (self.winfo_screenheight() // 2) - (700 // 2)
+        self.geometry(f"1000x700+{x}+{y}")
+    
+    def _build_ui(self):
+        """Build the calibration window UI"""
+        # Main container
+        main_frame = ttk.Frame(self)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Top section - Status and Controls
+        top_frame = ttk.Frame(main_frame)
+        top_frame.pack(fill="x", pady=(0, 10))
+        
+        # Status display
+        status_frame = ttk.LabelFrame(top_frame, text="Calibration Status")
+        status_frame.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        
+        self.status_label = ttk.Label(status_frame, textvariable=self.cal_status_var, 
+                                    font=("Arial", 12, "bold"))
+        self.status_label.pack(pady=5)
+        
+        self.type_label = ttk.Label(status_frame, textvariable=self.cal_type_var, 
+                                  font=("Arial", 10))
+        self.type_label.pack()
+        
+        # Control buttons
+        control_frame = ttk.LabelFrame(top_frame, text="Calibration Controls")
+        control_frame.pack(side="right", fill="y")
+        
+        # Start calibration buttons
+        ttk.Button(control_frame, text="Start Local Cal", 
+                  command=lambda: self._send_command("LOCAL_AUTO_CAL"),
+                  style="Accent.TButton").pack(pady=2, padx=5, fill="x")
+        
+        ttk.Button(control_frame, text="Start Remote Cal", 
+                  command=lambda: self._send_command("REMOTE_AUTO_CAL"),
+                  style="Accent.TButton").pack(pady=2, padx=5, fill="x")
+        
+        # Control flow buttons
+        ttk.Button(control_frame, text="Continue", 
+                  command=lambda: self._send_command("CONTINUE"),
+                  style="Success.TButton").pack(pady=2, padx=5, fill="x")
+        
+        ttk.Button(control_frame, text="Skip Step", 
+                  command=lambda: self._send_command("SKIP"),
+                  style="Warning.TButton").pack(pady=2, padx=5, fill="x")
+        
+        ttk.Button(control_frame, text="Abort", 
+                  command=lambda: self._send_command("ABORT"),
+                  style="Danger.TButton").pack(pady=2, padx=5, fill="x")
+        
+        # Status check button
+        ttk.Button(control_frame, text="Check Status", 
+                  command=lambda: self._send_command("CAL_STATUS")).pack(pady=2, padx=5, fill="x")
+        
+        # Main log area
+        log_frame = ttk.LabelFrame(main_frame, text="Calibration Log")
+        log_frame.pack(fill="both", expand=True)
+        
+        # Create text widget with scrollbar
+        text_frame = ttk.Frame(log_frame)
+        text_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        self.log_text = tk.Text(text_frame, 
+                               font=("Consolas", 11),
+                               wrap=tk.WORD,
+                               bg="#1e1e1e",
+                               fg="#ffffff",
+                               insertbackground="#ffffff",
+                               selectbackground="#404040",
+                               state="disabled")
+        
+        # Scrollbar
+        scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack text and scrollbar
+        self.log_text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Bottom controls
+        bottom_frame = ttk.Frame(main_frame)
+        bottom_frame.pack(fill="x", pady=(10, 0))
+        
+        # Clear log button
+        ttk.Button(bottom_frame, text="Clear Log", 
+                  command=self._clear_log).pack(side="left")
+        
+        # Auto-scroll toggle
+        self.auto_scroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bottom_frame, text="Auto-scroll", 
+                       variable=self.auto_scroll_var).pack(side="left", padx=(20, 0))
+        
+        # Close button
+        ttk.Button(bottom_frame, text="Close", 
+                  command=self.destroy).pack(side="right")
+    
+    def _send_command(self, command):
+        """Send command to BLE worker"""
+        if self.ble and self.ble.client and self.ble.client.is_connected:
+            self.ble.send_command(command)
+            self._add_log(f"📤 Sent: {command}", "command")
+        else:
+            self._add_log("❌ Not connected to device", "error")
+    
+    def _add_log(self, message, log_type="info"):
+        """Add message to the calibration log"""
+        timestamp = time.strftime("%H:%M:%S")
+        
+        # Color coding based on log type
+        colors = {
+            "info": "#ffffff",
+            "success": "#4CAF50",
+            "error": "#F44336",
+            "warning": "#FF9800",
+            "command": "#2196F3",
+            "prompt": "#9C27B0",
+            "header": "#FFC107"
+        }
+        
+        color = colors.get(log_type, "#ffffff")
+        
+        # Enable text widget for editing
+        self.log_text.config(state="normal")
+        
+        # Insert timestamp and message
+        self.log_text.insert("end", f"[{timestamp}] ", "timestamp")
+        self.log_text.insert("end", f"{message}\n", log_type)
+        
+        # Configure tags for colors
+        self.log_text.tag_configure("timestamp", foreground="#888888")
+        self.log_text.tag_configure(log_type, foreground=color)
+        
+        # Auto-scroll if enabled
+        if self.auto_scroll_var.get():
+            self.log_text.see("end")
+        
+        # Disable text widget to prevent editing
+        self.log_text.config(state="disabled")
+    
+    def _clear_log(self):
+        """Clear the calibration log"""
+        self.log_text.config(state="normal")
+        self.log_text.delete(1.0, "end")
+        self.log_text.config(state="disabled")
+    
+    def _process_calibration_logs(self):
+        """Process calibration log messages from BLE"""
+        try:
+            while True:
+                message = self.cal_log_queue.get_nowait()
+                self._handle_calibration_message(message)
+        except queue.Empty:
+            pass
+        
+        # Schedule next check
+        self.after(100, self._process_calibration_logs)
+    
+    def _handle_calibration_message(self, message):
+        """Handle calibration message and update UI"""
+        # Extract message type and content
+        message_type = ""
+        content = message
+        
+        if message.startswith("CALIBRATION_START:"):
+            message_type = "calibration_start"
+            content = message.replace("CALIBRATION_START: ", "")
+        elif message.startswith("PROMPT:"):
+            message_type = "prompt"
+            content = message.replace("PROMPT: ", "")
+        elif message.startswith("SUCCESS:"):
+            message_type = "success"
+            content = message.replace("SUCCESS: ", "")
+        elif message.startswith("ERROR:"):
+            message_type = "error"
+            content = message.replace("ERROR: ", "")
+        elif message.startswith("HEADER:"):
+            message_type = "header"
+            content = message.replace("HEADER: ", "")
+        elif message.startswith("INFO:"):
+            message_type = "info"
+            content = message.replace("INFO: ", "")
+        else:
+            message_type = "info"
+            content = message
+        
+        # Update status based on message type
+        if message_type == "calibration_start":
+            if "LOCAL" in content:
+                self.cal_status_var.set("🟢 LOCAL Calibration Active")
+                self.cal_type_var.set("Local Force Plate")
+            elif "REMOTE" in content:
+                self.cal_status_var.set("🔵 REMOTE Calibration Active")
+                self.cal_type_var.set("Remote Force Plate")
+            self._add_log(content, "success")
+        elif message_type == "prompt":
+            self.cal_status_var.set("❓ Waiting for user input")
+            self._add_log(content, "prompt")
+        elif message_type == "success":
+            self.cal_status_var.set("✅ Step completed successfully")
+            self._add_log(content, "success")
+        elif message_type == "error":
+            self.cal_status_var.set("❌ Error occurred")
+            self._add_log(content, "error")
+        elif message_type == "header":
+            # Extract step information for status
+            if "STEP A" in content:
+                self.cal_status_var.set("📋 Step A: ADC Calibration")
+            elif "STEP B" in content:
+                self.cal_status_var.set("📋 Step B: Load Cell Calibration")
+            elif "STEP C" in content:
+                self.cal_status_var.set("📋 Step C: Matrix Calibration")
+            elif "COMPLETE" in content:
+                self.cal_status_var.set("🎉 Calibration Complete!")
+            self._add_log(content, "header")
+        else:
+            # Info or generic message
+            self._add_log(content, "info")
+    
+    def add_calibration_message(self, message):
+        """Add calibration message to the queue (called from main app)"""
+        self.cal_log_queue.put(message)
+
 # ===== Main Tk app =====
 class App(tk.Tk):
     def __init__(self):
@@ -272,12 +541,23 @@ class App(tk.Tk):
 
         # Selected channel
         self.selected_channel = tk.StringVar(value=CHANNEL_NAMES[0])  # default L1
+        
+        # Calibration window reference
+        self.calibration_window = None
+        
+        # Configure button styles
+        style = ttk.Style()
+        style.configure("Accent.TButton", foreground="white", background="#0078d4")
+        style.configure("Success.TButton", foreground="white", background="#28a745")
+        style.configure("Warning.TButton", foreground="white", background="#ffc107")
+        style.configure("Danger.TButton", foreground="white", background="#dc3545")
 
         # ------------- UI Layout -------------
         self._build_top_bar()
         self._build_scan_select()
         self._build_commands()
         self._build_monitor_and_plot()
+        self._build_calibration_log()
         self._build_output()
 
         # Timers
@@ -332,6 +612,14 @@ class App(tk.Tk):
             ttk.Label(row, text=grp, width=14).pack(side="left")
             for c in cmds:
                 ttk.Button(row, text=c, command=lambda cc=c: self.ble.send_command(cc)).pack(side="left", padx=2, pady=2)
+        
+        # Calibration window button
+        cal_row = ttk.Frame(cmd_frame)
+        cal_row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(cal_row, text="Calibration", width=14).pack(side="left")
+        ttk.Button(cal_row, text="Open Calibration Monitor", 
+                  command=self._open_calibration_window,
+                  style="Accent.TButton").pack(side="left", padx=2, pady=2)
 
         custom = ttk.Frame(self)
         custom.pack(fill="x", padx=10, pady=6)
@@ -387,6 +675,22 @@ class App(tk.Tk):
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _build_calibration_log(self):
+        cal_frame = ttk.LabelFrame(self, text="Calibration Log")
+        cal_frame.pack(fill="x", padx=10, pady=6)
+
+        # Calibration log text area
+        self.cal_log_text = tk.Text(cal_frame, height=8, wrap=tk.WORD, font=("Consolas", 9))
+        cal_scrollbar = ttk.Scrollbar(cal_frame, orient="vertical", command=self.cal_log_text.yview)
+        self.cal_log_text.configure(yscrollcommand=cal_scrollbar.set)
+        
+        self.cal_log_text.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+        cal_scrollbar.pack(side="right", fill="y", pady=6)
+
+        # Calibration status
+        self.cal_status_var = tk.StringVar(value="No calibration active")
+        ttk.Label(cal_frame, textvariable=self.cal_status_var, font=("Arial", 10, "bold")).pack(pady=2)
 
     def _build_output(self):
         out_frame = ttk.LabelFrame(self, text="Log / Output")
@@ -448,6 +752,8 @@ class App(tk.Tk):
                     self._populate_devices(payload or [])
                 elif kind == "samples":
                     self._ingest_samples(payload or [])
+                elif kind == "calibration_log":
+                    self._handle_calibration_log(str(payload))
         except queue.Empty:
             pass
         self.after(50, self._pump_queue)
@@ -505,6 +811,50 @@ class App(tk.Tk):
     def _log(self, s: str):
         ts = time.strftime("%H:%M:%S")
         self._print_line(f"[{ts}] {s}")
+
+    def _handle_calibration_log(self, message: str):
+        """Handle calibration log messages from BLE"""
+        ts = time.strftime("%H:%M:%S")
+        
+        # Add to calibration log text area (preserve formatting)
+        self.cal_log_text.insert("end", f"[{ts}] {message}\n")
+        self.cal_log_text.see("end")
+        
+        # Update calibration status based on message type
+        if "CALIBRATION_START" in message:
+            if "LOCAL" in message:
+                self.cal_status_var.set("🟢 LOCAL Calibration Active")
+            elif "REMOTE" in message:
+                self.cal_status_var.set("🔵 REMOTE Calibration Active")
+        elif "PROMPT:" in message:
+            self.cal_status_var.set("❓ Waiting for user input")
+        elif "SUCCESS:" in message:
+            self.cal_status_var.set("✅ Step completed successfully")
+        elif "ERROR:" in message:
+            self.cal_status_var.set("❌ Error occurred")
+        elif "HEADER:" in message:
+            # Extract step information from header
+            if "STEP A" in message:
+                self.cal_status_var.set("📋 Step A: ADC Calibration")
+            elif "STEP B" in message:
+                self.cal_status_var.set("📋 Step B: Load Cell Calibration")
+            elif "STEP C" in message:
+                self.cal_status_var.set("📋 Step C: Matrix Calibration")
+            elif "COMPLETE" in message:
+                self.cal_status_var.set("🎉 Calibration Complete!")
+        
+        # Forward message to calibration window if open
+        if self.calibration_window:
+            self.calibration_window.add_calibration_message(message)
+
+    def _open_calibration_window(self):
+        """Open the calibration monitoring window"""
+        if self.calibration_window is None or not self.calibration_window.winfo_exists():
+            self.calibration_window = CalibrationWindow(self, self.ble)
+        else:
+            # Bring existing window to front
+            self.calibration_window.lift()
+            self.calibration_window.focus_force()
 
     def destroy(self):
         try:

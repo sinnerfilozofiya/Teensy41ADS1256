@@ -444,7 +444,9 @@ static const CalibrationMessage CALIBRATION_MESSAGES[] = {
     {
         "AC.STEP_B.PURPOSE", 4, "body",
         {
-            "🎯 PURPOSE: [Generic purpose message - content varies by configuration]",
+            "🎯 PURPOSE:",
+            "  Calibrate the load cells to convert raw ADC values",
+            "  into accurate force measurements (Newtons)",
             nullptr
         },
         {
@@ -456,7 +458,9 @@ static const CalibrationMessage CALIBRATION_MESSAGES[] = {
     {
         "AC.STEP_B.DURATION", 4, "body",
         {
-            "⏱️  DURATION: [Generic duration message - content varies by configuration]",
+            "⏱️  DURATION:",
+            "  Approximately 15-30 minutes depending on",
+            "  number of calibration masses used",
             nullptr
         },
         {
@@ -468,7 +472,11 @@ static const CalibrationMessage CALIBRATION_MESSAGES[] = {
     {
         "AC.STEP_B.WHAT_HAPPENS", 4, "body",
         {
-            "📋 WHAT WILL HAPPEN: [Generic process description - content varies by configuration]",
+            "📋 WHAT WILL HAPPEN:",
+            "  1. Place known masses on the force plate",
+            "  2. System records raw ADC values for each mass",
+            "  3. Calculates calibration coefficients",
+            "  4. Verifies accuracy with test measurements",
             nullptr
         },
         {
@@ -480,7 +488,11 @@ static const CalibrationMessage CALIBRATION_MESSAGES[] = {
     {
         "AC.STEP_B.MASSES_NEEDED", 4, "body",
         {
-            "📦 MASSES NEEDED: [Generic masses description - content varies by configuration]",
+            "📦 MASSES NEEDED:",
+            "  • At least 3 different known masses",
+            "  • Recommended: 1kg, 5kg, 10kg, 20kg",
+            "  • Must be accurate to ±0.1% or better",
+            "  • Total mass should not exceed plate capacity",
             nullptr
         },
         {
@@ -492,7 +504,11 @@ static const CalibrationMessage CALIBRATION_MESSAGES[] = {
     {
         "AC.STEP_B.IMPORTANT", 4, "body",
         {
-            "⚠️  IMPORTANT: [Generic important notes - content varies by configuration]",
+            "⚠️  IMPORTANT:",
+            "  • Ensure force plate is level and stable",
+            "  • Do not move or disturb the plate during calibration",
+            "  • Place masses gently in the center of the plate",
+            "  • Wait for readings to stabilize before proceeding",
             nullptr
         },
         {
@@ -817,7 +833,9 @@ static const CalibrationMessage CALIBRATION_MESSAGES[] = {
     {
         "AC.STEP_B.SPAN_HEADER", 6, "body",
         {
-            "📊 SPAN CALIBRATION: [Generic span header - content varies by configuration]",
+            "📊 SPAN CALIBRATION:",
+            "  Record raw ADC values for each calibration mass",
+            "  to establish the relationship between mass and ADC readings",
             nullptr
         },
         {

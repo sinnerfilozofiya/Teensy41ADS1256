@@ -285,7 +285,9 @@
       "code": 4,
       "type": "body",
       "text": [
-        "[AUTO-CAL] 🎯 PURPOSE: [Generic purpose message - content varies by configuration]"
+        "[AUTO-CAL] 🎯 PURPOSE:",
+        "[AUTO-CAL]   Calibrate the load cells to convert raw ADC values",
+        "[AUTO-CAL]   into accurate force measurements (Newtons)"
       ]
     },
     "AC.STEP_B.DURATION": {
@@ -293,7 +295,9 @@
       "code": 4,
       "type": "body",
       "text": [
-        "[AUTO-CAL] ⏱️  DURATION: [Generic duration message - content varies by configuration]"
+        "[AUTO-CAL] ⏱️  DURATION:",
+        "[AUTO-CAL]   Approximately 15-30 minutes depending on",
+        "[AUTO-CAL]   number of calibration masses used"
       ]
     },
     "AC.STEP_B.WHAT_HAPPENS": {
@@ -301,7 +305,11 @@
       "code": 4,
       "type": "body",
       "text": [
-        "[AUTO-CAL] 📋 WHAT WILL HAPPEN: [Generic process description - content varies by configuration]"
+        "[AUTO-CAL] 📋 WHAT WILL HAPPEN:",
+        "[AUTO-CAL]   1. Place known masses on the force plate",
+        "[AUTO-CAL]   2. System records raw ADC values for each mass",
+        "[AUTO-CAL]   3. Calculates calibration coefficients",
+        "[AUTO-CAL]   4. Verifies accuracy with test measurements"
       ]
     },
     "AC.STEP_B.MASSES_NEEDED": {
@@ -309,7 +317,11 @@
       "code": 4,
       "type": "body",
       "text": [
-        "[AUTO-CAL] 📦 MASSES NEEDED: [Generic masses description - content varies by configuration]"
+        "[AUTO-CAL] 📦 MASSES NEEDED:",
+        "[AUTO-CAL]   • At least 3 different known masses",
+        "[AUTO-CAL]   • Recommended: 1kg, 5kg, 10kg, 20kg",
+        "[AUTO-CAL]   • Must be accurate to ±0.1% or better",
+        "[AUTO-CAL]   • Total mass should not exceed plate capacity"
       ]
     },
     "AC.STEP_B.IMPORTANT": {
@@ -317,7 +329,11 @@
       "code": 4,
       "type": "body",
       "text": [
-        "[AUTO-CAL] ⚠️  IMPORTANT: [Generic important notes - content varies by configuration]"
+        "[AUTO-CAL] ⚠️  IMPORTANT:",
+        "[AUTO-CAL]   • Ensure force plate is level and stable",
+        "[AUTO-CAL]   • Do not move or disturb the plate during calibration",
+        "[AUTO-CAL]   • Place masses gently in the center of the plate",
+        "[AUTO-CAL]   • Wait for readings to stabilize before proceeding"
       ]
     },
     "AC.STEP_B.PURPOSE_CENTER": {
@@ -556,7 +572,9 @@
       "code": 6,
       "type": "body",
       "text": [
-        "[AUTO-CAL] 📊 SPAN CALIBRATION: [Generic span header - content varies by configuration]"
+        "[AUTO-CAL] 📊 SPAN CALIBRATION:",
+        "[AUTO-CAL]   Record raw ADC values for each calibration mass",
+        "[AUTO-CAL]   to establish the relationship between mass and ADC readings"
       ]
     },
     "AC.STEP_B.SPAN_PROCESS": {
