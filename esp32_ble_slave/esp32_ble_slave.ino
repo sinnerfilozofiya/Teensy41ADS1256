@@ -190,11 +190,41 @@ static int current_sample_count = 0;
 
 // Find calibration message by ID (using imported calibration_texts.h)
 const CalibrationMessage* find_calibration_message(const String& id) {
+    // First try exact match
     for (int i = 0; i < CALIBRATION_MESSAGES_COUNT; i++) {
         if (String(CALIBRATION_MESSAGES[i].id) == id) {
             return &CALIBRATION_MESSAGES[i];
         }
     }
+    
+    // If no exact match, try to parse contextual ID (e.g., "AC.STEP_B.SPAN_COLLECT.MASS_POINT:1/5:0.0kg")
+    String base_id = id;
+    int context_pos = id.indexOf(':');
+    if (context_pos != -1) {
+        base_id = id.substring(0, context_pos);
+        
+        // Try exact match with base ID
+        for (int i = 0; i < CALIBRATION_MESSAGES_COUNT; i++) {
+            if (String(CALIBRATION_MESSAGES[i].id) == base_id) {
+                return &CALIBRATION_MESSAGES[i];
+            }
+        }
+        
+        // Handle special contextual ID mappings
+        if (base_id == "AC.STEP_B.SPAN_COLLECT.MASS_POINT") {
+            base_id = "AC.STEP_B.SPAN_COLLECT_MASS_POINT";
+        } else if (base_id == "AC.STEP_C.COLLECT_POSITION") {
+            base_id = "AC.STEP_C.COLLECT_POSITION";
+        }
+        
+        // Try again with mapped base ID
+        for (int i = 0; i < CALIBRATION_MESSAGES_COUNT; i++) {
+            if (String(CALIBRATION_MESSAGES[i].id) == base_id) {
+                return &CALIBRATION_MESSAGES[i];
+            }
+        }
+    }
+    
     return nullptr;
 }
 
@@ -214,6 +244,15 @@ void handle_calibration_id(const String& full_message) {
     current_step_id = step_id;
     cal_last_message_time = millis();
     cal_messages_received++;
+    
+    // Parse contextual information if present
+    String context_info = "";
+    String base_step_id = step_id;
+    int context_pos = step_id.indexOf(':');
+    if (context_pos != -1) {
+        base_step_id = step_id.substring(0, context_pos);
+        context_info = step_id.substring(context_pos + 1);
+    }
     
     // Look up message from calibration_texts.json structure
     const CalibrationMessage* cal_msg = find_calibration_message(step_id);
@@ -298,6 +337,37 @@ void handle_calibration_id(const String& full_message) {
                         }
                     }
                 }
+            }
+        }
+        
+        // Display contextual information if present
+        if (context_info.length() > 0) {
+            Serial.println();
+            
+            // Parse different types of contextual information
+            if (base_step_id == "AC.STEP_B.SPAN_COLLECT.MASS_POINT") {
+                // Format: "1/5:0.0kg" -> "Mass Point 1 of 5: 0.0kg"
+                int slash_pos = context_info.indexOf('/');
+                int colon_pos = context_info.indexOf(':');
+                if (slash_pos != -1 && colon_pos != -1) {
+                    String current = context_info.substring(0, slash_pos);
+                    String total = context_info.substring(slash_pos + 1, colon_pos);
+                    String mass = context_info.substring(colon_pos + 1);
+                    Serial.printf("   📊 Mass Point %s of %s: %s\n", current.c_str(), total.c_str(), mass.c_str());
+                }
+            } else if (base_step_id == "AC.STEP_C.COLLECT_POSITION") {
+                // Format: "1/9:Center" -> "Position 1 of 9: Center"
+                int slash_pos = context_info.indexOf('/');
+                int colon_pos = context_info.indexOf(':');
+                if (slash_pos != -1 && colon_pos != -1) {
+                    String current = context_info.substring(0, slash_pos);
+                    String total = context_info.substring(slash_pos + 1, colon_pos);
+                    String position = context_info.substring(colon_pos + 1);
+                    Serial.printf("   📍 Position %s of %s: %s\n", current.c_str(), total.c_str(), position.c_str());
+                }
+            } else {
+                // Generic contextual info display
+                Serial.printf("   ℹ️  Context: %s\n", context_info.c_str());
             }
         }
     }

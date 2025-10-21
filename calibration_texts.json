@@ -280,6 +280,46 @@
         "[AUTO-CAL] =========================================="
       ]
     },
+    "AC.STEP_B.PURPOSE": {
+      "id": "AC.STEP_B.PURPOSE",
+      "code": 4,
+      "type": "body",
+      "text": [
+        "[AUTO-CAL] 🎯 PURPOSE: [Generic purpose message - content varies by configuration]"
+      ]
+    },
+    "AC.STEP_B.DURATION": {
+      "id": "AC.STEP_B.DURATION",
+      "code": 4,
+      "type": "body",
+      "text": [
+        "[AUTO-CAL] ⏱️  DURATION: [Generic duration message - content varies by configuration]"
+      ]
+    },
+    "AC.STEP_B.WHAT_HAPPENS": {
+      "id": "AC.STEP_B.WHAT_HAPPENS",
+      "code": 4,
+      "type": "body",
+      "text": [
+        "[AUTO-CAL] 📋 WHAT WILL HAPPEN: [Generic process description - content varies by configuration]"
+      ]
+    },
+    "AC.STEP_B.MASSES_NEEDED": {
+      "id": "AC.STEP_B.MASSES_NEEDED",
+      "code": 4,
+      "type": "body",
+      "text": [
+        "[AUTO-CAL] 📦 MASSES NEEDED: [Generic masses description - content varies by configuration]"
+      ]
+    },
+    "AC.STEP_B.IMPORTANT": {
+      "id": "AC.STEP_B.IMPORTANT",
+      "code": 4,
+      "type": "body",
+      "text": [
+        "[AUTO-CAL] ⚠️  IMPORTANT: [Generic important notes - content varies by configuration]"
+      ]
+    },
     "AC.STEP_B.PURPOSE_CENTER": {
       "id": "AC.STEP_B.PURPOSE_CENTER",
       "code": 4,
@@ -466,6 +506,14 @@
         "[AUTO-CAL] 🔄 Taring all 4 load cells..."
       ]
     },
+    "AC.STEP_B.TARE_PROCESS": {
+      "id": "AC.STEP_B.TARE_PROCESS",
+      "code": 5,
+      "type": "body",
+      "text": [
+        "[AUTO-CAL] 🔄 Processing tare operation..."
+      ]
+    },
     "AC.STEP_B.TARE_CELL": {
       "id": "AC.STEP_B.TARE_CELL",
       "code": 5,
@@ -501,6 +549,30 @@
         "[AUTO-CAL] ==========================================",
         "[AUTO-CAL] 🔄 STEP B2: SPAN CALIBRATION SETUP",
         "[AUTO-CAL] =========================================="
+      ]
+    },
+    "AC.STEP_B.SPAN_HEADER": {
+      "id": "AC.STEP_B.SPAN_HEADER",
+      "code": 6,
+      "type": "body",
+      "text": [
+        "[AUTO-CAL] 📊 SPAN CALIBRATION: [Generic span header - content varies by configuration]"
+      ]
+    },
+    "AC.STEP_B.SPAN_PROCESS": {
+      "id": "AC.STEP_B.SPAN_PROCESS",
+      "code": 6,
+      "type": "body",
+      "text": [
+        "[AUTO-CAL] 🔄 Processing span calibration..."
+      ]
+    },
+    "AC.STEP_B.SPAN_COMPUTING": {
+      "id": "AC.STEP_B.SPAN_COMPUTING",
+      "code": 8,
+      "type": "body",
+      "text": [
+        "[AUTO-CAL] 🧮 Computing span coefficients..."
       ]
     },
     "AC.STEP_B.SPAN_SETUP_PROCESS_HEADER": {
@@ -763,6 +835,35 @@
       "text": [
         "[AUTO-CAL] ==========================================",
         "[AUTO-CAL] 📋 STEP C: MATRIX CALIBRATION (OPTIONAL)",
+        "[AUTO-CAL] =========================================="
+      ]
+    },
+    "AC.STEP_C.DISABLED_HEADER": {
+      "id": "AC.STEP_C.DISABLED_HEADER",
+      "code": 9,
+      "type": "header",
+      "text": [
+        "[AUTO-CAL] ==========================================",
+        "[AUTO-CAL] 📋 STEP C: MATRIX CALIBRATION (DISABLED)",
+        "[AUTO-CAL] =========================================="
+      ]
+    },
+    "AC.STEP_C.DISABLED_INFO": {
+      "id": "AC.STEP_C.DISABLED_INFO",
+      "code": 9,
+      "type": "body",
+      "text": [
+        "[AUTO-CAL] ⏭️ Step C (Matrix Calibration) is DISABLED",
+        "[AUTO-CAL] Skipping to final save and verification..."
+      ]
+    },
+    "AC.STEP_C.HEADER": {
+      "id": "AC.STEP_C.HEADER",
+      "code": 9,
+      "type": "header",
+      "text": [
+        "[AUTO-CAL] ==========================================",
+        "[AUTO-CAL] 📋 STEP C: MATRIX CALIBRATION",
         "[AUTO-CAL] =========================================="
       ]
     },
