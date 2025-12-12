@@ -409,7 +409,7 @@ static void espnow_rx_callback(const esp_now_recv_info *recv_info, const uint8_t
                     // End of chunked message, send complete message
                     if (message_buffer.length() > 0) {
                         Serial.printf("[RX_RADIO] → Complete chunked message: %s\n", message_buffer.c_str());
-                        Serial2.printf("REMOTE:%s\n", message_buffer.c_str());
+                        Serial2.printf("##REMOTE:%s\n", message_buffer.c_str());
                         Serial2.flush();
                         message_buffer = "";
                         receiving_chunks = false;
@@ -446,10 +446,11 @@ static void espnow_rx_callback(const esp_now_recv_info *recv_info, const uint8_t
                 }
                 
                 // Forward response to BLE Slave via Serial2 with REMOTE: prefix
+                // Use "##" prefix to distinguish text from binary UART packets
                 Serial.printf("[RX_RADIO] → Forwarding to BLE Slave via Serial2...\n");
-                Serial2.printf("REMOTE:%s\n", response_str.c_str());
+                Serial2.printf("##REMOTE:%s\n", response_str.c_str());
                 Serial2.flush();
-                Serial.printf("[RX_RADIO] ✓ Response forwarded successfully: REMOTE:%s\n", response_str.c_str());
+                Serial.printf("[RX_RADIO] ✓ Response forwarded successfully: ##REMOTE:%s\n", response_str.c_str());
             }
             return;
         } else {
@@ -620,9 +621,10 @@ static void process_command(String command) {
             Serial.println("[RX_RADIO] ================================================");
             
             // Forward to BLE Slave with LOCAL: prefix
-            Serial2.printf("LOCAL:%s\n", response_text.c_str());
+            // Use "##" prefix to distinguish text from binary UART packets
+            Serial2.printf("##LOCAL:%s\n", response_text.c_str());
             Serial2.flush();
-            Serial.printf("[RX_RADIO] → Forwarded to BLE Slave: LOCAL:%s\n", response_text.c_str());
+            Serial.printf("[RX_RADIO] → Forwarded to BLE Slave: ##LOCAL:%s\n", response_text.c_str());
         } else {
             Serial.println("[RX_RADIO] ================================================");
             Serial.printf("[RX_RADIO] ✗ No PONG response after %lu ms\n", round_trip);
@@ -630,7 +632,8 @@ static void process_command(String command) {
             Serial.println("[RX_RADIO] ================================================");
             
             // Forward timeout to BLE Slave
-            Serial2.println("LOCAL:PONG_TIMEOUT");
+            // Use "##" prefix to distinguish text from binary UART packets
+            Serial2.println("##LOCAL:PONG_TIMEOUT");
             Serial2.flush();
         }
     }
@@ -1061,21 +1064,22 @@ void loop() {
         line.trim();
         
         // Forward structured calibration IDs (new system)
+        // Use "##" prefix to distinguish text from binary UART packets
         if (line.startsWith("CAL_")) {
             Serial.printf("[RX_RADIO] ID RX: %s\n", line.c_str());
-            Serial2.printf("LOCAL:%s\n", line.c_str());
+            Serial2.printf("##LOCAL:%s\n", line.c_str());
             Serial2.flush();
         }
         // Also forward raw calibration messages (for debugging/fallback)
         else if (line.startsWith("[AUTO-CAL]")) {
             Serial.printf("[RX_RADIO] (raw cal msg): %s\n", line.c_str());
-            Serial2.printf("LOCAL:%s\n", line.c_str());
+            Serial2.printf("##LOCAL:%s\n", line.c_str());
             Serial2.flush();
         }
         // Forward any other responses from Local Teensy
         else if (line.length() > 0) {
             Serial.printf("[RX_RADIO] Local Teensy: %s\n", line.c_str());
-            Serial2.printf("LOCAL:%s\n", line.c_str());
+            Serial2.printf("##LOCAL:%s\n", line.c_str());
             Serial2.flush();
         }
     }

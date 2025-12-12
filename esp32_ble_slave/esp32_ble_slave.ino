@@ -1168,11 +1168,22 @@ static void uart_rx_task(void* param) {
             
             if (!sync_found) {
                 // Check if this might be a text response (not binary packet)
+                // Text messages from RX Radio are prefixed with "##" to distinguish from binary
                 uint8_t byte = Serial2.peek();  // Peek without consuming
                 
-                // If it's a printable ASCII character (likely text response), read as string
-                if (byte >= 32 && byte < 127 && byte != 0xAA) {
+                // Check for "##" text message prefix (0x23 0x23)
+                if (byte == '#') {
+                     // Likely a text message, read and verify
                      String text_response = Serial2.readStringUntil('\n');
+                     
+                     // Skip the "##" prefix if present
+                     if (text_response.startsWith("##")) {
+                         text_response = text_response.substring(2);
+                     } else if (text_response.startsWith("#")) {
+                         // Single # might mean partial read, still try to process
+                         text_response = text_response.substring(1);
+                     }
+                     
                      if (text_response.length() > 0) {
                          // Check if this is a structured calibration ID
                          if (text_response.startsWith("LOCAL:CAL_") || text_response.startsWith("REMOTE:CAL_")) {
@@ -1242,19 +1253,24 @@ static void uart_rx_task(void* param) {
                     continue;  // Skip to next iteration
                 }
                 
-                // Look for binary sync pattern
+                // Look for binary sync pattern (0xAA, 0x55)
+                // Discard any bytes that aren't part of sync or text prefix
                 byte = Serial2.read();
                 debug_sync_attempts++;
                 
-                if (bytes_received == 0 && byte == 0xAA) {
+                if (byte == 0xAA) {
+                    // Start of potential binary packet
                     packet_ptr[0] = byte;
                     bytes_received = 1;
                 } else if (bytes_received == 1 && byte == 0x55) {
+                    // Valid sync pattern found
                     packet_ptr[1] = byte;
                     bytes_received = 2;
                     sync_found = true;
                 } else {
-                    bytes_received = 0;  // Reset if sync pattern broken
+                    // Not part of valid sync pattern - discard
+                    // This handles stray bytes from partial binary packets
+                    bytes_received = 0;
                 }
             } else {
                 // Read rest of packet
