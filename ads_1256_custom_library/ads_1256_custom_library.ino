@@ -23,9 +23,10 @@
 #define PIN_MISO1   1
 #define PIN_CS1     0
 
-// Serial3 pins for ESP32 command interface (Hardware pins - no defines needed)
-// TX3 = Pin 14 (to ESP32 GPIO3)
-// RX3 = Pin 15 (from ESP32 GPIO2)
+// Serial3 pins for ESP32 command interface
+// RX3 = Pin 15 (from ESP32 GPIO2) - Used for receiving commands
+// TX is on Pin 16 (software serial) - PCB fixed wiring
+#define SOFT_TX_PIN 16
 
 // ============================================================================
 // DATA ACQUISITION STATE MANAGEMENT
@@ -448,27 +449,72 @@ int32_t apply_offset(int32_t raw_value, int channel) {
 }
 
 // ============================================================================
+// SOFTWARE SERIAL TX ON PIN 16 (PCB has TX wired to Pin 16, not Pin 14)
+// ============================================================================
+
+#define SOFT_TX_BAUD 9600
+#define SOFT_TX_BIT_TIME_US (1000000 / SOFT_TX_BAUD)  // ~104 µs per bit (much more reliable)
+
+void softSerialTX_init() {
+    pinMode(SOFT_TX_PIN, OUTPUT);
+    digitalWriteFast(SOFT_TX_PIN, HIGH);  // Idle high (UART idle state)
+}
+
+void softSerialTX_writeByte(uint8_t b) {
+    // Disable interrupts for precise timing
+    noInterrupts();
+    
+    // Start bit (LOW)
+    digitalWriteFast(SOFT_TX_PIN, LOW);
+    delayMicroseconds(SOFT_TX_BIT_TIME_US);
+    
+    // Data bits (LSB first)
+    for (int i = 0; i < 8; i++) {
+        digitalWriteFast(SOFT_TX_PIN, (b >> i) & 0x01);
+        delayMicroseconds(SOFT_TX_BIT_TIME_US);
+    }
+    
+    // Stop bit (HIGH)
+    digitalWriteFast(SOFT_TX_PIN, HIGH);
+    delayMicroseconds(SOFT_TX_BIT_TIME_US);
+    
+    interrupts();
+}
+
+void softSerialTX_print(const char* str) {
+    while (*str) {
+        softSerialTX_writeByte(*str++);
+    }
+}
+
+void softSerialTX_println(const char* str) {
+    softSerialTX_print(str);
+    softSerialTX_writeByte('\n');
+}
+
+// ============================================================================
 // COMMAND INTERFACE FUNCTIONS
 // ============================================================================
 
 void send_status_response(const char* command, const char* status) {
-  Serial3.printf("RESP:%s:%s\n", command, status);
-  Serial3.flush();
+  char buf[64];
+  snprintf(buf, sizeof(buf), "RESP:%s:%s", command, status);
+  softSerialTX_println(buf);
 }
 
 // ============================================================================
 // DUAL OUTPUT SYSTEM FOR ESP32 MESSAGE RELAY
 // ============================================================================
 
-// Dual output functions to send messages to both Serial (USB) and Serial3 (ESP32)
+// Dual output functions to send messages to both Serial (USB) and Software TX (ESP32)
 void dual_print(const String& message) {
   Serial.print(message);
-  Serial3.print(message);
+  softSerialTX_print(message.c_str());
 }
 
 void dual_println(const String& message) {
   Serial.println(message);
-  Serial3.println(message);
+  softSerialTX_println(message.c_str());
 }
 
 void dual_printf(const char* format, ...) {
@@ -479,7 +525,7 @@ void dual_printf(const char* format, ...) {
   va_end(args);
   
   Serial.print(buffer);
-  Serial3.print(buffer);
+  softSerialTX_print(buffer);
 }
 
 // Auto calibration output: print locally only; do NOT send raw text to ESP32.
@@ -500,8 +546,9 @@ void auto_cal_printf(const char* format, ...) {
 
 void send_state_update() {
   const char* state_names[] = {"STOPPED", "STARTING", "RUNNING", "STOPPING", "ERROR"};
-  Serial3.printf("STATE:%s\n", state_names[current_state]);
-  Serial3.flush();
+  char buf[32];
+  snprintf(buf, sizeof(buf), "STATE:%s", state_names[current_state]);
+  softSerialTX_println(buf);
   state_changed = false;
 }
 
@@ -609,10 +656,11 @@ void handle_esp32_commands() {
       send_status_response("ZERO", "OK");
     }
     else if (command == "ZERO_STATUS") {
-      Serial3.printf("ZERO_STATUS:offsets_applied=%s,lc1=%ld,lc2=%ld,lc3=%ld,lc4=%ld\n", 
-                     offsets_applied ? "true" : "false",
-                     zero_offsets[0], zero_offsets[1], zero_offsets[2], zero_offsets[3]);
-      Serial3.flush();
+      char buf[128];
+      snprintf(buf, sizeof(buf), "ZERO_STATUS:offsets_applied=%s,lc1=%ld,lc2=%ld,lc3=%ld,lc4=%ld",
+               offsets_applied ? "true" : "false",
+               zero_offsets[0], zero_offsets[1], zero_offsets[2], zero_offsets[3]);
+      softSerialTX_println(buf);
       send_status_response("ZERO_STATUS", "OK");
     }
     else if (command == "ZERO_RESET") {
@@ -620,11 +668,12 @@ void handle_esp32_commands() {
       send_status_response("ZERO_RESET", "OK");
     }
     else if (command == "STATUS") {
-      const char* state_names[] = {"STOPPED", "STARTING", "RUNNING", "STOPPING", "ERROR"};
-      Serial3.printf("STATUS:state=%s,frames=%lu,offsets=%s\n", 
-                     state_names[current_state], (unsigned long)st.frames_sent,
-                     offsets_applied ? "applied" : "none");
-      Serial3.flush();
+      const char* state_names_arr[] = {"STOPPED", "STARTING", "RUNNING", "STOPPING", "ERROR"};
+      char buf[128];
+      snprintf(buf, sizeof(buf), "STATUS:state=%s,frames=%lu,offsets=%s",
+               state_names_arr[current_state], (unsigned long)st.frames_sent,
+               offsets_applied ? "applied" : "none");
+      softSerialTX_println(buf);
       send_status_response("STATUS", "OK");
     }
     else if (command == "CAL_START") {
@@ -713,8 +762,10 @@ void handle_esp32_commands() {
         int16_t cop_x_mm = cop_to_int16_mm(data.cop_x);
         int16_t cop_y_mm = cop_to_int16_mm(data.cop_y);
         
-        Serial3.printf("FORCE_DATA:%d,%d,%d,%d,%d\n",
-                       fz_10g, mx_scaled, my_scaled, cop_x_mm, cop_y_mm);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "FORCE_DATA:%d,%d,%d,%d,%d",
+                 fz_10g, mx_scaled, my_scaled, cop_x_mm, cop_y_mm);
+        softSerialTX_println(buf);
         send_status_response("CAL_FORCE_DATA", "OK");
       } else {
         send_status_response("CAL_FORCE_DATA", "ERROR");
@@ -730,8 +781,10 @@ void handle_esp32_commands() {
         int16_t cop_x_mm = cop_to_int16_mm(data.cop_x);
         int16_t cop_y_mm = cop_to_int16_mm(data.cop_y);
         
-        Serial3.printf("FORCE_INT16:%d,%d,%d,%d,%d\n",
-                       fz_10g, mx_scaled, my_scaled, cop_x_mm, cop_y_mm);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "FORCE_INT16:%d,%d,%d,%d,%d",
+                 fz_10g, mx_scaled, my_scaled, cop_x_mm, cop_y_mm);
+        softSerialTX_println(buf);
         send_status_response("CAL_FORCE_INT16", "OK");
       } else {
         send_status_response("CAL_FORCE_INT16", "ERROR");
@@ -822,9 +875,29 @@ void handle_esp32_commands() {
     }
     else if (command == "PING") {
       // Simple ping-pong test for communication chain verification
-      Serial3.println("PONG");
-      Serial3.flush();
-      Serial.println("[T41] PING received, responded with PONG");
+      Serial.println("[T41] PING received, sending PONG via Software TX (Pin 16)...");
+      Serial.printf("[T41] Software TX config: Pin=%d, Baud=%d, BitTime=%d us\n", 
+                    SOFT_TX_PIN, SOFT_TX_BAUD, SOFT_TX_BIT_TIME_US);
+      
+      // Verify pin is configured
+      pinMode(SOFT_TX_PIN, OUTPUT);
+      
+      // Send PONG using software serial TX on Pin 16
+      softSerialTX_println("PONG");
+      
+      Serial.println("[T41] PONG sent on Pin 16 at 9600 baud");
+    }
+    else if (command == "TX_TEST") {
+      // Continuous TX test - send data every 100ms for 5 seconds
+      Serial.println("[T41] Starting Software TX test on Pin 16 (5 seconds)...");
+      char buf[20];
+      for (int i = 0; i < 50; i++) {
+        sprintf(buf, "TX_TEST_%d", i);
+        softSerialTX_println(buf);
+        Serial.printf("[T41] Sent: %s\n", buf);
+        delay(100);
+      }
+      Serial.println("[T41] TX test complete");
     }
     else {
       send_status_response(command.c_str(), "ERROR");
@@ -1355,9 +1428,13 @@ void setup() {
   SPI1.begin();
   Serial.println("[T41] SPI1 Master initialized");
   
-  // Initialize Serial3 for ESP32 command interface
-  Serial3.begin(115200);
-  Serial.println("[T41] Serial3 initialized for ESP32 commands (TX=Pin34, RX=Pin35)");
+  // Initialize Serial3 for ESP32 command interface (RX only - Pin 15)
+  Serial3.begin(9600);  // Lower baud rate for reliable software TX
+  Serial.println("[T41] Serial3 RX initialized (Pin 15) at 9600 baud");
+  
+  // Initialize Software Serial TX on Pin 16 (PCB fixed wiring)
+  softSerialTX_init();
+  Serial.println("[T41] Software TX initialized (Pin 16) for ESP32 responses");
 
   // Initialize sample buffer
   memset(sample_buffer, 0, sizeof(sample_buffer));

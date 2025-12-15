@@ -181,29 +181,9 @@ static inline void process_uart_packet(const UartPacket* packet) {
 // ============================================================================
 
 static void forward_command_to_rx_radio(String command) {
-    // Special formatting for PING commands
-    bool is_local_ping = (command == "LOCAL_PING");
-    bool is_remote_ping = (command == "REMOTE_PING");
-    bool is_ping = (is_local_ping || is_remote_ping);
+    bool is_ping = (command == "LOCAL_PING" || command == "REMOTE_PING");
     
-    if (is_ping) {
-        Serial.println("\n╔════════════════════════════════════════════════════════════════╗");
-        if (is_local_ping) {
-            Serial.println("║              LOCAL PING-PONG TEST                              ║");
-        } else {
-            Serial.println("║              REMOTE PING-PONG TEST                             ║");
-        }
-        Serial.println("╚════════════════════════════════════════════════════════════════╝");
-        Serial.printf("  📤 SENDING: %s\n", command.c_str());
-        if (is_local_ping) {
-            Serial.println("  Path: BLE Slave → RX Radio → Local Teensy");
-        } else {
-            Serial.println("  Path: BLE Slave → RX Radio → SPI Slave → Remote Teensy");
-        }
-        Serial.println("  ──────────────────────────────────────────────────────────────");
-    } else {
-        Serial.printf("[BLE_SLAVE] Forwarding '%s' to ESP32 RX Radio...\n", command.c_str());
-    }
+    Serial.printf("[BLE_SLAVE] Forwarding '%s' to RX Radio...\n", command.c_str());
     
     // Clear previous response
     if (command_response_mutex != NULL && xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -240,35 +220,19 @@ static void forward_command_to_rx_radio(String command) {
     
     if (got_response) {
         if (is_ping) {
-            String source_indicator = "UNKNOWN";
             String actual_response = response_text;
-            
             if (response_text.startsWith("LOCAL:")) {
-                source_indicator = "🟢 LOCAL TEENSY";
                 actual_response = response_text.substring(6);
             } else if (response_text.startsWith("REMOTE:")) {
-                source_indicator = "🔵 REMOTE TEENSY";
                 actual_response = response_text.substring(7);
             }
-            
-            Serial.printf("  📥 RECEIVED: %s (from %s)\n", actual_response.c_str(), source_indicator.c_str());
-            Serial.printf("  ⏱️  Round-trip time: %lu ms\n", round_trip_ms);
-            Serial.println("  ──────────────────────────────────────────────────────────────");
-            Serial.println("  ✅ PING-PONG TEST SUCCESS!");
-            Serial.println("╚════════════════════════════════════════════════════════════════╝\n");
+            Serial.printf("[BLE_SLAVE] ✓ PONG received: '%s' (%lu ms)\n", actual_response.c_str(), round_trip_ms);
         } else {
             Serial.printf("[BLE_SLAVE] Response: %s\n", response_text.c_str());
         }
         command_responses_received++;
     } else {
-        if (is_ping) {
-            Serial.printf("  ⏱️  Timeout after: %lu ms\n", round_trip_ms);
-            Serial.println("  ──────────────────────────────────────────────────────────────");
-            Serial.println("  ❌ PING-PONG TEST FAILED - No response received");
-            Serial.println("╚════════════════════════════════════════════════════════════════╝\n");
-        } else {
-            Serial.println("[BLE_SLAVE] ⚠ No response from ESP32 RX Radio");
-        }
+        Serial.printf("[BLE_SLAVE] ✗ TIMEOUT after %lu ms\n", round_trip_ms);
         command_timeouts++;
     }
 }
@@ -614,57 +578,25 @@ static void show_detailed_stats() {
     unsigned long uptime_min = uptime_sec / 60;
     unsigned long uptime_hrs = uptime_min / 60;
     
-    Serial.println("\n╔══════════════════════════════════════════════════════════════════════════════╗");
-    Serial.println("║                              📊 SYSTEM STATISTICS                            ║");
-    Serial.println("╠══════════════════════════════════════════════════════════════════════════════╣");
-    
-    Serial.printf("║  ⏱️  Uptime: %02lu:%02lu:%02lu                                                        ║\n",
-                 uptime_hrs, uptime_min % 60, uptime_sec % 60);
-    Serial.println("║                                                                              ║");
-    
-    Serial.println("║  📡 UART Statistics                                                         ║");
-    Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
-    Serial.printf("║    Packets received:     %-12lu                                       ║\n", uart_packets_received);
-    Serial.printf("║    Bytes received:       %-12lu                                       ║\n", uart_bytes_received);
-    Serial.printf("║    CRC errors:           %-12lu                                       ║\n", uart_crc_errors);
-    Serial.printf("║    Sync errors:          %-12lu                                       ║\n", uart_sync_errors);
-    Serial.println("║                                                                              ║");
-    
-    Serial.println("║  📦 Sample Statistics                                                       ║");
-    Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
-    Serial.printf("║    Local samples:        %-12lu                                       ║\n", local_samples_received);
-    Serial.printf("║    Remote samples:       %-12lu                                       ║\n", remote_samples_received);
-    Serial.printf("║    Timer samples:        %-12lu                                       ║\n", timer_samples_generated);
-    Serial.printf("║    Samples batched:      %-12lu                                       ║\n", samples_batched);
-    Serial.println("║                                                                              ║");
-    
-    Serial.println("║  📶 BLE Statistics                                                          ║");
-    Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
-    Serial.printf("║    Connection:           %-12s                                       ║\n", deviceConnected ? "CONNECTED" : "DISCONNECTED");
-    Serial.printf("║    Notifications sent:   %-12lu                                       ║\n", ble_notifications_sent);
-    Serial.printf("║    Packets sent:         %-12lu                                       ║\n", ble_packets_sent);
-    Serial.printf("║    Send errors:          %-12lu                                       ║\n", ble_send_errors);
-    Serial.println("║                                                                              ║");
-    
-    Serial.println("║  🎮 Command Statistics                                                      ║");
-    Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
-    Serial.printf("║    BLE commands recv:    %-12lu                                       ║\n", ble_commands_received);
-    Serial.printf("║    BLE command errors:   %-12lu                                       ║\n", ble_command_errors);
-    Serial.printf("║    Commands forwarded:   %-12lu                                       ║\n", commands_forwarded);
-    Serial.printf("║    Responses received:   %-12lu                                       ║\n", command_responses_received);
-    Serial.printf("║    Command timeouts:     %-12lu                                       ║\n", command_timeouts);
-    Serial.println("║                                                                              ║");
-    
-    Serial.println("║  📋 Queue Status                                                            ║");
-    Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
-    Serial.printf("║    Local queue:          %d / %d                                            ║\n", data_store.local_count, QUEUE_SIZE);
-    Serial.printf("║    Remote queue:         %d / %d                                            ║\n", data_store.remote_count, QUEUE_SIZE);
-    Serial.printf("║    Current batch:        %d / %d                                            ║\n", current_sample_count, SAMPLES_PER_BLE_PACKET);
-    Serial.println("║                                                                              ║");
-    
-    Serial.printf("║    Free heap:            %-12lu bytes                                 ║\n", ESP.getFreeHeap());
-    
-    Serial.println("╚══════════════════════════════════════════════════════════════════════════════╝\n");
+    Serial.println("\n[BLE_SLAVE] === SYSTEM STATISTICS ===");
+    Serial.printf("  Uptime: %02lu:%02lu:%02lu\n", uptime_hrs, uptime_min % 60, uptime_sec % 60);
+    Serial.println("  --- UART ---");
+    Serial.printf("  Packets: %lu (%lu bytes), CRC errors: %lu, Sync errors: %lu\n", 
+                 uart_packets_received, uart_bytes_received, uart_crc_errors, uart_sync_errors);
+    Serial.println("  --- Samples ---");
+    Serial.printf("  Local: %lu | Remote: %lu | Timer: %lu | Batched: %lu\n", 
+                 local_samples_received, remote_samples_received, timer_samples_generated, samples_batched);
+    Serial.println("  --- BLE ---");
+    Serial.printf("  Status: %s | Notifications: %lu | Packets: %lu | Errors: %lu\n", 
+                 deviceConnected ? "CONNECTED" : "DISCONNECTED", ble_notifications_sent, ble_packets_sent, ble_send_errors);
+    Serial.println("  --- Commands ---");
+    Serial.printf("  BLE cmds: %lu | Forwarded: %lu | Responses: %lu | Timeouts: %lu\n", 
+                 ble_commands_received, commands_forwarded, command_responses_received, command_timeouts);
+    Serial.println("  --- Queues ---");
+    Serial.printf("  Local: %d/%d | Remote: %d/%d | Batch: %d/%d | Heap: %lu bytes\n", 
+                 data_store.local_count, QUEUE_SIZE, data_store.remote_count, QUEUE_SIZE, 
+                 current_sample_count, SAMPLES_PER_BLE_PACKET, ESP.getFreeHeap());
+    Serial.println("=====================================\n");
 }
 
 static void reset_all_stats() {
@@ -718,44 +650,12 @@ static void handle_serial_commands() {
             reset_all_stats();
         }
         else if (command == "HELP") {
-            Serial.println("\n");
-            Serial.println("╔══════════════════════════════════════════════════════════════════════════════╗");
-            Serial.println("║                              📖 AVAILABLE COMMANDS                          ║");
-            Serial.println("╠══════════════════════════════════════════════════════════════════════════════╣");
-            Serial.println("║                                                                              ║");
-            Serial.println("║  🟢 LOCAL TEENSY CONTROL                                                    ║");
-            Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
-            Serial.println("║  • START             - Start local force plate data collection              ║");
-            Serial.println("║  • STOP              - Stop local force plate data collection               ║");
-            Serial.println("║  • RESTART           - Restart local force plate data collection            ║");
-            Serial.println("║  • RESET             - Reset the local force plate system                   ║");
-            Serial.println("║                                                                              ║");
-            Serial.println("║  🔵 REMOTE TEENSY CONTROL                                                   ║");
-            Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
-            Serial.println("║  • REMOTE_START      - Start remote force plate data collection             ║");
-            Serial.println("║  • REMOTE_STOP       - Stop remote force plate data collection              ║");
-            Serial.println("║  • REMOTE_RESTART    - Restart remote force plate data collection           ║");
-            Serial.println("║  • REMOTE_RESET      - Reset the remote force plate system                  ║");
-            Serial.println("║                                                                              ║");
-            Serial.println("║  🔄 DUAL CONTROL (Both Plates)                                              ║");
-            Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
-            Serial.println("║  • ALL_START         - Start both force plates                              ║");
-            Serial.println("║  • ALL_STOP          - Stop both force plates                               ║");
-            Serial.println("║  • ALL_RESTART       - Restart both force plates                            ║");
-            Serial.println("║  • ALL_RESET         - Reset both force plate systems                       ║");
-            Serial.println("║                                                                              ║");
-            Serial.println("║  🔍 TESTING                                                                 ║");
-            Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
-            Serial.println("║  • LOCAL_PING        - Test connection to local force plate                 ║");
-            Serial.println("║  • REMOTE_PING       - Test connection to remote force plate                ║");
-            Serial.println("║                                                                              ║");
-            Serial.println("║  📊 STATISTICS                                                              ║");
-            Serial.println("║  ────────────────────────────────────────────────────────────────────────  ║");
-            Serial.println("║  • STATS             - Show detailed system statistics                      ║");
-            Serial.println("║  • RESET_STATS       - Reset all statistics counters                        ║");
-            Serial.println("║                                                                              ║");
-            Serial.println("╚══════════════════════════════════════════════════════════════════════════════╝");
-            Serial.println();
+            Serial.println("\n[BLE_SLAVE] === AVAILABLE COMMANDS ===");
+            Serial.println("  Local:  START, STOP, RESTART, RESET, LOCAL_PING");
+            Serial.println("  Remote: REMOTE_START/STOP/RESTART/RESET, REMOTE_PING");
+            Serial.println("  Both:   ALL_START/STOP/RESTART/RESET");
+            Serial.println("  Stats:  STATS, RESET_STATS");
+            Serial.println("=====================================\n");
         } else {
             Serial.printf("[BLE_SLAVE] ✗ Unknown command: '%s'\n", command.c_str());
             Serial.println("[BLE_SLAVE] Type 'HELP' for available commands");
@@ -776,17 +676,8 @@ void setup() {
         Serial.println("[BLE_SLAVE] ⚠ Failed to create mutex!");
     }
     
-    Serial.println("ESP32 BLE Slave - Load Cell Data Forwarder + Command Gateway");
-    Serial.println("=== BLE COMMAND INTERFACE ===");
-    Serial.println("BLE Service: 12345678-1234-1234-1234-123456789abc");
-    Serial.println("Data (Notify): 87654321-4321-4321-4321-cba987654321");
-    Serial.println("Command (Write): 11111111-2222-3333-4444-555555555555");
-    Serial.println();
-    Serial.println("Commands: START, STOP, RESTART, RESET");
-    Serial.println("          REMOTE_START, REMOTE_STOP, REMOTE_RESTART, REMOTE_RESET");
-    Serial.println("          ALL_START, ALL_STOP, ALL_RESTART, ALL_RESET");
-    Serial.println("          LOCAL_PING, REMOTE_PING, STATS, RESET_STATS, HELP");
-    Serial.println("==============================");
+    Serial.println("\n[BLE_SLAVE] ESP32 BLE Slave - Load Cell Data Forwarder");
+    Serial.println("[BLE_SLAVE] BLE Service: 12345678-1234-1234-1234-123456789abc");
     
     // Initialize UART2
     Serial2.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
@@ -822,7 +713,7 @@ void setup() {
     pAdvertising->setMinPreferred(0x0);
     BLEDevice::startAdvertising();
     
-    Serial.println("BLE server started, waiting for connections...");
+    Serial.println("[BLE_SLAVE] BLE server started, waiting for connections...");
     
     // Initialize hardware timer for 1000Hz sampling
     sampling_timer = timerBegin(1000000);
@@ -834,7 +725,7 @@ void setup() {
     xTaskCreatePinnedToCore(timer_processing_task, "timer_proc", 4096, NULL, 24, NULL, 1);
     xTaskCreatePinnedToCore(ble_tx_task, "ble_tx", 4096, NULL, 22, NULL, 1);
     
-    Serial.println("System ready");
+    Serial.println("[BLE_SLAVE] ✓ System ready (type HELP for commands)");
 }
 
 // ============================================================================
