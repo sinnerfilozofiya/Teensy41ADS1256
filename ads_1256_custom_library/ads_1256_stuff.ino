@@ -9,8 +9,16 @@
 //https://github.com/adienakhmad/ADS1256
 
 
+// DRDY interrupt can cause hard-fault resets if the pin is floating/noisy or during early init.
+// Default to polling DRDY pin for maximum robustness on Teensy 4.1.
+#ifndef USE_DRDY_INTERRUPT
+#define USE_DRDY_INTERRUPT 0
+#endif
+
 void initADS() {
+#if USE_DRDY_INTERRUPT
   attachInterrupt(ADS_RDY_PIN, DRDY_Interuppt, FALLING);
+#endif
 
   digitalWrite(ADS_RST_PIN, LOW);
   delay(10); // LOW at least 4 clock cycles of onboard clock. 100 microsecons is enough
@@ -616,24 +624,37 @@ void read_four_values() {
 
 //library files
 
-volatile int DRDY_state = HIGH;
-
+// Wait for ADS1256 DRDY to go LOW (data ready).
+// Polling mode (default) avoids interrupt-related hard faults/resets.
 void waitforDRDY() {
-  while (DRDY_state) {
-    continue;
-  }
+#if USE_DRDY_INTERRUPT
+  extern volatile int DRDY_state;
+  while (DRDY_state) { /* spin */ }
   noInterrupts();
   DRDY_state = HIGH;
   interrupts();
+#else
+  // Poll with a safety timeout to avoid lockups if DRDY isn't wired/working.
+  const uint32_t t0 = millis();
+  while (digitalReadFast(ADS_RDY_PIN) != LOW) {
+    if ((millis() - t0) > 100) break; // 100ms timeout
+  }
+#endif
 }
 
-//Interrupt function
+#if USE_DRDY_INTERRUPT
+volatile int DRDY_state = HIGH;
+// Interrupt function
 void DRDY_Interuppt() {
   DRDY_state = LOW;
 }
+#endif
 
 long GetRegisterValue(uint8_t regAdress) {
   uint8_t bufr;
+  // NOTE: This function previously called SPI.endTransaction() without a matching beginTransaction(),
+  // which can corrupt SPI internals and lead to hard-fault resets on Teensy 4.1.
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE1));
   digitalWriteFast(ADS_CS_PIN, LOW);
   delayMicroseconds(10);
   SPI.transfer(RREG | regAdress); // send 1st command byte, address of the register

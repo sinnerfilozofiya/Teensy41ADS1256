@@ -1,0 +1,345 @@
+#include "calibration_regression.h"
+
+#include <EEPROM.h>
+#include <math.h>
+
+// External ADC read helpers from existing sketch
+extern int32_t read_single_channel_fast(uint8_t channel);
+extern int32_t get_filtered_load_cell_reading(uint8_t channel);
+
+// ---------------- Storage ----------------
+static const uint32_t CAL_MAGIC   = 0xCA1BCA1Bu;
+static const uint16_t CAL_VERSION = 0x0003u; // per-cell regression (no total fit)
+static const int      CAL_EEPROM_ADDR = 0;
+
+// Keep everything fixed-size: no heap allocations.
+static const uint8_t CAL_MAX_POINTS = 10;
+
+struct CalPoint {
+  // x: counts delta (sum or channel), y: 10g units
+  float x_counts;
+  float y_10g;
+};
+
+struct CalBlob {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+
+  int32_t offsets[CHANNELS];   // tare offsets in counts
+
+  // Per-channel scale only: y = a*x, x is |delta_counts[ch]|
+  float ch_a_10g_per_count[CHANNELS];
+
+  uint8_t points_ch_n[CHANNELS];
+#if (CHANNELS % 4) != 0
+  uint8_t _pad_ch_n[4 - (CHANNELS % 4)];
+#else
+  uint8_t _pad_ch_n[0];
+#endif
+  CalPoint points_ch[CHANNELS][CAL_MAX_POINTS];
+
+  uint32_t crc32;
+};
+
+static_assert((offsetof(CalBlob, points_ch) % 4) == 0, "points_ch must be 4-byte aligned");
+
+static CalBlob g_cal;
+static bool g_loaded = false;
+static bool g_dirty = false;
+
+static uint32_t crc32_sw(const uint8_t* data, size_t len) {
+  uint32_t crc = 0xFFFFFFFFu;
+  while (len--) {
+    crc ^= *data++;
+    for (uint8_t i = 0; i < 8; i++) {
+      uint32_t mask = -(crc & 1u);
+      crc = (crc >> 1) ^ (0xEDB88320u & mask);
+    }
+  }
+  return ~crc;
+}
+
+static uint32_t cal_crc(const CalBlob& c) {
+  return crc32_sw((const uint8_t*)&c, sizeof(CalBlob) - sizeof(uint32_t));
+}
+
+static void cal_defaults() {
+  memset(&g_cal, 0, sizeof(g_cal));
+  g_cal.magic = CAL_MAGIC;
+  g_cal.version = CAL_VERSION;
+  g_cal.reserved = 0;
+  for (int i = 0; i < CHANNELS; i++) g_cal.offsets[i] = 0;
+
+  for (int i = 0; i < CHANNELS; i++) {
+    g_cal.ch_a_10g_per_count[i] = 0.0f;
+    g_cal.points_ch_n[i] = 0;
+  }
+  g_cal.crc32 = cal_crc(g_cal);
+}
+
+static bool cal_load_internal() {
+  EEPROM.get(CAL_EEPROM_ADDR, g_cal);
+  if (g_cal.magic != CAL_MAGIC || g_cal.version != CAL_VERSION) {
+    cal_defaults();
+    g_loaded = true;
+    return false;
+  }
+  const uint32_t expect = cal_crc(g_cal);
+  if (expect != g_cal.crc32) {
+    cal_defaults();
+    g_loaded = true;
+    return false;
+  }
+  g_loaded = true;
+  return true;
+}
+
+static bool cal_save_internal() {
+  if (!g_loaded) cal_load_internal();
+  g_cal.crc32 = cal_crc(g_cal);
+  // Write byte-wise with yields to avoid long blocking flash writes that can look like a reset.
+  const uint8_t* src = (const uint8_t*)&g_cal;
+  for (unsigned i = 0; i < sizeof(CalBlob); i++) {
+    EEPROM.update(CAL_EEPROM_ADDR + (int)i, src[i]);
+    if ((i & 0x3F) == 0) yield();
+  }
+  g_dirty = false;
+  return true;
+}
+
+bool cal_init_load() {
+  return cal_load_internal();
+}
+
+bool cal_clear() {
+  cal_defaults();
+  g_loaded = true;
+  g_dirty = true;
+  return cal_save_internal();
+}
+
+// ---------------- Sampling helpers ----------------
+struct CaptureStats {
+  int32_t mean[CHANNELS];
+  float stddev[CHANNELS];
+  uint32_t n;
+};
+
+static int32_t read_counts(uint8_t ch, bool use_filtered) {
+  return use_filtered ? get_filtered_load_cell_reading(ch) : read_single_channel_fast(ch);
+}
+
+static bool capture_window(uint32_t window_ms, bool use_filtered, CaptureStats* out) {
+  if (!out) return false;
+  memset(out, 0, sizeof(*out));
+
+  double mean[CHANNELS] = {0,0,0,0};
+  double m2[CHANNELS]   = {0,0,0,0};
+  uint32_t n = 0;
+
+  const uint32_t t0 = millis();
+  while ((millis() - t0) < window_ms) {
+    n++;
+    for (uint8_t ch = 0; ch < CHANNELS; ch++) {
+      const double x = (double)read_counts(ch, use_filtered);
+      const double d = x - mean[ch];
+      mean[ch] += d / (double)n;
+      const double d2 = x - mean[ch];
+      m2[ch] += d * d2;
+    }
+    delayMicroseconds(300);
+    yield();
+  }
+
+  out->n = n;
+  for (uint8_t ch = 0; ch < CHANNELS; ch++) {
+    out->mean[ch] = (int32_t)llround(mean[ch]);
+    const double var = (n > 1) ? (m2[ch] / (double)(n - 1)) : 0.0;
+    out->stddev[ch] = (float)sqrt(var);
+  }
+  return (n > 5);
+}
+
+bool cal_tare(uint32_t window_ms, bool use_filtered) {
+  if (!g_loaded) cal_load_internal();
+
+  const uint8_t trials = 3;
+  float best = 1e30f;
+  CaptureStats best_s = {};
+  bool ok = false;
+
+  for (uint8_t i = 0; i < trials; i++) {
+    CaptureStats s;
+    if (!capture_window(window_ms, use_filtered, &s)) continue;
+    ok = true;
+    float score = 0.0f;
+    for (int ch = 0; ch < CHANNELS; ch++) score += s.stddev[ch];
+    if (score < best) { best = score; best_s = s; }
+    delay(20);
+    yield();
+  }
+  if (!ok) return false;
+  if (!(best < 20000.0f)) {
+    Serial.printf("[CAL] TARE rejected: unstable (sum_std=%.1f)\n", (double)best);
+    return false;
+  }
+  for (int ch = 0; ch < CHANNELS; ch++) g_cal.offsets[ch] = best_s.mean[ch];
+  g_dirty = true;
+  return cal_save_internal();
+}
+
+// ---------------- Regression ----------------
+static bool fit_through_zero(const CalPoint* pts, uint8_t n, float* out_a) {
+  // Enforce no intercept: y = a*x (so mass is 0 when delta_counts is 0)
+  if (!out_a) return false;
+  if (n < 1) return false;
+
+  double sxx = 0.0;
+  double sxy = 0.0;
+  for (uint8_t i = 0; i < n; i++) {
+    const double x = pts[i].x_counts;
+    const double y = pts[i].y_10g;
+    sxx += x * x;
+    sxy += x * y;
+  }
+  if (sxx < 1e-9) return false;
+  const double a = sxy / sxx;
+  if (!isfinite(a)) return false;
+  *out_a = (float)a;
+  return true;
+}
+
+bool cal_add_point_total(float known_kg, uint32_t window_ms, bool use_filtered) {
+  if (!g_loaded) cal_load_internal();
+  if (known_kg <= 0.0f) return false;
+
+  CaptureStats s;
+  if (!capture_window(window_ms, use_filtered, &s)) return false;
+
+  // Compute per-cell deltas and distribute known TOTAL load across cells by contribution.
+  double delta[CHANNELS] = {0,0,0,0};
+  double sum_delta = 0.0;
+  for (int ch = 0; ch < CHANNELS; ch++) {
+    const double d = (double)s.mean[ch] - (double)g_cal.offsets[ch];
+    const double ad = fabs(d);
+
+    // Skip saturated channels (ADS1256 rails) to avoid corrupting calibration points.
+    // 0x7FFFFF is full-scale max; 0x800000 is min (signed 24-bit).
+    if (s.mean[ch] >= 0x7FFFF0 || s.mean[ch] <= -0x7FFF00) {
+      delta[ch] = 0.0;
+      continue;
+    }
+
+    delta[ch] = ad;
+    sum_delta += ad;
+  }
+  if (sum_delta < 1.0) return false;
+
+  const float total_y10g = known_kg * 100.0f;
+  for (int ch = 0; ch < CHANNELS; ch++) {
+    if (delta[ch] <= 0.0) continue;
+    if (g_cal.points_ch_n[ch] >= CAL_MAX_POINTS) continue;
+    const float y10g_ch = total_y10g * (float)(delta[ch] / sum_delta);
+    g_cal.points_ch[ch][g_cal.points_ch_n[ch]++] = CalPoint{ (float)delta[ch], y10g_ch };
+  }
+
+  g_dirty = true;
+  // Do NOT EEPROM-write on every ADD; keep points in RAM and persist on FIT to reduce flash activity.
+  return true;
+}
+
+bool cal_add_point_channel(uint8_t ch, float known_kg, uint32_t window_ms, bool use_filtered) {
+  if (!g_loaded) cal_load_internal();
+  if (ch >= CHANNELS) return false;
+  if (known_kg <= 0.0f) return false;
+  if (g_cal.points_ch_n[ch] >= CAL_MAX_POINTS) return false;
+
+  CaptureStats s;
+  if (!capture_window(window_ms, use_filtered, &s)) return false;
+
+  const double d = (double)s.mean[ch] - (double)g_cal.offsets[ch];
+  if (fabs(d) < 1.0) return false;
+
+  const float y10g = known_kg * 100.0f;
+  g_cal.points_ch[ch][g_cal.points_ch_n[ch]++] = CalPoint{ (float)d, y10g };
+  g_dirty = true;
+  return true;
+}
+
+bool cal_fit_and_save() {
+  if (!g_loaded) cal_load_internal();
+
+  bool any = false;
+  for (int ch = 0; ch < CHANNELS; ch++) {
+    const uint8_t n = g_cal.points_ch_n[ch];
+    if (n < 1) continue;
+    float a = 0.0f;
+    if (!fit_through_zero(g_cal.points_ch[ch], n, &a)) continue;
+    g_cal.ch_a_10g_per_count[ch] = a;
+    any = true;
+  }
+  if (!any) return false;
+
+  g_dirty = true;
+  return cal_save_internal();
+}
+
+static int32_t apply_line(float a, float b, float x) {
+  const float y = a * x + b;
+  return (int32_t)lroundf(y);
+}
+
+int32_t cal_read_cell_10g_units(uint8_t ch, bool use_filtered) {
+  if (!g_loaded) cal_load_internal();
+  if (ch >= CHANNELS) return 0;
+
+  const int32_t counts = read_counts(ch, use_filtered);
+  const float dx = (float)fabs((double)((int32_t)(counts - g_cal.offsets[ch])));
+
+  const float a = g_cal.ch_a_10g_per_count[ch];
+  if (a == 0.0f) return 0;
+  return (int32_t)lroundf(a * dx);
+}
+
+int32_t cal_read_total_10g_units(bool use_filtered) {
+  if (!g_loaded) cal_load_internal();
+
+  int32_t total = 0;
+  for (int ch = 0; ch < CHANNELS; ch++) total += cal_read_cell_10g_units((uint8_t)ch, use_filtered);
+  return total;
+}
+
+void cal_print_status() {
+  if (!g_loaded) cal_load_internal();
+  Serial.println("[CAL] ===== Calibration regression v2 =====");
+  for (int ch = 0; ch < CHANNELS; ch++) {
+    Serial.printf("[CAL] LC%d offset=%ld ch_fit(a=%.9f) points=%u\n",
+                  ch+1, (long)g_cal.offsets[ch],
+                  (double)g_cal.ch_a_10g_per_count[ch],
+                  (unsigned)g_cal.points_ch_n[ch]);
+  }
+  Serial.println("[CAL] Units: 10g (0.01kg). 1kg = 100 units.");
+}
+
+void cal_print_points() {
+  if (!g_loaded) cal_load_internal();
+  for (int ch = 0; ch < CHANNELS; ch++) {
+    Serial.printf("[CAL] Points (LC%d):\n", ch+1);
+    for (uint8_t i = 0; i < g_cal.points_ch_n[ch]; i++) {
+      Serial.printf("[CAL]  #%u x_counts=%.1f y_10g=%.1f\n",
+                    (unsigned)i, (double)g_cal.points_ch[ch][i].x_counts, (double)g_cal.points_ch[ch][i].y_10g);
+    }
+  }
+}
+
+void cal_print_reading(bool use_filtered) {
+  for (int ch = 0; ch < CHANNELS; ch++) {
+    const int32_t u = cal_read_cell_10g_units((uint8_t)ch, use_filtered);
+    Serial.printf("[CAL] LC%d=%ld (10g units)\n", ch + 1, (long)u);
+  }
+  const int32_t tot = cal_read_total_10g_units(use_filtered);
+  Serial.printf("[CAL] TOTAL=%ld (10g units)\n", (long)tot);
+}
+
+

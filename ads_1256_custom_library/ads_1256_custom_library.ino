@@ -1,5 +1,6 @@
 #include <SPI.h>
 #include <math.h>
+#include "calibration_regression.h"
 
 // Include ADS1256 constants first
 // (These are defined in the ads1256_constants.ino tab)
@@ -98,6 +99,8 @@ int32_t val4;  // Load cell 4 (AIN6-AIN7)
 void initADS();
 void SendCMD(uint8_t cmd);
 int32_t read_single_channel_fast(uint8_t channel);
+
+// Calibration regression v2 (in calibration_regression.cpp/.h)
 
 // ADS1256 constants (in case they're not loaded yet from constants tab)
 #ifndef SELFCAL
@@ -634,6 +637,53 @@ void handle_serial_monitor_commands() {
       }
       Serial.println("[T41] TX test complete");
     }
+    // ========== CALIBRATION (REGRESSION v2, TEENSY-ONLY) ==========
+    else if (command == "CAL SHOW") {
+      cal_print_status();
+    }
+    else if (command == "CAL POINTS") {
+      cal_print_points();
+    }
+    else if (command == "CAL READ") {
+      cal_print_reading(true);
+    }
+    else if (command == "CAL READ RAW") {
+      cal_print_reading(false);
+    }
+    else if (command == "CAL TARE") {
+      Serial.println("[CAL] TARE: remove all load and keep still...");
+      bool ok = cal_tare(600, true);
+      Serial.println(ok ? "[CAL] TARE OK" : "[CAL] TARE ERROR");
+    }
+    else if (command.startsWith("CAL ADD ")) {
+      // Format: CAL ADD <kg>
+      float kg = command.substring(8).toFloat();
+      Serial.printf("[CAL] ADD(TOTAL): apply %.3f kg and keep still...\n", (double)kg);
+      bool ok = cal_add_point_total(kg, 800, true);
+      Serial.println(ok ? "[CAL] ADD OK" : "[CAL] ADD ERROR");
+    }
+    else if (command.startsWith("CAL ADD_CH ")) {
+      // Format: CAL ADD_CH <ch> <kg>
+      // Example: CAL ADD_CH 1 10
+      int sp1 = command.indexOf(' ', 11);
+      if (sp1 > 0) {
+        int ch = command.substring(11, sp1).toInt();
+        float kg = command.substring(sp1 + 1).toFloat();
+        Serial.printf("[CAL] ADD(LC%d): apply %.3f kg mostly on that cell and keep still...\n", ch, (double)kg);
+        bool ok = cal_add_point_channel((uint8_t)(ch - 1), kg, 800, true);
+        Serial.println(ok ? "[CAL] ADD_CH OK" : "[CAL] ADD_CH ERROR");
+      } else {
+        Serial.println("[CAL] ADD_CH ERROR (usage: CAL ADD_CH <1-4> <kg>)");
+      }
+    }
+    else if (command == "CAL FIT") {
+      bool ok = cal_fit_and_save();
+      Serial.println(ok ? "[CAL] FIT OK" : "[CAL] FIT ERROR");
+    }
+    else if (command == "CAL CLEAR") {
+      bool ok = cal_clear();
+      Serial.println(ok ? "[CAL] CLEAR OK" : "[CAL] CLEAR ERROR");
+    }
     else if (command == "HELP") {
       Serial.println("[T41] === COMMANDS ===");
       Serial.println("[T41] Data: START, STOP, RESTART, RESET, STATUS");
@@ -641,6 +691,8 @@ void handle_serial_monitor_commands() {
       Serial.println("[T41] Presets: FILTER_REALTIME/HIGH_QUALITY/LOW_NOISE/GAUSSIAN");
       Serial.println("[T41] Config: FILTER_TYPE <0-7>, OUTLIER_METHOD <0-4>, GAUSSIAN_SIGMA <0.1-5>");
       Serial.println("[T41] Debug: SHOW_FILTERED, PING, TX_TEST");
+      Serial.println("[T41] Cal: CAL SHOW, CAL POINTS, CAL READ, CAL READ RAW, CAL TARE");
+      Serial.println("[T41]      CAL ADD <kg>, CAL ADD_CH <1-4> <kg>, CAL FIT, CAL CLEAR");
     }
     else if (command == "") {
       // Empty command, do nothing
@@ -719,6 +771,10 @@ void setup() {
   set_realtime_filtering();  // Start with real-time preset
   enable_filtering(true);    // Enable filtering by default
   Serial.println("[T41] Noise filtering enabled (Real-time preset)");
+
+  // Load calibration (Teensy-only, does not affect frame output format)
+  bool cal_ok = cal_init_load();
+  Serial.printf("[CAL] EEPROM load: %s\n", cal_ok ? "OK" : "DEFAULTS");
   
   Serial.println("[T41] Ready - type HELP for commands");
   
