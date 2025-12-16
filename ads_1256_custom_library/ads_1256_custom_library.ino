@@ -660,7 +660,13 @@ void handle_serial_monitor_commands() {
       float kg = command.substring(8).toFloat();
       Serial.printf("[CAL] ADD(TOTAL): apply %.3f kg and keep still...\n", (double)kg);
       bool ok = cal_add_point_total(kg, 800, true);
-      Serial.println(ok ? "[CAL] ADD OK" : "[CAL] ADD ERROR");
+      if (ok) {
+        Serial.println("[CAL] ADD OK -> auto-fitting...");
+        bool fit_ok = cal_fit_and_save();
+        Serial.println(fit_ok ? "[CAL] FIT OK" : "[CAL] FIT ERROR");
+      } else {
+        Serial.println("[CAL] ADD ERROR");
+      }
     }
     else if (command.startsWith("CAL ADD_CH ")) {
       // Format: CAL ADD_CH <ch> <kg>
@@ -671,7 +677,13 @@ void handle_serial_monitor_commands() {
         float kg = command.substring(sp1 + 1).toFloat();
         Serial.printf("[CAL] ADD(LC%d): apply %.3f kg mostly on that cell and keep still...\n", ch, (double)kg);
         bool ok = cal_add_point_channel((uint8_t)(ch - 1), kg, 800, true);
-        Serial.println(ok ? "[CAL] ADD_CH OK" : "[CAL] ADD_CH ERROR");
+        if (ok) {
+          Serial.println("[CAL] ADD_CH OK -> auto-fitting...");
+          bool fit_ok = cal_fit_and_save();
+          Serial.println(fit_ok ? "[CAL] FIT OK" : "[CAL] FIT ERROR");
+        } else {
+          Serial.println("[CAL] ADD_CH ERROR");
+        }
       } else {
         Serial.println("[CAL] ADD_CH ERROR (usage: CAL ADD_CH <1-4> <kg>)");
       }
