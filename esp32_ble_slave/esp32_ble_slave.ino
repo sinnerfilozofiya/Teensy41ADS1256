@@ -183,6 +183,9 @@ static inline void process_uart_packet(const UartPacket* packet) {
 static void forward_command_to_rx_radio(String command) {
     bool is_ping = (command == "LOCAL_PING" || command == "REMOTE_PING");
     
+    // Check if this is a calibration command (needs longer timeout)
+    bool is_cal_command = (command.startsWith("LOCAL_CAL_") || command.startsWith("REMOTE_CAL_"));
+    
     Serial.printf("[BLE_SLAVE] Forwarding '%s' to RX Radio...\n", command.c_str());
     
     // Clear previous response
@@ -197,8 +200,8 @@ static void forward_command_to_rx_radio(String command) {
     Serial2.flush();
     commands_forwarded++;
     
-    // Wait for response from ESP32 RX Radio
-    unsigned long timeout = millis() + 5000;
+    // Wait for response from ESP32 RX Radio (longer timeout for calibration commands)
+    unsigned long timeout = millis() + (is_cal_command ? 15000 : 5000);
     bool got_response = false;
     String response_text = "";
     
@@ -265,7 +268,8 @@ static void process_ble_command(String command) {
     if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
         command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
         command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET" ||
-        command == "LOCAL_PING" || command == "REMOTE_PING") {
+        command == "LOCAL_PING" || command == "REMOTE_PING" ||
+        command.startsWith("LOCAL_CAL_") || command.startsWith("REMOTE_CAL_")) {
         
         forward_command_to_rx_radio(command);
     } else {
@@ -484,23 +488,37 @@ static void uart_rx_task(void* param) {
             if (!sync_found) {
                 uint8_t byte = Serial2.peek();
                 
-                // Check for text message prefix
+                // Check for text message prefix (##REMOTE: or ##LOCAL:)
                 if (byte == '#') {
-                    String text_response = Serial2.readStringUntil('\n');
+                    Serial2.read(); // consume the '#'
                     
-                    if (text_response.startsWith("##")) {
-                        text_response = text_response.substring(2);
-                    } else if (text_response.startsWith("#")) {
-                        text_response = text_response.substring(1);
-                    }
-                    
-                    if (text_response.length() > 0) {
-                        Serial.printf("[BLE_SLAVE] Text response: %s\n", text_response.c_str());
+                    // Check if it's ## (double hash) for calibration responses
+                    if (Serial2.peek() == '#') {
+                        Serial2.read(); // consume second '#'
                         
-                        if (command_response_mutex != NULL && xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                            command_response_data = text_response;
-                            command_response_ready = true;
-                            xSemaphoreGive(command_response_mutex);
+                        // Read single-line response (format: "REMOTE:response" or "LOCAL:response")
+                        String text_response = Serial2.readStringUntil('\n');
+                        text_response.trim();
+                        
+                        if (text_response.length() > 0) {
+                            // Parse prefix and response
+                            String prefix = "";
+                            String response = text_response;
+                            int colon_pos = text_response.indexOf(':');
+                            if (colon_pos > 0 && colon_pos < 10) {
+                                prefix = text_response.substring(0, colon_pos);
+                                response = text_response.substring(colon_pos + 1);
+                            }
+                            
+                            // Display response
+                            Serial.printf("[%s] %s\n", prefix.c_str(), response.c_str());
+                            
+                            // Store for command response callback
+                            if (command_response_mutex != NULL && xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                                command_response_data = text_response;
+                                command_response_ready = true;
+                                xSemaphoreGive(command_response_mutex);
+                            }
                         }
                     }
                     bytes_received = 0;
@@ -639,7 +657,8 @@ static void handle_serial_commands() {
         if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
             command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
             command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET" ||
-            command == "LOCAL_PING" || command == "REMOTE_PING") {
+            command == "LOCAL_PING" || command == "REMOTE_PING" ||
+            command.startsWith("LOCAL_CAL_") || command.startsWith("REMOTE_CAL_")) {
             
             forward_command_to_rx_radio(command);
         }
@@ -654,6 +673,9 @@ static void handle_serial_commands() {
             Serial.println("  Local:  START, STOP, RESTART, RESET, LOCAL_PING");
             Serial.println("  Remote: REMOTE_START/STOP/RESTART/RESET, REMOTE_PING");
             Serial.println("  Both:   ALL_START/STOP/RESTART/RESET");
+            Serial.println("  Calibration:");
+            Serial.println("    LOCAL_CAL_SHOW, LOCAL_CAL_TARE, LOCAL_CAL_ADD_<kg>, LOCAL_CAL_CLEAR, etc.");
+            Serial.println("    REMOTE_CAL_SHOW, REMOTE_CAL_TARE, REMOTE_CAL_ADD_<kg>, REMOTE_CAL_CLEAR, etc.");
             Serial.println("  Stats:  STATS, RESET_STATS");
             Serial.println("=====================================\n");
         } else {

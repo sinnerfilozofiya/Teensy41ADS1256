@@ -36,4 +36,17 @@ void cal_print_status();
 void cal_print_points();
 void cal_print_reading(bool use_filtered = true);
 
+// Getters for ESP32 output (access calibration data)
+struct CalPoint {
+  float x_counts;
+  float y_10g;
+};
+struct CalStatus {
+  int32_t offsets[CHANNELS];
+  float ch_a_10g_per_count[CHANNELS];
+  uint8_t points_ch_n[CHANNELS];
+};
+void cal_get_status(CalStatus* out);
+bool cal_get_points(uint8_t ch, CalPoint* out_points, uint8_t max_points, uint8_t* out_count);
+
 

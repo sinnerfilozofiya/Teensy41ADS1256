@@ -35,20 +35,19 @@ from matplotlib.figure import Figure
 SERVICE_UUID       = "12345678-1234-1234-1234-123456789abc"
 DATA_CHAR_UUID     = "87654321-4321-4321-4321-cba987654321"  # Notify + Read
 COMMAND_CHAR_UUID  = "11111111-2222-3333-4444-555555555555"  # Write
-CALIBRATION_LOG_CHAR_UUID = "22222222-3333-4444-5555-666666666666"  # Notify + Read
+# Optional characteristic (older firmware used this). Current `esp32_ble_slave.ino`
+# does NOT create it, so we must not require it for connecting.
+CALIBRATION_LOG_CHAR_UUID: Optional[str] = None  # e.g. "22222222-3333-4444-5555-666666666666"
 
 DEFAULT_DEVICE_NAME = "LoadCell_BLE_Server"
 
-# ==== Command sets (from your doc) ====
+# ==== Command sets (matching current esp32_ble_slave.ino) ====
 COMMAND_GROUPS = {
     "Local": ["START", "STOP", "RESTART", "RESET"],
     "Remote": ["REMOTE_START", "REMOTE_STOP", "REMOTE_RESTART", "REMOTE_RESET"],
     "Dual": ["ALL_START", "ALL_STOP", "ALL_RESTART", "ALL_RESET"],
-    "Zero (Local)": ["ZERO", "ZERO_STATUS", "ZERO_RESET"],
-    "Zero (Remote)": ["REMOTE_ZERO", "REMOTE_ZERO_STATUS", "REMOTE_ZERO_RESET"],
-    "Zero (All)": ["ALL_ZERO", "ALL_ZERO_STATUS", "ALL_ZERO_RESET"],
-    "Calibration": ["LOCAL_AUTO_CAL", "REMOTE_AUTO_CAL", "CONTINUE", "SKIP", "ABORT", "CAL_STATUS", "CAL_SHOW_STEPS"],
-    "System": ["STATUS", "LOCAL_ON", "LOCAL_OFF", "REMOTE_ON", "REMOTE_OFF"],
+    "Ping": ["LOCAL_PING", "REMOTE_PING"],
+    "System": ["STATS", "RESET_STATS"],
 }
 
 CHANNEL_NAMES = ["L1", "L2", "L3", "L4", "R5", "R6", "R7", "R8"]
@@ -59,6 +58,9 @@ def parse_packet(data: bytes):
     if not data or len(data) < 1:
         return {"sample_count": 0, "samples": []}
     sample_count = data[0]
+    if sample_count > 10:
+        # Corrupt/partial packet; ignore.
+        return {"sample_count": 0, "samples": []}
     expected_len = 1 + sample_count * 16
     if len(data) < expected_len or sample_count == 0:
         return {"sample_count": 0, "samples": []}
@@ -80,6 +82,7 @@ class BLEWorker:
         self.ui_q = ui_q
         self.selected_address: Optional[str] = None
         self.packet_counter = 0
+        self._subscribed_notify_uuids = set()
 
     def send_ui(self, kind: str, payload):
         self.ui_q.put({"kind": kind, "payload": payload})
@@ -186,8 +189,36 @@ class BLEWorker:
         try:
             await self.client.connect()
             self.send_ui("status", f"Connected: {self.selected_address}")
-            await self.client.start_notify(DATA_CHAR_UUID, self._notification_handler)
-            await self.client.start_notify(CALIBRATION_LOG_CHAR_UUID, self._calibration_log_handler)
+            self._subscribed_notify_uuids.clear()
+
+            # Discover what this device actually exposes (important because the
+            # GUI used to assume extra characteristics that are not present now).
+            services = await self.client.get_services()
+            available = set()
+            try:
+                for svc in services:
+                    for ch in getattr(svc, "characteristics", []) or []:
+                        if getattr(ch, "uuid", None):
+                            available.add(ch.uuid.lower())
+            except Exception:
+                # If service parsing fails, we'll just attempt operations below.
+                available = set()
+
+            # Data notifications (required)
+            if not available or DATA_CHAR_UUID.lower() in available:
+                await self.client.start_notify(DATA_CHAR_UUID, self._notification_handler)
+                self._subscribed_notify_uuids.add(DATA_CHAR_UUID)
+            else:
+                raise BleakError(f"Device missing DATA characteristic {DATA_CHAR_UUID}")
+
+            # Optional calibration log notifications (only if configured and present)
+            if CALIBRATION_LOG_CHAR_UUID:
+                if (not available) or (CALIBRATION_LOG_CHAR_UUID.lower() in available):
+                    await self.client.start_notify(CALIBRATION_LOG_CHAR_UUID, self._calibration_log_handler)
+                    self._subscribed_notify_uuids.add(CALIBRATION_LOG_CHAR_UUID)
+                else:
+                    self.send_ui("log", f"(info) Calibration log characteristic not found; skipping.")
+
             self.packet_counter = 0
             self.send_ui("status", "Notifications enabled.")
         except BleakError as e:
@@ -200,13 +231,17 @@ class BLEWorker:
     async def _disconnect_task(self):
         try:
             if self.client and self.client.is_connected:
-                await self.client.stop_notify(DATA_CHAR_UUID)
-                await self.client.stop_notify(CALIBRATION_LOG_CHAR_UUID)
+                for uuid in list(self._subscribed_notify_uuids):
+                    try:
+                        await self.client.stop_notify(uuid)
+                    except Exception:
+                        pass
                 await self.client.disconnect()
                 self.send_ui("status", "Disconnected.")
         except Exception as e:
             self.send_ui("log", f"Disconnect error: {e}")
         finally:
+            self._subscribed_notify_uuids.clear()
             self.client = None
 
     async def _send_command_task(self, cmd: str):
@@ -218,7 +253,8 @@ class BLEWorker:
             self.send_ui("log", "Not connected.")
             return
         try:
-            await self.client.write_gatt_char(COMMAND_CHAR_UUID, cmd.encode("utf-8"))
+            # Slave supports both Write and Write Without Response; prefer without response.
+            await self.client.write_gatt_char(COMMAND_CHAR_UUID, cmd.encode("utf-8"), response=False)
             self.send_ui("log", f">> {cmd}")
         except Exception as e:
             self.send_ui("log", f"Command error: {e}")
@@ -613,13 +649,8 @@ class App(tk.Tk):
             for c in cmds:
                 ttk.Button(row, text=c, command=lambda cc=c: self.ble.send_command(cc)).pack(side="left", padx=2, pady=2)
         
-        # Calibration window button
-        cal_row = ttk.Frame(cmd_frame)
-        cal_row.pack(fill="x", padx=4, pady=2)
-        ttk.Label(cal_row, text="Calibration", width=14).pack(side="left")
-        ttk.Button(cal_row, text="Open Calibration Monitor", 
-                  command=self._open_calibration_window,
-                  style="Accent.TButton").pack(side="left", padx=2, pady=2)
+        # Calibration UI is kept for older firmware, but current esp32_ble_slave.ino
+        # does not stream calibration logs over BLE (no characteristic), so we hide it.
 
         custom = ttk.Frame(self)
         custom.pack(fill="x", padx=10, pady=6)
@@ -677,20 +708,10 @@ class App(tk.Tk):
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def _build_calibration_log(self):
-        cal_frame = ttk.LabelFrame(self, text="Calibration Log")
-        cal_frame.pack(fill="x", padx=10, pady=6)
-
-        # Calibration log text area
-        self.cal_log_text = tk.Text(cal_frame, height=8, wrap=tk.WORD, font=("Consolas", 9))
-        cal_scrollbar = ttk.Scrollbar(cal_frame, orient="vertical", command=self.cal_log_text.yview)
-        self.cal_log_text.configure(yscrollcommand=cal_scrollbar.set)
-        
-        self.cal_log_text.pack(side="left", fill="both", expand=True, padx=6, pady=6)
-        cal_scrollbar.pack(side="right", fill="y", pady=6)
-
-        # Calibration status
-        self.cal_status_var = tk.StringVar(value="No calibration active")
-        ttk.Label(cal_frame, textvariable=self.cal_status_var, font=("Arial", 10, "bold")).pack(pady=2)
+        # Current esp32_ble_slave.ino has no calibration-log characteristic, so we
+        # don't show the calibration log panel (prevents confusion).
+        self.cal_log_text = None
+        self.cal_status_var = tk.StringVar(value="Calibration log not available on this firmware")
 
     def _build_output(self):
         out_frame = ttk.LabelFrame(self, text="Log / Output")
@@ -817,8 +838,9 @@ class App(tk.Tk):
         ts = time.strftime("%H:%M:%S")
         
         # Add to calibration log text area (preserve formatting)
-        self.cal_log_text.insert("end", f"[{ts}] {message}\n")
-        self.cal_log_text.see("end")
+        if self.cal_log_text is not None:
+            self.cal_log_text.insert("end", f"[{ts}] {message}\n")
+            self.cal_log_text.see("end")
         
         # Update calibration status based on message type
         if "CALIBRATION_START" in message:

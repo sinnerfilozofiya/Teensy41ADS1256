@@ -410,6 +410,13 @@ bool restart_data_acquisition() {
 // COMMAND INTERFACE FUNCTIONS
 // ============================================================================
 
+// Send compact single-line calibration response to ESP32
+// Format: "CMD:data" - one line, easy to parse, no loss
+static void cal_response(const char* response) {
+  Serial.printf("[CAL] -> %s\n", response);  // Debug to Serial Monitor
+  softSerialTX_println(response);  // Send to ESP32
+}
+
 void handle_esp32_commands() {
   if (Serial3.available()) {
     String command = Serial3.readStringUntil('\n');
@@ -507,6 +514,104 @@ void handle_esp32_commands() {
         delay(100);
       }
       Serial.println("[T41] TX test complete");
+    }
+    // ========== CALIBRATION COMMANDS (ESP32) - COMPACT SINGLE-LINE RESPONSES ==========
+    else if (command == "CAL_SHOW") {
+      // Format: SHOW:LC1=off,a,n;LC2=off,a,n;LC3=off,a,n;LC4=off,a,n
+      CalStatus status;
+      cal_get_status(&status);
+      char buf[200];
+      snprintf(buf, sizeof(buf), "SHOW:LC1=%ld,%.6f,%u;LC2=%ld,%.6f,%u;LC3=%ld,%.6f,%u;LC4=%ld,%.6f,%u",
+               (long)status.offsets[0], (double)status.ch_a_10g_per_count[0], (unsigned)status.points_ch_n[0],
+               (long)status.offsets[1], (double)status.ch_a_10g_per_count[1], (unsigned)status.points_ch_n[1],
+               (long)status.offsets[2], (double)status.ch_a_10g_per_count[2], (unsigned)status.points_ch_n[2],
+               (long)status.offsets[3], (double)status.ch_a_10g_per_count[3], (unsigned)status.points_ch_n[3]);
+      cal_response(buf);
+    }
+    else if (command == "CAL_READ") {
+      // Format: READ:LC1=val;LC2=val;LC3=val;LC4=val;TOT=val
+      char buf[100];
+      snprintf(buf, sizeof(buf), "READ:%ld;%ld;%ld;%ld;%ld",
+               (long)cal_read_cell_10g_units(0, true),
+               (long)cal_read_cell_10g_units(1, true),
+               (long)cal_read_cell_10g_units(2, true),
+               (long)cal_read_cell_10g_units(3, true),
+               (long)cal_read_total_10g_units(true));
+      cal_response(buf);
+    }
+    else if (command == "CAL_TARE") {
+      Serial.println("[CAL] TARE: collecting samples...");
+      bool ok = cal_tare(600, true);
+      cal_response(ok ? "TARE:OK" : "TARE:ERR");
+    }
+    else if (command.startsWith("CAL_ADD_") && !command.startsWith("CAL_ADD_CH_")) {
+      // Format: CAL_ADD_<kg>
+      float kg = command.substring(8).toFloat();
+      if (kg > 0.0f) {
+        Serial.printf("[CAL] ADD %.3f kg: collecting...\n", (double)kg);
+        bool ok = cal_add_point_total(kg, 800, true);
+        if (ok) {
+          bool fit_ok = cal_fit_and_save();
+          cal_response(fit_ok ? "ADD:OK" : "ADD:FIT_ERR");
+        } else {
+          cal_response("ADD:ERR");
+        }
+      } else {
+        cal_response("ADD:BAD_KG");
+      }
+    }
+    else if (command.startsWith("CAL_ADD_CH_")) {
+      // Format: CAL_ADD_CH_<ch>_<weight>
+      // Parse: CAL_ADD_CH_1_20 -> ch=1, kg=20
+      String params = command.substring(11);  // "1_20"
+      int us = params.indexOf('_');
+      if (us > 0) {
+        int ch = params.substring(0, us).toInt();
+        float kg = params.substring(us + 1).toFloat();
+        if (ch >= 1 && ch <= 4 && kg > 0.0f) {
+          Serial.printf("[CAL] ADD_CH%d %.3f kg: collecting...\n", ch, (double)kg);
+          bool ok = cal_add_point_channel((uint8_t)(ch - 1), kg, 800, true);
+          if (ok) {
+            bool fit_ok = cal_fit_and_save();
+            cal_response(fit_ok ? "ADD_CH:OK" : "ADD_CH:FIT_ERR");
+          } else {
+            cal_response("ADD_CH:ERR");
+          }
+        } else {
+          cal_response("ADD_CH:BAD_ARGS");
+        }
+      } else {
+        cal_response("ADD_CH:BAD_FMT");
+      }
+    }
+    else if (command == "CAL_FIT") {
+      bool ok = cal_fit_and_save();
+      cal_response(ok ? "FIT:OK" : "FIT:ERR");
+    }
+    else if (command == "CAL_CLEAR") {
+      bool ok = cal_clear();
+      cal_response(ok ? "CLEAR:OK" : "CLEAR:ERR");
+    }
+    else if (command == "CAL_POINTS") {
+      // Format: PTS:LC1=n;LC2=n;LC3=n;LC4=n
+      CalStatus status;
+      cal_get_status(&status);
+      char buf[50];
+      snprintf(buf, sizeof(buf), "PTS:%u;%u;%u;%u",
+               (unsigned)status.points_ch_n[0], (unsigned)status.points_ch_n[1],
+               (unsigned)status.points_ch_n[2], (unsigned)status.points_ch_n[3]);
+      cal_response(buf);
+    }
+    else if (command == "CAL_READ_RAW") {
+      // Same as CAL_READ but with raw (unfiltered) values
+      char buf[100];
+      snprintf(buf, sizeof(buf), "READ_RAW:%ld;%ld;%ld;%ld;%ld",
+               (long)cal_read_cell_10g_units(0, false),
+               (long)cal_read_cell_10g_units(1, false),
+               (long)cal_read_cell_10g_units(2, false),
+               (long)cal_read_cell_10g_units(3, false),
+               (long)cal_read_total_10g_units(false));
+      cal_response(buf);
     }
     else {
       send_status_response(command.c_str(), "UNKNOWN");
@@ -638,26 +743,33 @@ void handle_serial_monitor_commands() {
       Serial.println("[T41] TX test complete");
     }
     // ========== CALIBRATION (REGRESSION v2, TEENSY-ONLY) ==========
-    else if (command == "CAL SHOW") {
+    // Support both space format (legacy) and underscore format (new, uppercase)
+    else if (command == "CAL SHOW" || command == "CAL_SHOW") {
       cal_print_status();
     }
-    else if (command == "CAL POINTS") {
+    else if (command == "CAL POINTS" || command == "CAL_POINTS") {
       cal_print_points();
     }
-    else if (command == "CAL READ") {
+    else if (command == "CAL READ" || command == "CAL_READ") {
       cal_print_reading(true);
     }
-    else if (command == "CAL READ RAW") {
+    else if (command == "CAL READ RAW" || command == "CAL_READ_RAW") {
       cal_print_reading(false);
     }
-    else if (command == "CAL TARE") {
+    else if (command == "CAL TARE" || command == "CAL_TARE") {
       Serial.println("[CAL] TARE: remove all load and keep still...");
       bool ok = cal_tare(600, true);
       Serial.println(ok ? "[CAL] TARE OK" : "[CAL] TARE ERROR");
     }
-    else if (command.startsWith("CAL ADD ")) {
-      // Format: CAL ADD <kg>
-      float kg = command.substring(8).toFloat();
+    else if (command.startsWith("CAL ADD ") || command.startsWith("CAL_ADD_")) {
+      // Format: CAL ADD <kg> or CAL_ADD_<kg>
+      float kg = 0.0f;
+      if (command.startsWith("CAL ADD ")) {
+        kg = command.substring(8).toFloat();
+      } else {
+        // CAL_ADD_<kg>
+        kg = command.substring(8).toFloat();
+      }
       Serial.printf("[CAL] ADD(TOTAL): apply %.3f kg and keep still...\n", (double)kg);
       bool ok = cal_add_point_total(kg, 800, true);
       if (ok) {
@@ -668,13 +780,32 @@ void handle_serial_monitor_commands() {
         Serial.println("[CAL] ADD ERROR");
       }
     }
-    else if (command.startsWith("CAL ADD_CH ")) {
-      // Format: CAL ADD_CH <ch> <kg>
-      // Example: CAL ADD_CH 1 10
-      int sp1 = command.indexOf(' ', 11);
-      if (sp1 > 0) {
-        int ch = command.substring(11, sp1).toInt();
-        float kg = command.substring(sp1 + 1).toFloat();
+    else if (command.startsWith("CAL ADD_CH ") || command.startsWith("CAL_ADD_CH_")) {
+      // Format: CAL ADD_CH <ch> <kg> or CAL_ADD_CH_<ch>_<weight>
+      int ch = 0;
+      float kg = 0.0f;
+      if (command.startsWith("CAL ADD_CH ")) {
+        int sp1 = command.indexOf(' ', 11);
+        if (sp1 > 0) {
+          ch = command.substring(11, sp1).toInt();
+          kg = command.substring(sp1 + 1).toFloat();
+        } else {
+          Serial.println("[CAL] ADD_CH ERROR (usage: CAL ADD_CH <1-4> <kg>)");
+          ch = 0;
+        }
+      } else {
+        // CAL_ADD_CH_<ch>_<weight>
+        int us1 = command.indexOf('_', 12);
+        int us2 = command.indexOf('_', us1 + 1);
+        if (us1 > 0 && us2 > 0) {
+          ch = command.substring(12, us1).toInt();
+          kg = command.substring(us2 + 1).toFloat();
+        } else {
+          Serial.println("[CAL] ADD_CH ERROR (usage: CAL_ADD_CH_<1-4>_<kg>)");
+          ch = 0;
+        }
+      }
+      if (ch > 0 && ch <= 4 && kg > 0.0f) {
         Serial.printf("[CAL] ADD(LC%d): apply %.3f kg mostly on that cell and keep still...\n", ch, (double)kg);
         bool ok = cal_add_point_channel((uint8_t)(ch - 1), kg, 800, true);
         if (ok) {
@@ -684,15 +815,13 @@ void handle_serial_monitor_commands() {
         } else {
           Serial.println("[CAL] ADD_CH ERROR");
         }
-      } else {
-        Serial.println("[CAL] ADD_CH ERROR (usage: CAL ADD_CH <1-4> <kg>)");
       }
     }
-    else if (command == "CAL FIT") {
+    else if (command == "CAL FIT" || command == "CAL_FIT") {
       bool ok = cal_fit_and_save();
       Serial.println(ok ? "[CAL] FIT OK" : "[CAL] FIT ERROR");
     }
-    else if (command == "CAL CLEAR") {
+    else if (command == "CAL CLEAR" || command == "CAL_CLEAR") {
       bool ok = cal_clear();
       Serial.println(ok ? "[CAL] CLEAR OK" : "[CAL] CLEAR ERROR");
     }
@@ -703,8 +832,8 @@ void handle_serial_monitor_commands() {
       Serial.println("[T41] Presets: FILTER_REALTIME/HIGH_QUALITY/LOW_NOISE/GAUSSIAN");
       Serial.println("[T41] Config: FILTER_TYPE <0-7>, OUTLIER_METHOD <0-4>, GAUSSIAN_SIGMA <0.1-5>");
       Serial.println("[T41] Debug: SHOW_FILTERED, PING, TX_TEST");
-      Serial.println("[T41] Cal: CAL SHOW, CAL POINTS, CAL READ, CAL READ RAW, CAL TARE");
-      Serial.println("[T41]      CAL ADD <kg>, CAL ADD_CH <1-4> <kg>, CAL FIT, CAL CLEAR");
+      Serial.println("[T41] Cal: CAL_SHOW, CAL_POINTS, CAL_READ, CAL_READ_RAW, CAL_TARE");
+      Serial.println("[T41]      CAL_ADD_<kg>, CAL_ADD_CH_<1-4>_<kg>, CAL_FIT, CAL_CLEAR");
     }
     else if (command == "") {
       // Empty command, do nothing

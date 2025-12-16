@@ -90,18 +90,18 @@ static volatile uint32_t espnow_command_errors = 0;
 // ESP-NOW COMMAND STRUCTURES AND FUNCTIONS
 // ============================================================================
 
-// ESP-NOW command packet (16 bytes)
+// ESP-NOW command packet (expanded to 56 bytes for calibration commands)
 struct __attribute__((packed)) ESPNowCommand {
     uint8_t magic[2];   // 0xCD, 0xD1 (Command magic)
-    uint8_t command[8]; // Command string (null-terminated)
+    uint8_t command[48]; // Command string (null-terminated, expanded for cal_* commands)
     uint32_t timestamp; // Timestamp for deduplication
     uint16_t crc16;     // CRC16 of packet
 };
 
-// ESP-NOW response packet (64 bytes)
+// ESP-NOW response packet (compact single-line responses)
 struct __attribute__((packed)) ESPNowResponse {
     uint8_t magic[2];   // 0xAB, 0xCD (Response magic)
-    char response[60];  // Response string (null-terminated)
+    char response[220]; // Response string (null-terminated) - compact cal responses
     uint16_t crc16;     // CRC16 of packet
 };
 
@@ -115,16 +115,30 @@ static void process_espnow_command(const ESPNowCommand* cmd);
 // ESP-NOW COMMAND PROCESSING
 // ============================================================================
 
+// Case-insensitive string comparison helper
+static bool strncmp_case_insensitive(const char* s1, const char* s2, size_t n) {
+    for (size_t i = 0; i < n && s1[i] != '\0' && s2[i] != '\0'; i++) {
+        char c1 = (s1[i] >= 'a' && s1[i] <= 'z') ? (s1[i] - 'a' + 'A') : s1[i];
+        char c2 = (s2[i] >= 'a' && s2[i] <= 'z') ? (s2[i] - 'a' + 'A') : s2[i];
+        if (c1 != c2) return false;
+    }
+    return true;
+}
+
 static void process_espnow_command(const ESPNowCommand* cmd) {
-    char safe_command[9];
-    memcpy(safe_command, cmd->command, 8);
-    safe_command[8] = '\0';
+    char safe_command[49];
+    strncpy(safe_command, (const char*)cmd->command, 48);
+    safe_command[48] = '\0';
     
     Serial.printf("[SPI_SLAVE] ESP-NOW Command: %s\n", safe_command);
     espnow_commands_received++;
     
+    // Convert command to uppercase for comparison (but send original to Teensy)
+    String cmd_upper = String(safe_command);
+    cmd_upper.toUpperCase();
+    
     // PING command - forward to Teensy and send response back
-    if (strcmp(safe_command, "PING") == 0) {
+    if (cmd_upper == "PING") {
         Serial.println("[SPI_SLAVE] PING received, forwarding to Teensy...");
         
         // Clear RX buffer
@@ -157,8 +171,8 @@ static void process_espnow_command(const ESPNowCommand* cmd) {
         }
     }
     // Control commands - forward to Teensy
-    else if (strcmp(safe_command, "START") == 0 || strcmp(safe_command, "STOP") == 0 ||
-             strcmp(safe_command, "RESTART") == 0 || strcmp(safe_command, "RESET") == 0) {
+    else if (cmd_upper == "START" || cmd_upper == "STOP" ||
+             cmd_upper == "RESTART" || cmd_upper == "RESET") {
         Serial.printf("[SPI_SLAVE] Forwarding '%s' to Teensy...\n", safe_command);
         Serial1.println(safe_command);
         Serial1.flush();
@@ -172,6 +186,42 @@ static void process_espnow_command(const ESPNowCommand* cmd) {
                 break;
             }
             delay(10);
+        }
+    }
+    // Calibration commands - forward to Teensy, expect single-line response
+    else if (cmd_upper.startsWith("CAL_")) {
+        Serial.printf("[SPI_SLAVE] CAL: %s\n", safe_command);
+        
+        // Clear buffer
+        while (Serial1.available()) Serial1.read();
+        
+        // Send command
+        String cmd_to_teensy = String(safe_command);
+        cmd_to_teensy.toUpperCase();
+        Serial1.println(cmd_to_teensy);
+        Serial1.flush();
+        
+        // Wait for single-line response (longer timeout for TARE/ADD which collect samples)
+        unsigned long timeout = millis() + 5000;
+        String response = "";
+        
+        while (millis() < timeout) {
+            if (Serial1.available()) {
+                response = Serial1.readStringUntil('\n');
+                response.trim();
+                if (response.length() > 0) {
+                    Serial.printf("[SPI_SLAVE] << %s\n", response.c_str());
+                    break;
+                }
+            }
+            delay(5);
+        }
+        
+        // Send response via ESP-NOW
+        if (response.length() > 0) {
+            send_espnow_response(response.c_str());
+        } else {
+            send_espnow_response("TIMEOUT");
         }
     }
     else {
@@ -335,15 +385,13 @@ static void espnow_recv_callback(const esp_now_recv_info *recv_info, const uint8
 }
 
 static bool create_espnow_response(ESPNowResponse* resp, const char* response_str) {
-  if (strlen(response_str) >= 60) return false; // Response too long
-  
   memset(resp, 0, sizeof(ESPNowResponse));
   resp->magic[0] = 0xAB;
   resp->magic[1] = 0xCD;
-  strncpy(resp->response, response_str, 59);
-  resp->response[59] = '\0';
+  strncpy(resp->response, response_str, 219);
+  resp->response[219] = '\0';
   
-  // Calculate CRC16 of everything except CRC field
+  // Calculate CRC16
   resp->crc16 = crc16_ccitt_false((const uint8_t*)resp, sizeof(ESPNowResponse) - 2);
   return true;
 }

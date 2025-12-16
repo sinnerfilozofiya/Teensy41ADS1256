@@ -55,6 +55,10 @@ static unsigned long uart_packets_sent = 0;
 static unsigned long uart_bytes_sent = 0;
 static unsigned long uart_send_errors = 0;
 
+// UART streaming suspension for calibration commands
+static bool suspend_uart_stream = false;
+static unsigned long suspend_uart_since_ms = 0;
+
 // ============================================================================
 // LATEST DATA SYNCHRONIZATION
 // ============================================================================
@@ -112,6 +116,15 @@ static inline bool send_uart_packet(uint8_t type, uint16_t frame_idx, uint8_t sa
 
 static inline void forward_sample_to_uart(char type, uint16_t frame_idx, uint8_t sample_idx,
                                          int32_t lc1, int32_t lc2, int32_t lc3, int32_t lc4) {
+    // Skip if UART streaming is suspended (e.g., during calibration commands)
+    if (suspend_uart_stream) return;
+    
+    // Auto-resume after 2 seconds if something went wrong
+    if (suspend_uart_since_ms > 0 && (millis() - suspend_uart_since_ms) > 2000) {
+        suspend_uart_stream = false;
+        suspend_uart_since_ms = 0;
+    }
+    
     // Send only individual sample - Redis-like system on slave handles combining
     send_uart_packet(type, frame_idx, sample_idx, lc1, lc2, lc3, lc4);
 }
@@ -161,18 +174,18 @@ static SemaphoreHandle_t response_mutex = NULL;
 // ESP-NOW COMMAND STRUCTURES AND FUNCTIONS
 // ============================================================================
 
-// ESP-NOW command packet (16 bytes)
+// ESP-NOW command packet (expanded to 56 bytes for calibration commands)
 struct __attribute__((packed)) ESPNowCommand {
     uint8_t magic[2];   // 0xCD, 0xD1 (Command magic)
-    uint8_t command[8]; // Command string (null-terminated)
+    uint8_t command[48]; // Command string (null-terminated, expanded for cal_* commands)
     uint32_t timestamp; // Timestamp for deduplication
     uint16_t crc16;     // CRC16 of packet
 };
 
-// ESP-NOW response packet (64 bytes)
+// ESP-NOW response packet (compact single-line responses)
 struct __attribute__((packed)) ESPNowResponse {
     uint8_t magic[2];   // 0xAB, 0xCD (Response magic)
-    char response[60];  // Response string (null-terminated)
+    char response[220]; // Response string (null-terminated) - compact cal responses
     uint16_t crc16;     // CRC16 of packet
 };
 
@@ -209,19 +222,16 @@ static bool send_espnow_command(const char* command_str) {
 // ============================================================================
 
 bool create_espnow_command(ESPNowCommand* cmd, const char* command_str) {
-    if (strlen(command_str) > 8) return false; // Command too long (allow exactly 8 chars)
+    size_t cmd_len = strlen(command_str);
+    if (cmd_len > 47) return false; // Command too long (max 47 chars + null terminator)
     
     memset(cmd, 0, sizeof(ESPNowCommand));
     cmd->magic[0] = 0xCD;
     cmd->magic[1] = 0xD1;
     
-    // Copy command string - for 8-char commands, don't null terminate (use full buffer)
-    if (strlen(command_str) == 8) {
-        memcpy(cmd->command, command_str, 8); // Copy all 8 chars without null terminator
-    } else {
-        strncpy((char*)cmd->command, command_str, 7); // Copy up to 7 chars
-        cmd->command[7] = '\0'; // Null terminate for shorter commands
-    }
+    // Copy command string (null-terminated)
+    strncpy((char*)cmd->command, command_str, 47);
+    cmd->command[47] = '\0'; // Ensure null termination
     
     cmd->timestamp = millis();
     
@@ -310,23 +320,22 @@ static void spi_rx_task(void* param) {
 // ============================================================================
 
 static void espnow_rx_callback(const esp_now_recv_info *recv_info, const uint8_t *data, int len) {
-    // Check if this is a response packet (64 bytes)
+    // Check if this is a response packet
     if (len == sizeof(ESPNowResponse)) {
         const ESPNowResponse* resp = (const ESPNowResponse*)data;
         
         if (validate_espnow_response(resp)) {
             String response_str = String(resp->response);
             
-            // Capture response for PING test
+            // Store response for command handlers (PING, CAL, etc.)
+            // The command handler will forward to BLE Slave
             if (response_mutex != NULL && xSemaphoreTake(response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 espnow_response_data = response_str;
                 espnow_response_ready = true;
                 xSemaphoreGive(response_mutex);
             }
             
-            // Forward response to BLE Slave via Serial2 with REMOTE: prefix
-            Serial2.printf("##REMOTE:%s\n", response_str.c_str());
-            Serial2.flush();
+            // Don't forward here - let the command handler do it to avoid duplicates
         }
         return;
     }
@@ -558,6 +567,106 @@ static void process_command(String command) {
         Serial.printf("  Remote Teensy: %s\n", remote_success ? "✓ SUCCESS" : "✗ FAILED");
         Serial.println("=============================");
     }
+    // LOCAL calibration commands - forward to Local Teensy via UART
+    else if (command.startsWith("LOCAL_CAL_")) {
+        String cal_command = command.substring(6);  // Remove "LOCAL_" prefix
+        Serial.printf("[RX_RADIO] LOCAL_CAL: %s\n", cal_command.c_str());
+        
+        // Suspend binary data streaming
+        suspend_uart_stream = true;
+        suspend_uart_since_ms = millis();
+        Serial2.flush();
+        
+        // Clear buffer
+        while (Serial1.available()) Serial1.read();
+        
+        // Send command
+        cal_command.toUpperCase();
+        Serial1.println(cal_command);
+        Serial1.flush();
+        
+        // Wait for single-line response
+        unsigned long timeout = millis() + 5000;
+        String response = "";
+        
+        while (millis() < timeout) {
+            if (Serial1.available()) {
+                response = Serial1.readStringUntil('\n');
+                response.trim();
+                if (response.length() > 0) {
+                    Serial.printf("[RX_RADIO] << %s\n", response.c_str());
+                    break;
+                }
+            }
+            delay(5);
+        }
+        
+        // Resume streaming
+        suspend_uart_stream = false;
+        
+        // Forward to BLE Slave
+        if (response.length() > 0) {
+            Serial2.printf("##LOCAL:%s\n", response.c_str());
+        } else {
+            Serial2.println("##LOCAL:TIMEOUT");
+        }
+        Serial2.flush();
+    }
+    // REMOTE calibration commands - forward to Remote Teensy via ESP-NOW
+    else if (command.startsWith("REMOTE_CAL_")) {
+        String cal_command = command.substring(7);  // Remove "REMOTE_" prefix
+        Serial.printf("[RX_RADIO] REMOTE_CAL: %s\n", cal_command.c_str());
+        
+        // Suspend binary data streaming
+        suspend_uart_stream = true;
+        suspend_uart_since_ms = millis();
+        Serial2.flush();
+        
+        // Clear previous response
+        if (response_mutex != NULL && xSemaphoreTake(response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            espnow_response_ready = false;
+            espnow_response_data = "";
+            xSemaphoreGive(response_mutex);
+        }
+        
+        // Send command via ESP-NOW
+        cal_command.toUpperCase();
+        
+        if (send_espnow_command(cal_command.c_str())) {
+            // Wait for response
+            unsigned long timeout = millis() + 5000;
+            String response = "";
+            
+            while (millis() < timeout) {
+                if (response_mutex != NULL && xSemaphoreTake(response_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    if (espnow_response_ready) {
+                        response = espnow_response_data;
+                        espnow_response_ready = false;
+                        xSemaphoreGive(response_mutex);
+                        break;
+                    }
+                    xSemaphoreGive(response_mutex);
+                }
+                delay(10);
+            }
+            
+            // Resume streaming
+            suspend_uart_stream = false;
+            
+            // Forward to BLE Slave
+            if (response.length() > 0) {
+                Serial.printf("[RX_RADIO] << %s\n", response.c_str());
+                Serial2.printf("##REMOTE:%s\n", response.c_str());
+            } else {
+                Serial2.println("##REMOTE:TIMEOUT");
+            }
+            Serial2.flush();
+        } else {
+            suspend_uart_stream = false;
+            Serial2.println("##REMOTE:ESPNOW_ERR");
+            Serial2.flush();
+        }
+    }
     // STATUS command
     else if (command == "STATUS") {
         Serial.println("\n[RX_RADIO] === STATUS ===");
@@ -574,6 +683,9 @@ static void process_command(String command) {
         Serial.println("  Local:  START, STOP, RESTART, RESET, LOCAL_PING");
         Serial.println("  Remote: REMOTE_START/STOP/RESTART/RESET, REMOTE_PING");
         Serial.println("  Both:   ALL_START/STOP/RESTART/RESET");
+        Serial.println("  Calibration:");
+        Serial.println("    LOCAL_CAL_SHOW, LOCAL_CAL_TARE, LOCAL_CAL_ADD_<kg>, etc.");
+        Serial.println("    REMOTE_CAL_SHOW, REMOTE_CAL_TARE, REMOTE_CAL_ADD_<kg>, etc.");
         Serial.println("  System: STATUS, HELP");
         Serial.println("=====================================\n");
     } else if (command == "") {
