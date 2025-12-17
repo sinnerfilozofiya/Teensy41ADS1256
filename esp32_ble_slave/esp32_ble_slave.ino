@@ -29,11 +29,11 @@ struct __attribute__((packed)) UartPacket {
 
 #define BLE_SERVICE_UUID        "12345678-1234-1234-1234-123456789abc"
 #define BLE_DATA_CHARACTERISTIC_UUID "87654321-4321-4321-4321-cba987654321"
-#define BLE_COMMAND_CHARACTERISTIC_UUID "11111111-2222-3333-4444-555555555555"
+#define BLE_CMD_CHARACTERISTIC_UUID "11111111-2222-3333-4444-555555555555"  // Bidirectional: WRITE + NOTIFY
 
 BLEServer* pServer = nullptr;
-BLECharacteristic* pDataCharacteristic = nullptr;    // For sending sensor data
-BLECharacteristic* pCommandCharacteristic = nullptr; // For receiving commands
+BLECharacteristic* pDataCharacteristic = nullptr;  // Sensor data (binary NOTIFY)
+BLECharacteristic* pCmdCharacteristic = nullptr;   // Commands (WRITE) + Responses (NOTIFY)
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
@@ -177,66 +177,247 @@ static inline void process_uart_packet(const UartPacket* packet) {
 }
 
 // ============================================================================
+// BLE JSON RESPONSE FUNCTIONS
+// ============================================================================
+
+// Send JSON response via BLE Command characteristic (bidirectional)
+static void send_ble_json_response(const char* json) {
+    if (deviceConnected && pCmdCharacteristic != nullptr) {
+        pCmdCharacteristic->setValue((uint8_t*)json, strlen(json));
+        pCmdCharacteristic->notify();
+        Serial.printf("[BLE] -> %s\n", json);
+    }
+}
+
+// Parse Teensy response and send as JSON via BLE
+// Response formats from Teensy: "TARE:OK", "SHOW:LC1=off,a,n;LC2=...", "READ:v1;v2;v3;v4;tot", etc.
+static void send_json_response(const char* prefix, const char* response, unsigned long round_trip_ms) {
+    char json[300];
+    
+    // Determine if this is LOCAL or REMOTE
+    bool is_remote = (strcmp(prefix, "REMOTE") == 0);
+    const char* target = is_remote ? "REMOTE" : "LOCAL";
+    
+    // Parse the response format: "CMD:DATA" or "CMD:STATUS"
+    String resp = String(response);
+    int colon_pos = resp.indexOf(':');
+    
+    if (colon_pos <= 0) {
+        // Unknown format - send raw
+        snprintf(json, sizeof(json), "{\"target\":\"%s\",\"raw\":\"%s\",\"ms\":%lu}", 
+                 target, response, round_trip_ms);
+        send_ble_json_response(json);
+        return;
+    }
+    
+    String cmd = resp.substring(0, colon_pos);
+    String data = resp.substring(colon_pos + 1);
+    
+    // Handle different command responses
+    if (cmd == "TARE" || cmd == "FIT" || cmd == "CLEAR" || cmd == "ADD" || cmd == "ADD_CH") {
+        // Simple OK/ERR responses
+        bool ok = (data == "OK");
+        if (ok) {
+            snprintf(json, sizeof(json), "{\"target\":\"%s\",\"cmd\":\"%s\",\"ok\":true,\"ms\":%lu}", 
+                     target, cmd.c_str(), round_trip_ms);
+        } else {
+            snprintf(json, sizeof(json), "{\"target\":\"%s\",\"cmd\":\"%s\",\"ok\":false,\"err\":\"%s\",\"ms\":%lu}", 
+                     target, cmd.c_str(), data.c_str(), round_trip_ms);
+        }
+    }
+    else if (cmd == "SHOW") {
+        // Format: SHOW:LC1=off,a,n;LC2=off,a,n;LC3=off,a,n;LC4=off,a,n
+        // Parse into JSON array
+        long off[4] = {0};
+        float a[4] = {0};
+        int n[4] = {0};
+        
+        // Parse each LC section
+        int lc_idx = 0;
+        int start = 0;
+        while (lc_idx < 4) {
+            int semi = data.indexOf(';', start);
+            String lc_data = (semi > 0) ? data.substring(start, semi) : data.substring(start);
+            
+            // Parse "LC1=off,a,n" - skip "LCx=" prefix
+            int eq = lc_data.indexOf('=');
+            if (eq > 0) {
+                String vals = lc_data.substring(eq + 1);
+                int c1 = vals.indexOf(',');
+                int c2 = vals.indexOf(',', c1 + 1);
+                if (c1 > 0 && c2 > 0) {
+                    off[lc_idx] = vals.substring(0, c1).toInt();
+                    a[lc_idx] = vals.substring(c1 + 1, c2).toFloat();
+                    n[lc_idx] = vals.substring(c2 + 1).toInt();
+                }
+            }
+            
+            lc_idx++;
+            if (semi < 0) break;
+            start = semi + 1;
+        }
+        
+        snprintf(json, sizeof(json), 
+                 "{\"target\":\"%s\",\"cmd\":\"SHOW\",\"lc\":[{\"off\":%ld,\"a\":%.6f,\"n\":%d},{\"off\":%ld,\"a\":%.6f,\"n\":%d},{\"off\":%ld,\"a\":%.6f,\"n\":%d},{\"off\":%ld,\"a\":%.6f,\"n\":%d}],\"ms\":%lu}",
+                 target, off[0], a[0], n[0], off[1], a[1], n[1], off[2], a[2], n[2], off[3], a[3], n[3], round_trip_ms);
+    }
+    else if (cmd == "READ" || cmd == "READ_RAW") {
+        // Format: READ:v1;v2;v3;v4;tot
+        long v[5] = {0};
+        int idx = 0;
+        int start = 0;
+        while (idx < 5) {
+            int semi = data.indexOf(';', start);
+            String val = (semi > 0) ? data.substring(start, semi) : data.substring(start);
+            v[idx] = val.toInt();
+            idx++;
+            if (semi < 0) break;
+            start = semi + 1;
+        }
+        snprintf(json, sizeof(json), "{\"target\":\"%s\",\"cmd\":\"%s\",\"v\":[%ld,%ld,%ld,%ld,%ld],\"ms\":%lu}", 
+                 target, cmd.c_str(), v[0], v[1], v[2], v[3], v[4], round_trip_ms);
+    }
+    else if (cmd == "PTS") {
+        // Format: PTS:n1;n2;n3;n4
+        int n[4] = {0};
+        int idx = 0;
+        int start = 0;
+        while (idx < 4) {
+            int semi = data.indexOf(';', start);
+            String val = (semi > 0) ? data.substring(start, semi) : data.substring(start);
+            n[idx] = val.toInt();
+            idx++;
+            if (semi < 0) break;
+            start = semi + 1;
+        }
+        snprintf(json, sizeof(json), "{\"target\":\"%s\",\"cmd\":\"PTS\",\"n\":[%d,%d,%d,%d],\"ms\":%lu}", 
+                 target, n[0], n[1], n[2], n[3], round_trip_ms);
+    }
+    else if (data == "TIMEOUT" || data == "ESPNOW_ERR") {
+        // Error responses
+        snprintf(json, sizeof(json), "{\"target\":\"%s\",\"cmd\":\"%s\",\"ok\":false,\"err\":\"%s\",\"ms\":%lu}", 
+                 target, cmd.c_str(), data.c_str(), round_trip_ms);
+    }
+    else {
+        // Unknown command - send as generic response
+        snprintf(json, sizeof(json), "{\"target\":\"%s\",\"cmd\":\"%s\",\"data\":\"%s\",\"ms\":%lu}", 
+                 target, cmd.c_str(), data.c_str(), round_trip_ms);
+    }
+    
+    send_ble_json_response(json);
+}
+
+// Send simple status JSON for control commands (START, STOP, etc.)
+static void send_control_json_response(const char* target, const char* cmd, bool ok, unsigned long ms) {
+    char json[150];
+    snprintf(json, sizeof(json), "{\"target\":\"%s\",\"cmd\":\"%s\",\"ok\":%s,\"ms\":%lu}", 
+             target, cmd, ok ? "true" : "false", ms);
+    send_ble_json_response(json);
+}
+
+// Send PING response
+static void send_ping_json_response(const char* target, unsigned long ms) {
+    char json[100];
+    snprintf(json, sizeof(json), "{\"target\":\"%s\",\"cmd\":\"PING\",\"ok\":true,\"ms\":%lu}", target, ms);
+    send_ble_json_response(json);
+}
+
+// Send timeout error
+static void send_timeout_json_response(const char* target, const char* cmd, unsigned long ms) {
+    char json[150];
+    snprintf(json, sizeof(json), "{\"target\":\"%s\",\"cmd\":\"%s\",\"ok\":false,\"err\":\"TIMEOUT\",\"ms\":%lu}", 
+             target, cmd, ms);
+    send_ble_json_response(json);
+}
+
+// ============================================================================
 // BLE COMMAND PROCESSING
 // ============================================================================
 
 static void forward_command_to_rx_radio(String command) {
     bool is_ping = (command == "LOCAL_PING" || command == "REMOTE_PING");
-    
-    // Check if this is a calibration command (needs longer timeout)
     bool is_cal_command = (command.startsWith("LOCAL_CAL_") || command.startsWith("REMOTE_CAL_"));
+    bool is_remote = (command.startsWith("REMOTE_") || command.startsWith("ALL_"));
+    bool is_local = command.startsWith("LOCAL_") || (!is_remote && !command.startsWith("ALL_"));
+    
+    // Determine target for JSON response
+    const char* target = "LOCAL";
+    if (command.startsWith("REMOTE_")) target = "REMOTE";
+    else if (command.startsWith("ALL_")) target = "ALL";
+    
+    // Extract base command (e.g., "START" from "REMOTE_START", "CAL_TARE" from "LOCAL_CAL_TARE")
+    String base_cmd = command;
+    if (command.startsWith("LOCAL_")) base_cmd = command.substring(6);
+    else if (command.startsWith("REMOTE_")) base_cmd = command.substring(7);
+    else if (command.startsWith("ALL_")) base_cmd = command.substring(4);
     
     Serial.printf("[BLE_SLAVE] Forwarding '%s' to RX Radio...\n", command.c_str());
-    
-    // Clear previous response
-    if (command_response_mutex != NULL && xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        command_response_ready = false;
-        command_response_data = "";
-        xSemaphoreGive(command_response_mutex);
-    }
-    
-    unsigned long start_time = millis();
-    Serial2.println(command);
-    Serial2.flush();
-    commands_forwarded++;
-    
-    // Wait for response from ESP32 RX Radio (longer timeout for calibration commands)
-    unsigned long timeout = millis() + (is_cal_command ? 15000 : 5000);
-    bool got_response = false;
-    String response_text = "";
-    
-    while (millis() < timeout) {
-        if (command_response_mutex != NULL && xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            if (command_response_ready) {
-                response_text = command_response_data;
-                command_response_ready = false;
-                got_response = true;
-                xSemaphoreGive(command_response_mutex);
-                break;
-            }
+        
+        // Clear previous response
+        if (command_response_mutex != NULL && xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            command_response_ready = false;
+            command_response_data = "";
             xSemaphoreGive(command_response_mutex);
         }
-        delay(10);
-    }
-    
-    unsigned long round_trip_ms = millis() - start_time;
-    
-    if (got_response) {
-        if (is_ping) {
-            String actual_response = response_text;
-            if (response_text.startsWith("LOCAL:")) {
-                actual_response = response_text.substring(6);
-            } else if (response_text.startsWith("REMOTE:")) {
-                actual_response = response_text.substring(7);
+        
+        unsigned long start_time = millis();
+        Serial2.println(command);
+        Serial2.flush();
+        commands_forwarded++;
+        
+    // Wait for response (longer timeout for calibration commands)
+    unsigned long timeout = millis() + (is_cal_command ? 15000 : 5000);
+        bool got_response = false;
+        String response_text = "";
+        
+        while (millis() < timeout) {
+            if (command_response_mutex != NULL && xSemaphoreTake(command_response_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                if (command_response_ready) {
+                    response_text = command_response_data;
+                    command_response_ready = false;
+                    got_response = true;
+                    xSemaphoreGive(command_response_mutex);
+                    break;
+                }
+                xSemaphoreGive(command_response_mutex);
             }
-            Serial.printf("[BLE_SLAVE] ✓ PONG received: '%s' (%lu ms)\n", actual_response.c_str(), round_trip_ms);
-        } else {
-            Serial.printf("[BLE_SLAVE] Response: %s\n", response_text.c_str());
+            delay(10);
         }
-        command_responses_received++;
+        
+        unsigned long round_trip_ms = millis() - start_time;
+        
+        if (got_response) {
+        // Parse prefix (LOCAL: or REMOTE:) from response
+        String prefix = "";
+                String actual_response = response_text;
+                if (response_text.startsWith("LOCAL:")) {
+            prefix = "LOCAL";
+            actual_response = response_text.substring(6);
+                } else if (response_text.startsWith("REMOTE:")) {
+            prefix = "REMOTE";
+            actual_response = response_text.substring(7);
+        }
+        
+        Serial.printf("[BLE_SLAVE] Response: %s (%lu ms)\n", actual_response.c_str(), round_trip_ms);
+            command_responses_received++;
+        
+        // Send JSON response via BLE
+            if (is_ping) {
+            send_ping_json_response(target, round_trip_ms);
+        } else if (is_cal_command) {
+            // Calibration commands - parse the detailed response
+            send_json_response(target, actual_response.c_str(), round_trip_ms);
+            } else {
+            // Control commands (START, STOP, etc.) - simple OK/ERROR
+            bool ok = (actual_response.indexOf("OK") >= 0);
+            send_control_json_response(target, base_cmd.c_str(), ok, round_trip_ms);
+            }
     } else {
         Serial.printf("[BLE_SLAVE] ✗ TIMEOUT after %lu ms\n", round_trip_ms);
-        command_timeouts++;
+            command_timeouts++;
+        
+        // Send timeout error via BLE
+        send_timeout_json_response(target, base_cmd.c_str(), round_trip_ms);
     }
 }
 
@@ -256,11 +437,19 @@ static void process_ble_command(String command) {
     // Local commands (handled by BLE Slave)
     if (command == "STATS") {
         show_detailed_stats();
+        send_control_json_response("BLE", "STATS", true, 0);
         return;
     }
     
     if (command == "RESET_STATS") {
         reset_all_stats();
+        send_control_json_response("BLE", "RESET_STATS", true, 0);
+        return;
+    }
+    
+    if (command == "HELP") {
+        show_help();
+        send_control_json_response("BLE", "HELP", true, 0);
         return;
     }
     
@@ -275,6 +464,11 @@ static void process_ble_command(String command) {
     } else {
         Serial.printf("[BLE_SLAVE] ✗ Unknown BLE command: '%s'\n", command.c_str());
         ble_command_errors++;
+        
+        // Send error via BLE
+        char json[150];
+        snprintf(json, sizeof(json), "{\"cmd\":\"%s\",\"ok\":false,\"err\":\"UNKNOWN_CMD\"}", command.c_str());
+        send_ble_json_response(json);
     }
 }
 
@@ -363,6 +557,10 @@ static inline bool get_next_sample(int32_t* local_lc, int32_t* remote_lc) {
     bool got_local = false;
     bool got_remote = false;
     
+    // Initialize to zero (missing channels show as 0)
+    memset(local_lc, 0, 4 * sizeof(int32_t));
+    memset(remote_lc, 0, 4 * sizeof(int32_t));
+    
     if (data_store.local_count > 0) {
         SampleData* sample = &data_store.local_queue[data_store.local_head];
         if (!sample->consumed) {
@@ -402,7 +600,8 @@ static inline bool get_next_sample(int32_t* local_lc, int32_t* remote_lc) {
         got_remote = true;
     }
     
-    return got_local && got_remote;
+    // Return true if we have ANY data (local OR remote)
+    return got_local || got_remote;
 }
 
 // ============================================================================
@@ -499,10 +698,10 @@ static void uart_rx_task(void* param) {
                         // Read single-line response (format: "REMOTE:response" or "LOCAL:response")
                         String text_response = Serial2.readStringUntil('\n');
                         text_response.trim();
-                        
-                        if (text_response.length() > 0) {
+                     
+                     if (text_response.length() > 0) {
                             // Parse prefix and response
-                            String prefix = "";
+                             String prefix = "";
                             String response = text_response;
                             int colon_pos = text_response.indexOf(':');
                             if (colon_pos > 0 && colon_pos < 10) {
@@ -618,25 +817,46 @@ static void show_detailed_stats() {
 }
 
 static void reset_all_stats() {
-    uart_packets_received = 0;
-    uart_bytes_received = 0;
-    uart_crc_errors = 0;
-    uart_sync_errors = 0;
-    local_samples_received = 0;
-    remote_samples_received = 0;
-    ble_notifications_sent = 0;
-    ble_send_errors = 0;
+            uart_packets_received = 0;
+            uart_bytes_received = 0;
+            uart_crc_errors = 0;
+            uart_sync_errors = 0;
+            local_samples_received = 0;
+            remote_samples_received = 0;
+            ble_notifications_sent = 0;
+            ble_send_errors = 0;
     timer_samples_generated = 0;
-    commands_forwarded = 0;
-    command_responses_received = 0;
-    command_timeouts = 0;
-    ble_commands_received = 0;
-    ble_command_errors = 0;
+            commands_forwarded = 0;
+            command_responses_received = 0;
+            command_timeouts = 0;
+            ble_commands_received = 0;
+            ble_command_errors = 0;
     sample_decimation_counter = 0;
     samples_batched = 0;
     ble_packets_sent = 0;
     
     Serial.println("[BLE_SLAVE] ✓ All statistics reset");
+}
+
+static void show_help() {
+    Serial.println("\n[BLE_SLAVE] === AVAILABLE COMMANDS ===");
+    Serial.println("  Control:");
+    Serial.println("    START, STOP, RESTART, RESET (local Teensy)");
+    Serial.println("    REMOTE_START/STOP/RESTART/RESET (remote Teensy)");
+    Serial.println("    ALL_START/STOP/RESTART/RESET (both)");
+    Serial.println("  Ping:");
+    Serial.println("    LOCAL_PING, REMOTE_PING");
+    Serial.println("  Calibration:");
+    Serial.println("    LOCAL_CAL_TARE, LOCAL_CAL_SHOW, LOCAL_CAL_ADD_<kg>");
+    Serial.println("    LOCAL_CAL_ADD_CH_<ch>_<kg>, LOCAL_CAL_CLEAR, LOCAL_CAL_READ");
+    Serial.println("    REMOTE_CAL_TARE, REMOTE_CAL_SHOW, etc.");
+    Serial.println("  Stats:");
+    Serial.println("    STATS, RESET_STATS, HELP");
+    Serial.println("\n=== BLE CHARACTERISTICS ===");
+    Serial.println("  Service: 12345678-1234-1234-1234-123456789abc");
+    Serial.println("  Data:    87654321-... (NOTIFY binary sensor data)");
+    Serial.println("  Cmd:     11111111-... (WRITE cmd, NOTIFY JSON response)");
+    Serial.println("=====================================\n");
 }
 
 // ============================================================================
@@ -669,15 +889,7 @@ static void handle_serial_commands() {
             reset_all_stats();
         }
         else if (command == "HELP") {
-            Serial.println("\n[BLE_SLAVE] === AVAILABLE COMMANDS ===");
-            Serial.println("  Local:  START, STOP, RESTART, RESET, LOCAL_PING");
-            Serial.println("  Remote: REMOTE_START/STOP/RESTART/RESET, REMOTE_PING");
-            Serial.println("  Both:   ALL_START/STOP/RESTART/RESET");
-            Serial.println("  Calibration:");
-            Serial.println("    LOCAL_CAL_SHOW, LOCAL_CAL_TARE, LOCAL_CAL_ADD_<kg>, LOCAL_CAL_CLEAR, etc.");
-            Serial.println("    REMOTE_CAL_SHOW, REMOTE_CAL_TARE, REMOTE_CAL_ADD_<kg>, REMOTE_CAL_CLEAR, etc.");
-            Serial.println("  Stats:  STATS, RESET_STATS");
-            Serial.println("=====================================\n");
+            show_help();
         } else {
             Serial.printf("[BLE_SLAVE] ✗ Unknown command: '%s'\n", command.c_str());
             Serial.println("[BLE_SLAVE] Type 'HELP' for available commands");
@@ -713,6 +925,7 @@ void setup() {
     
     BLEService *pService = pServer->createService(BLE_SERVICE_UUID);
     
+    // Data characteristic - binary sensor data (NOTIFY)
     pDataCharacteristic = pService->createCharacteristic(
                         BLE_DATA_CHARACTERISTIC_UUID,
                         BLECharacteristic::PROPERTY_READ |
@@ -720,12 +933,15 @@ void setup() {
                       );
     pDataCharacteristic->addDescriptor(new BLE2902());
     
-    pCommandCharacteristic = pService->createCharacteristic(
-                        BLE_COMMAND_CHARACTERISTIC_UUID,
+    // Command characteristic - bidirectional (WRITE commands, NOTIFY responses)
+    pCmdCharacteristic = pService->createCharacteristic(
+                        BLE_CMD_CHARACTERISTIC_UUID,
                         BLECharacteristic::PROPERTY_WRITE |
-                        BLECharacteristic::PROPERTY_WRITE_NR
+                        BLECharacteristic::PROPERTY_WRITE_NR |
+                        BLECharacteristic::PROPERTY_NOTIFY
                       );
-    pCommandCharacteristic->setCallbacks(new MyCommandCallbacks());
+    pCmdCharacteristic->addDescriptor(new BLE2902());
+    pCmdCharacteristic->setCallbacks(new MyCommandCallbacks());
     
     pService->start();
     

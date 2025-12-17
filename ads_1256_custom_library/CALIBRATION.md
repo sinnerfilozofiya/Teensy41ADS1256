@@ -130,13 +130,94 @@ The current calibration code stores calibration in a properly aligned struct and
 
 ---
 
+## BLE Control (Wireless Calibration)
+
+The system supports full calibration control via BLE using the ESP32 BLE Slave.
+
+### BLE Characteristics
+
+| UUID | Name | Type | Description |
+|------|------|------|-------------|
+| `12345678-1234-1234-1234-123456789abc` | Service | - | Main BLE service |
+| `87654321-4321-4321-4321-cba987654321` | Data | NOTIFY | Binary sensor data (8 channels, 16-bit) |
+| `11111111-2222-3333-4444-555555555555` | Cmd | WRITE + NOTIFY | Send commands, receive JSON responses |
+
+### BLE Commands
+
+Prefix commands with `LOCAL_` or `REMOTE_` to target specific Teensy:
+
+| Command | Description |
+|---------|-------------|
+| `LOCAL_CAL_TARE` | Tare local Teensy |
+| `LOCAL_CAL_SHOW` | Show local calibration |
+| `LOCAL_CAL_ADD_10` | Add 10kg point to local |
+| `LOCAL_CAL_CLEAR` | Clear local calibration |
+| `LOCAL_CAL_READ` | Read calibrated values |
+| `REMOTE_CAL_TARE` | Tare remote Teensy |
+| `REMOTE_CAL_SHOW` | Show remote calibration |
+| `LOCAL_PING` | Ping local Teensy |
+| `REMOTE_PING` | Ping remote Teensy |
+| `START` / `STOP` | Control data acquisition |
+
+### JSON Response Format
+
+All responses are sent as JSON via the Response characteristic:
+
+```json
+// PING response
+{"target":"LOCAL","cmd":"PING","ok":true,"ms":45}
+
+// TARE response
+{"target":"LOCAL","cmd":"TARE","ok":true,"ms":650}
+
+// SHOW response
+{"target":"LOCAL","cmd":"SHOW","lc":[
+  {"off":38853,"a":0.015743,"n":2},
+  {"off":12345,"a":0.014892,"n":2},
+  {"off":-1234,"a":0.016021,"n":2},
+  {"off":-5678,"a":0.015156,"n":2}
+],"ms":52}
+
+// READ response
+{"target":"LOCAL","cmd":"READ","v":[100,150,120,130,500],"ms":35}
+
+// Error response
+{"target":"LOCAL","cmd":"TARE","ok":false,"err":"TIMEOUT","ms":5001}
+```
+
+### Testing with nRF Connect (Android/iOS)
+
+1. **Connect**: Open nRF Connect, scan for "LoadCell_BLE_Server", connect.
+
+2. **Subscribe to Cmd characteristic**: Find service `12345678...`, expand.
+   - Tap the Cmd characteristic (`11111111...`)
+   - Enable notifications (arrow icon) - this is where responses come back
+
+3. **Send Command**: 
+   - Same Cmd characteristic (`11111111...`)
+   - Write text: `LOCAL_PING` and send
+   - Response appears as notification: `{"target":"LOCAL","cmd":"PING","ok":true,"ms":XX}`
+
+4. **Calibration Workflow**:
+   ```
+   Send: LOCAL_CAL_CLEAR     → {"target":"LOCAL","cmd":"CLEAR","ok":true,...}
+   Send: LOCAL_CAL_TARE      → {"target":"LOCAL","cmd":"TARE","ok":true,...}
+   Send: LOCAL_CAL_ADD_10    → {"target":"LOCAL","cmd":"ADD","ok":true,...}
+   Send: LOCAL_CAL_SHOW      → {"target":"LOCAL","cmd":"SHOW","lc":[...],...}
+   ```
+
+5. **Sensor Data Stream**: Enable notifications on Data characteristic (`87654321...`) to receive binary sensor data.
+
+---
+
 ## Extension Ideas (Future Development)
 
 - **Piecewise linear calibration** per cell (more accurate across range) by fitting segments.
 - **Stability gating**: require stddev below a threshold before accepting `TARE`/`ADD`.
 - **Persist points vs only persist fit**: currently points are kept in RAM until saved; you can persist point history if needed.
 - **COP estimation**: once per-cell forces are stable, compute approximate COP using geometry and calibrated forces.
-- **Wireless/UI control**: later integrate these commands through ESP32 without changing the Teensy core logic.
+- **Custom BLE App**: Build a Flutter/React Native app that uses the JSON responses for a polished UI.
+
 
 
 
