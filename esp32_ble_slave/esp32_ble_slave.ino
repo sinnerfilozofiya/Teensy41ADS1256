@@ -81,6 +81,10 @@ static volatile unsigned long timer_interrupts_count = 0;
 // Packet rate control
 static int packet_rate_counter = 0;
 
+// Data flow tracking
+static unsigned long last_data_received_ms = 0;
+#define DATA_TIMEOUT_MS 500  // Consider data stale after 500ms (no BLE send)
+
 // ============================================================================
 // STATISTICS
 // ============================================================================
@@ -408,8 +412,10 @@ static void forward_command_to_rx_radio(String command) {
             // Calibration commands - parse the detailed response
             send_json_response(target, actual_response.c_str(), round_trip_ms);
             } else {
-            // Control commands (START, STOP, etc.) - simple OK/ERROR
-            bool ok = (actual_response.indexOf("OK") >= 0);
+            // Control commands (START, STOP, etc.) - check for success indicators
+            bool ok = (actual_response.indexOf("OK") >= 0 ||
+                       actual_response.indexOf("RUNNING") >= 0 ||
+                       actual_response.indexOf("STOPPED") >= 0);
             send_control_json_response(target, base_cmd.c_str(), ok, round_trip_ms);
             }
     } else {
@@ -505,6 +511,7 @@ class MyCommandCallbacks: public BLECharacteristicCallbacks {
 
 static inline void add_to_queue(uint8_t type, const int32_t* lc, uint16_t frame_idx, uint8_t sample_idx) {
     uint32_t now = millis();
+    last_data_received_ms = now;  // Track when we last received fresh data
     
     if (type == 'L') {
         if (data_store.local_count < QUEUE_SIZE) {
@@ -554,6 +561,17 @@ static inline void add_to_queue(uint8_t type, const int32_t* lc, uint16_t frame_
 }
 
 static inline bool get_next_sample(int32_t* local_lc, int32_t* remote_lc) {
+    // Check if data flow has stopped (stale data)
+    unsigned long now = millis();
+    unsigned long age = (last_data_received_ms > 0) ? (now - last_data_received_ms) : 999999;
+    
+    if (age > DATA_TIMEOUT_MS) {
+        // Data flow stopped - reset fallback flags and don't send
+        data_store.has_local_data = false;
+        data_store.has_remote_data = false;
+        return false;
+    }
+    
     bool got_local = false;
     bool got_remote = false;
     
@@ -589,7 +607,7 @@ static inline bool get_next_sample(int32_t* local_lc, int32_t* remote_lc) {
         }
     }
     
-    // Use last known data as fallback
+    // Use last known data as fallback (only while data is flowing)
     if (!got_local && data_store.has_local_data) {
         memcpy(local_lc, data_store.last_local_lc, sizeof(data_store.last_local_lc));
         got_local = true;
@@ -650,6 +668,8 @@ static inline void create_8channel_sample() {
 // ============================================================================
 
 static inline void send_current_batch() {
+    // Only send if: samples ready AND connected
+    // The data flow check in get_next_sample() already prevents sending when no data
     if (current_sample_count > 0 && deviceConnected) {
         current_ble_packet.sample_count = current_sample_count;
         size_t packet_size = 1 + (current_sample_count * sizeof(CompactLoadCellSample));
@@ -989,10 +1009,15 @@ void loop() {
         float uart_pps = (uart_packets_received - last_uart_packets) / 5.0f;
         float batch_sps = (samples_batched - last_samples_batched) / 5.0f;
         
-        Serial.printf("📊 LIVE | Local: %.0f sps | Remote: %.0f sps | UART: %.0f pps | BLE: %s %.0f pps (%.0f sps) | Q: L=%d R=%d\n",
+        // Check data flow status
+        unsigned long data_age = (last_data_received_ms > 0) ? (now - last_data_received_ms) : 999999;
+        bool data_flowing = (data_age < DATA_TIMEOUT_MS);
+        
+        Serial.printf("📊 LIVE | L: %.0f | R: %.0f | UART: %.0f | BLE: %s %.0f (%.0f) | Q: L=%d R=%d | Flow: %s\n",
                      local_sps, remote_sps, uart_pps,
                      deviceConnected ? "✓" : "✗", ble_pps, batch_sps,
-                     data_store.local_count, data_store.remote_count);
+                     data_store.local_count, data_store.remote_count,
+                     data_flowing ? "ON" : "OFF");
         
         // Save current values for next calculation
         last_stats_time = now;
