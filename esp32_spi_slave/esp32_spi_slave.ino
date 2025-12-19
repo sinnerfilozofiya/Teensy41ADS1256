@@ -10,7 +10,64 @@
 #include <esp_now.h>
 #include <nvs_flash.h>
 #include <nvs.h>
+#include <Wire.h>
+#include <math.h>
 #include "common_frame.h"
+
+// ============================================================================
+// BMS CONFIGURATION (from esp_bmsv2.ino)
+// ============================================================================
+
+static const uint8_t BQ_ADDR = 0x6B;
+static const int I2C_SDA = 8;
+static const int I2C_SCL = 9;
+static const uint32_t I2C_HZ = 400000;
+
+// VBAT calibration
+static const float VBAT_GAIN     = 1.0000f;
+static const float VBAT_OFFSET_V = -0.111f;
+
+// Sampling
+static const uint32_t BMS_SAMPLE_MS = 2500;  // Read battery every 2.5 seconds (reduced to save wireless bandwidth)
+static const float EMA_ALPHA = 0.10f;
+
+// BQ register map (subset for reading)
+static const uint8_t REG2E_ADC_CTRL = 0x2E;
+static const uint8_t REG2F_ADC_DIS0 = 0x2F;
+static const uint8_t REG3B_VBAT_ADC = 0x3B;
+
+// BMS state
+static float vBatFiltCal = NAN;
+static float currentSoc = 0.0f;
+static uint32_t lastBmsSampleMs = 0;
+static bool bmsInitialized = false;
+
+// SOC lookup table (VBATcal -> SOC)
+struct BmsPt { float v; float soc; };
+static const BmsPt SOC_LUT[] = {
+  {5.80f,   0.0f},
+  {6.00f,   5.0f},
+  {6.20f,  10.0f},
+  {6.30f,  20.0f},
+  {6.40f,  30.0f},
+  {6.50f,  40.0f},
+  {6.56f,  50.0f},
+  {6.60f,  60.0f},
+  {6.64f,  70.0f},
+  {6.68f,  80.0f},
+  {6.74f,  90.0f},
+  {7.00f,  95.0f},
+  {7.10f,  98.0f},
+  {7.20f, 100.0f}
+};
+
+// ESP-NOW Battery Packet
+struct __attribute__((packed)) ESPNowBattery {
+    uint8_t magic[2];     // 0xBA, 0xBB
+    float voltage;        // Calibrated VBAT in volts
+    float soc;            // State of charge 0-100%
+    uint16_t crc16;
+};  // 12 bytes
 
 #define PIN_MOSI 11
 #define PIN_MISO 13
@@ -243,6 +300,134 @@ bool validate_espnow_command(const ESPNowCommand* cmd) {
     return cmd->crc16 == expected_crc;
 }
 
+// Forward declaration for ESP-NOW (needed by BMS battery send)
+#if USE_ESPNOW
+static bool espnow_initialized = false;
+#endif
+
+// ============================================================================
+// BMS I2C HELPER FUNCTIONS
+// ============================================================================
+
+static float socFromLUT(float v) {
+  const int n = (int)(sizeof(SOC_LUT)/sizeof(SOC_LUT[0]));
+  if (v <= SOC_LUT[0].v) return SOC_LUT[0].soc;
+  if (v >= SOC_LUT[n-1].v) return SOC_LUT[n-1].soc;
+  for (int i=0; i<n-1; i++) {
+    float v0=SOC_LUT[i].v, v1=SOC_LUT[i+1].v;
+    if (v>=v0 && v<=v1) {
+      float s0=SOC_LUT[i].soc, s1=SOC_LUT[i+1].soc;
+      float t=(v-v0)/(v1-v0);
+      return s0 + t*(s1-s0);
+    }
+  }
+  return 0.0f;
+}
+
+static bool bqProbe() {
+  Wire.beginTransmission(BQ_ADDR);
+  return (Wire.endTransmission() == 0);
+}
+
+static bool bqWrite8(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(BQ_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return (Wire.endTransmission() == 0);
+}
+
+static bool bqRead8(uint8_t reg, uint8_t &val) {
+  Wire.beginTransmission(BQ_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)BQ_ADDR, (uint8_t)1) != 1) return false;
+  val = Wire.read();
+  return true;
+}
+
+static bool bqRead16_MSB(uint8_t reg, uint16_t &val) {
+  Wire.beginTransmission(BQ_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)BQ_ADDR, (uint8_t)2) != 2) return false;
+  uint8_t msb = Wire.read();
+  uint8_t lsb = Wire.read();
+  val = ((uint16_t)msb << 8) | (uint16_t)lsb;
+  return true;
+}
+
+static void bqAdcEnableBestEffort() {
+  uint8_t r2e = 0, r2f = 0;
+
+  if (bqRead8(REG2E_ADC_CTRL, r2e)) {
+    r2e |= (1 << 7);   // ADC_EN = 1
+    r2e &= ~(1 << 6);  // ADC_RATE = 0 (continuous)
+    bqWrite8(REG2E_ADC_CTRL, r2e);
+  }
+
+  if (bqRead8(REG2F_ADC_DIS0, r2f)) {
+    r2f &= ~(1 << 4);  // Clear VBAT disable bit
+    bqWrite8(REG2F_ADC_DIS0, r2f);
+  }
+
+  delay(20);  // Allow ADC to settle
+}
+
+static float applyVbatCal(float vraw) {
+  return vraw * VBAT_GAIN + VBAT_OFFSET_V;
+}
+
+static bool readVBATraw(float &vbatV) {
+  uint16_t raw = 0;
+  if (!bqRead16_MSB(REG3B_VBAT_ADC, raw)) return false;
+  vbatV = raw / 1000.0f;
+  return true;
+}
+
+static bool bmsInit() {
+  if (!bqProbe()) {
+    Serial.println("[BMS] ✗ BQ charger not found at address 0x6B");
+    return false;
+  }
+  
+  bqAdcEnableBestEffort();
+  Serial.println("[BMS] ✓ BQ charger initialized");
+  return true;
+}
+
+static void bmsUpdateReading() {
+  if (!bqProbe()) return;
+  
+  float vraw = 0;
+  if (!readVBATraw(vraw)) return;
+  
+  float vcal = applyVbatCal(vraw);
+  
+  // EMA filter
+  if (isnan(vBatFiltCal)) {
+    vBatFiltCal = vcal;
+  } else {
+    vBatFiltCal = EMA_ALPHA * vcal + (1.0f - EMA_ALPHA) * vBatFiltCal;
+  }
+  
+  currentSoc = socFromLUT(vBatFiltCal);
+}
+
+static bool sendBatteryPacket() {
+  if (!espnow_initialized) return false;
+  if (isnan(vBatFiltCal)) return false;
+  
+  ESPNowBattery pkt;
+  pkt.magic[0] = 0xBA;
+  pkt.magic[1] = 0xBB;
+  pkt.voltage = vBatFiltCal;
+  pkt.soc = currentSoc;
+  pkt.crc16 = crc16_ccitt_false((const uint8_t*)&pkt, sizeof(ESPNowBattery) - 2);
+  
+  esp_err_t result = esp_now_send(ESPNOW_PEER_MAC, (uint8_t*)&pkt, sizeof(pkt));
+  return (result == ESP_OK);
+}
+
 // Network objects
 #if USE_WIFI_UDP
 static WiFiUDP udp;
@@ -251,7 +436,7 @@ static bool wifi_connected = false;
 #endif
 
 #if USE_ESPNOW
-static bool espnow_initialized = false;
+// espnow_initialized declared earlier (needed by BMS battery send)
 static volatile uint32_t espnow_send_success = 0;
 static volatile uint32_t espnow_send_fail = 0;
 #endif
@@ -585,6 +770,11 @@ static void stats_task(void*){
       (unsigned long)net_w_ok,(unsigned long)net_w_fail,(unsigned long)net_w_drops,
       kbps_total,kbps_win,sps_total,sps_win,
       (unsigned long)dtmin,(unsigned long)dtmax,(unsigned)last_idx);
+    
+    // Battery status log
+    Serial.printf("🔋 BAT | VBAT=%.2fV SOC=%.1f%% | BMS=%s\n",
+      isnan(vBatFiltCal) ? 0.0f : vBatFiltCal, currentSoc,
+      bmsInitialized ? "OK" : "N/A");
 
     // reset 5 s window
     win_ok=win_crc=win_missed=0;
@@ -684,6 +874,8 @@ void handle_serial_commands() {
       Serial.printf("  SPI Frames: OK=%lu CRC=%lu Missed=%lu\n", (unsigned long)frames_ok, (unsigned long)frames_crc, (unsigned long)frames_missed);
       Serial.printf("  Network: Sent=%lu Fail=%lu Drops=%lu\n", (unsigned long)net_sent_ok, (unsigned long)net_send_fail, (unsigned long)net_queue_drops);
       Serial.printf("  ESP-NOW: Cmds=%lu Errors=%lu\n", (unsigned long)espnow_commands_received, (unsigned long)espnow_command_errors);
+      Serial.printf("  BMS: %s | VBAT=%.2fV SOC=%.1f%%\n", bmsInitialized ? "OK" : "N/A", 
+                    isnan(vBatFiltCal) ? 0.0f : vBatFiltCal, currentSoc);
       Serial.printf("  Raw data: %s | Heap: %lu bytes\n", output_raw_data ? "ON" : "OFF", ESP.getFreeHeap());
       Serial.println("==========================\n");
     } else if (command == "HELP") {
@@ -701,6 +893,15 @@ void setup() {
   Serial.begin(921600); // fast prints so we never stall
   delay(200);
   Serial.println("\n[TX] SPI SLAVE + RADIO TX starting");
+
+  // Initialize I2C for BMS
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(I2C_HZ);
+  Wire.setTimeOut(50);
+  Serial.printf("[BMS] I2C initialized (SDA=GPIO%d, SCL=GPIO%d, %lu Hz)\n", I2C_SDA, I2C_SCL, I2C_HZ);
+  
+  // Initialize BMS
+  bmsInitialized = bmsInit();
 
   // Initialize NVS
   esp_err_t ret = nvs_flash_init();
@@ -792,6 +993,14 @@ void loop() {
     if (line.length() > 0) {
       Serial.printf("[SPI_SLAVE] Teensy: %s\n", line.c_str());
     }
+  }
+  
+  // Periodic BMS reading and sending
+  uint32_t now = millis();
+  if (bmsInitialized && (now - lastBmsSampleMs >= BMS_SAMPLE_MS)) {
+    lastBmsSampleMs = now;
+    bmsUpdateReading();
+    sendBatteryPacket();
   }
   
   handle_serial_commands();

@@ -1,9 +1,19 @@
 #include <Arduino.h>
+#include <WiFi.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include "common_frame.h"
+
+// ============================================================================
+// DEVICE INFORMATION (for BLE Device Information Service)
+// ============================================================================
+#define DEVICE_MANUFACTURER_NAME "well body tech"
+#define DEVICE_MODEL_NUMBER      "mesh force plate"
+#define FIRMWARE_VERSION         "1.0.0"        // Format: MAJOR.MINOR.PATCH
+#define HARDWARE_VERSION         "PCB-1.0"      // Format: PCB-MAJOR.MINOR
+#define SOFTWARE_VERSION         "lib-1.0.0"    // Format: lib-MAJOR.MINOR.PATCH
 
 // ============================================================================
 // UART CONFIGURATION (must match master ESP32)
@@ -24,16 +34,54 @@ struct __attribute__((packed)) UartPacket {
 };
 
 // ============================================================================
+// UART BATTERY PACKET (received from RX Radio)
+// ============================================================================
+
+struct __attribute__((packed)) UartBatteryPacket {
+    uint8_t sync[2];      // 0xBB, 0x55
+    float local_voltage;
+    float local_soc;
+    float remote_voltage;
+    float remote_soc;
+    uint16_t crc16;
+};  // 20 bytes
+
+// Battery data storage
+static float battery_local_voltage = 0.0f;
+static float battery_local_soc = 0.0f;
+static float battery_remote_voltage = 0.0f;
+static float battery_remote_soc = 0.0f;
+static uint32_t last_battery_received_ms = 0;
+static uint32_t last_battery_ble_send_ms = 0;
+static unsigned long battery_packets_received = 0;
+
+// ============================================================================
 // BLE CONFIGURATION
 // ============================================================================
 
+// Custom service for load cell data
 #define BLE_SERVICE_UUID        "12345678-1234-1234-1234-123456789abc"
+
+// Standard BLE Battery Service (so diagnostic tools can read battery level automatically)
+#define BLE_BATTERY_SERVICE_UUID        BLEUUID((uint16_t)0x180F)  // Standard Battery Service
+#define BLE_BATTERY_LEVEL_CHAR_UUID     BLEUUID((uint16_t)0x2A19)  // Standard Battery Level (0-100%)
 #define BLE_DATA_CHARACTERISTIC_UUID "87654321-4321-4321-4321-cba987654321"
 #define BLE_CMD_CHARACTERISTIC_UUID "11111111-2222-3333-4444-555555555555"  // Bidirectional: WRITE + NOTIFY
 
 BLEServer* pServer = nullptr;
-BLECharacteristic* pDataCharacteristic = nullptr;  // Sensor data (binary NOTIFY)
-BLECharacteristic* pCmdCharacteristic = nullptr;   // Commands (WRITE) + Responses (NOTIFY)
+BLECharacteristic* pDataCharacteristic = nullptr;    // Sensor data (binary NOTIFY)
+BLECharacteristic* pCmdCharacteristic = nullptr;     // Commands (WRITE) + Responses (NOTIFY)
+BLECharacteristic* pStdBatteryLevelChar = nullptr;        // Standard Battery Level (0-100%) - min of both
+
+// Device Information Service characteristics
+BLECharacteristic* pManufacturerChar = nullptr;
+BLECharacteristic* pModelNumberChar = nullptr;
+BLECharacteristic* pSerialNumberChar = nullptr;
+BLECharacteristic* pFirmwareRevisionChar = nullptr;
+BLECharacteristic* pHardwareRevisionChar = nullptr;
+BLECharacteristic* pSoftwareRevisionChar = nullptr;
+BLECharacteristic* pAppearanceChar = nullptr;
+
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
@@ -178,6 +226,68 @@ static inline void process_uart_packet(const UartPacket* packet) {
             add_to_queue('R', packet->lc, packet->frame_idx, packet->sample_idx);
             break;
     }
+}
+
+// ============================================================================
+// BATTERY PACKET PROCESSING
+// ============================================================================
+
+static inline uint16_t calculate_battery_crc(const UartBatteryPacket* packet) {
+    const uint8_t* data = (const uint8_t*)packet + 2;
+    uint32_t length = sizeof(UartBatteryPacket) - 4;
+    return crc16_ccitt_false(data, length);
+}
+
+static inline bool validate_battery_packet(const UartBatteryPacket* packet) {
+    if (packet->sync[0] != 0xBB || packet->sync[1] != 0x55) {
+        return false;
+    }
+    
+    uint16_t expected_crc = calculate_battery_crc(packet);
+    return packet->crc16 == expected_crc;
+}
+
+static inline void process_battery_packet(const UartBatteryPacket* packet) {
+    if (!validate_battery_packet(packet)) {
+        return;
+    }
+    
+    battery_local_voltage = packet->local_voltage;
+    battery_local_soc = packet->local_soc;
+    battery_remote_voltage = packet->remote_voltage;
+    battery_remote_soc = packet->remote_soc;
+    last_battery_received_ms = millis();
+    battery_packets_received++;
+}
+
+static void send_battery_ble_notification() {
+    // Only send if we have recent battery data (within 10 seconds)
+    if (last_battery_received_ms == 0 || (millis() - last_battery_received_ms) > 10000) return;
+    
+    // Update Standard BLE Battery Level (0x2A19) - use MIN of both batteries (worst-case)
+    // This gives a conservative estimate for overall system battery level
+    if (pStdBatteryLevelChar != nullptr) {
+        uint8_t localLevel = (uint8_t)constrain((int)battery_local_soc, 0, 100);
+        uint8_t remoteLevel = (uint8_t)constrain((int)battery_remote_soc, 0, 100);
+        uint8_t batteryLevel = min(localLevel, remoteLevel);
+        pStdBatteryLevelChar->setValue(&batteryLevel, 1);
+        
+        if (deviceConnected) {
+            try { pStdBatteryLevelChar->notify(); } catch (...) {}
+        }
+    }
+}
+
+// Send battery status JSON response for BAT command
+static void send_battery_json_response() {
+    char json[200];
+    snprintf(json, sizeof(json), 
+        "{\"target\":\"BLE\",\"cmd\":\"BAT\",\"ok\":true,"
+        "\"local\":{\"v\":%.2f,\"pct\":%.1f},"
+        "\"remote\":{\"v\":%.2f,\"pct\":%.1f},\"ms\":0}",
+        battery_local_voltage, battery_local_soc,
+        battery_remote_voltage, battery_remote_soc);
+    send_ble_json_response(json);
 }
 
 // ============================================================================
@@ -458,7 +568,15 @@ static void process_ble_command(String command) {
         send_control_json_response("BLE", "HELP", true, 0);
         return;
     }
-    
+
+    if (command == "BAT") {
+        Serial.printf("[BLE_SLAVE] Battery: Local=%.2fV (%.1f%%), Remote=%.2fV (%.1f%%)\n",
+                     battery_local_voltage, battery_local_soc, 
+                     battery_remote_voltage, battery_remote_soc);
+        send_battery_json_response();
+        return;
+    }
+
     // Valid commands to forward to ESP32 RX Radio
     if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
         command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
@@ -693,13 +811,15 @@ static inline void send_current_batch() {
 // ============================================================================
 
 static void uart_rx_task(void* param) {
-    UartPacket packet;
-    uint8_t* packet_ptr = (uint8_t*)&packet;
-    int bytes_needed = sizeof(UartPacket);
+    // Buffer for both packet types (use larger one)
+    uint8_t packet_buffer[32];  // Max of UartPacket (24) or UartBatteryPacket (20)
     int bytes_received = 0;
     bool sync_found = false;
+    uint8_t packet_type = 0;  // 0xAA = load cell, 0xBB = battery
+    int bytes_needed = 0;
     
-    Serial.printf("UART RX Task started, expecting %d byte packets\n", bytes_needed);
+    Serial.printf("UART RX Task started, handling load cell (%d bytes) and battery (%d bytes) packets\n", 
+                  (int)sizeof(UartPacket), (int)sizeof(UartBatteryPacket));
     
     while (true) {
         int available = Serial2.available();
@@ -746,27 +866,51 @@ static void uart_rx_task(void* param) {
                 
                 byte = Serial2.read();
                 
+                // Check for load cell packet sync (0xAA 0x55)
                 if (byte == 0xAA) {
-                    packet_ptr[0] = byte;
+                    packet_buffer[0] = byte;
                     bytes_received = 1;
-                } else if (bytes_received == 1 && byte == 0x55) {
-                    packet_ptr[1] = byte;
+                    packet_type = 0xAA;
+                }
+                // Check for battery packet sync (0xBB 0x55)
+                else if (byte == 0xBB) {
+                    packet_buffer[0] = byte;
+                    bytes_received = 1;
+                    packet_type = 0xBB;
+                }
+                else if (bytes_received == 1 && byte == 0x55) {
+                    packet_buffer[1] = byte;
                     bytes_received = 2;
                     sync_found = true;
+                    
+                    // Set expected packet size based on type
+                    if (packet_type == 0xAA) {
+                        bytes_needed = sizeof(UartPacket);
+                    } else if (packet_type == 0xBB) {
+                        bytes_needed = sizeof(UartBatteryPacket);
+                    }
                 } else {
                     bytes_received = 0;
+                    packet_type = 0;
                 }
             } else {
                 int to_read = min(available, bytes_needed - bytes_received);
                 
                 if (to_read > 0) {
-                    int actual_read = Serial2.readBytes(packet_ptr + bytes_received, to_read);
+                    int actual_read = Serial2.readBytes(packet_buffer + bytes_received, to_read);
                     bytes_received += actual_read;
                     
                     if (bytes_received >= bytes_needed) {
-                        process_uart_packet(&packet);
+                        // Process based on packet type
+                        if (packet_type == 0xAA) {
+                            process_uart_packet((UartPacket*)packet_buffer);
+                        } else if (packet_type == 0xBB) {
+                            process_battery_packet((UartBatteryPacket*)packet_buffer);
+                        }
+                        
                         bytes_received = 0;
                         sync_found = false;
+                        packet_type = 0;
                     }
                 }
             }
@@ -826,6 +970,9 @@ static void show_detailed_stats() {
     Serial.println("  --- BLE ---");
     Serial.printf("  Status: %s | Notifications: %lu | Packets: %lu | Errors: %lu\n", 
                  deviceConnected ? "CONNECTED" : "DISCONNECTED", ble_notifications_sent, ble_packets_sent, ble_send_errors);
+    Serial.println("  --- Battery ---");
+    Serial.printf("  Local: %.2fV (%.1f%%) | Remote: %.2fV (%.1f%%) | Packets: %lu\n", 
+                 battery_local_voltage, battery_local_soc, battery_remote_voltage, battery_remote_soc, battery_packets_received);
     Serial.println("  --- Commands ---");
     Serial.printf("  BLE cmds: %lu | Forwarded: %lu | Responses: %lu | Timeouts: %lu\n", 
                  ble_commands_received, commands_forwarded, command_responses_received, command_timeouts);
@@ -870,12 +1017,20 @@ static void show_help() {
     Serial.println("    LOCAL_CAL_TARE, LOCAL_CAL_SHOW, LOCAL_CAL_ADD_<kg>");
     Serial.println("    LOCAL_CAL_ADD_CH_<ch>_<kg>, LOCAL_CAL_CLEAR, LOCAL_CAL_READ");
     Serial.println("    REMOTE_CAL_TARE, REMOTE_CAL_SHOW, etc.");
-    Serial.println("  Stats:");
-    Serial.println("    STATS, RESET_STATS, HELP");
+    Serial.println("  Stats/Info:");
+    Serial.println("    STATS, RESET_STATS, HELP, BAT");
     Serial.println("\n=== BLE CHARACTERISTICS ===");
     Serial.println("  Service: 12345678-1234-1234-1234-123456789abc");
     Serial.println("  Data:    87654321-... (NOTIFY binary sensor data)");
     Serial.println("  Cmd:     11111111-... (WRITE cmd, NOTIFY JSON response)");
+    Serial.println("\n=== BAT COMMAND RESPONSE ===");
+    Serial.println("  {\"target\":\"BLE\",\"cmd\":\"BAT\",\"ok\":true,");
+    Serial.println("   \"local\":{\"v\":4.12,\"pct\":85.0},");
+    Serial.println("   \"remote\":{\"v\":3.98,\"pct\":72.0},\"ms\":0}");
+    Serial.println("\n=== STANDARD BLE SERVICES ===");
+    Serial.println("  Battery Service: 0x180F (Battery Level: 0x2A19)");
+    Serial.println("  Device Info: 0x180A (Manufacturer, Model, Serial, Versions)");
+    Serial.println("  Appearance: Weight Scale icon (0x0B40)");
     Serial.println("=====================================\n");
 }
 
@@ -910,11 +1065,29 @@ static void handle_serial_commands() {
         }
         else if (command == "HELP") {
             show_help();
+        }
+        else if (command == "BAT") {
+            Serial.printf("[BLE_SLAVE] Battery: Local=%.2fV (%.1f%%), Remote=%.2fV (%.1f%%)\n",
+                         battery_local_voltage, battery_local_soc, 
+                         battery_remote_voltage, battery_remote_soc);
         } else {
             Serial.printf("[BLE_SLAVE] ✗ Unknown command: '%s'\n", command.c_str());
             Serial.println("[BLE_SLAVE] Type 'HELP' for available commands");
         }
     }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+static String generate_serial_number() {
+    // Get MAC address using Arduino ESP32 API (works without WiFi initialization)
+    String macStr = WiFi.macAddress();
+    // Convert from "AA:BB:CC:DD:EE:FF" format to "AABBCCDDEEFF"
+    macStr.replace(":", "");
+    macStr.toUpperCase();
+    return macStr;
 }
 
 // ============================================================================
@@ -962,13 +1135,87 @@ void setup() {
                       );
     pCmdCharacteristic->addDescriptor(new BLE2902());
     pCmdCharacteristic->setCallbacks(new MyCommandCallbacks());
-    
+
     pService->start();
+    
+    // ========== STANDARD BLE BATTERY SERVICE (0x180F) ==========
+    // Single Battery Level showing minimum of both batteries (worst-case)
+    // Custom characteristic below has full details (local+remote voltage+SOC)
+    BLEService *pBatteryService = pServer->createService(BLEUUID((uint16_t)0x180F));
+    
+    pStdBatteryLevelChar = pBatteryService->createCharacteristic(
+                        BLEUUID((uint16_t)0x2A19),
+                        BLECharacteristic::PROPERTY_READ |
+                        BLECharacteristic::PROPERTY_NOTIFY
+                      );
+    pStdBatteryLevelChar->addDescriptor(new BLE2902());
+    
+    uint8_t initialLevel = 0;
+    pStdBatteryLevelChar->setValue(&initialLevel, 1);
+    
+    pBatteryService->start();
+    Serial.println("[BLE] Standard Battery Service started");
+    // ===========================================================
+    
+    // ========== DEVICE INFORMATION SERVICE (0x180A) ==========
+    BLEService *pDeviceInfoService = pServer->createService(BLEUUID((uint16_t)0x180A));
+    
+    // Manufacturer Name String (0x2A29)
+    pManufacturerChar = pDeviceInfoService->createCharacteristic(
+        BLEUUID((uint16_t)0x2A29), BLECharacteristic::PROPERTY_READ);
+    pManufacturerChar->setValue(DEVICE_MANUFACTURER_NAME);
+    
+    // Model Number String (0x2A24)
+    pModelNumberChar = pDeviceInfoService->createCharacteristic(
+        BLEUUID((uint16_t)0x2A24), BLECharacteristic::PROPERTY_READ);
+    pModelNumberChar->setValue(DEVICE_MODEL_NUMBER);
+    
+    // Serial Number String (0x2A25)
+    pSerialNumberChar = pDeviceInfoService->createCharacteristic(
+        BLEUUID((uint16_t)0x2A25), BLECharacteristic::PROPERTY_READ);
+    String serial = generate_serial_number();
+    pSerialNumberChar->setValue(serial.c_str());
+    
+    // Firmware Revision String (0x2A26)
+    pFirmwareRevisionChar = pDeviceInfoService->createCharacteristic(
+        BLEUUID((uint16_t)0x2A26), BLECharacteristic::PROPERTY_READ);
+    pFirmwareRevisionChar->setValue(FIRMWARE_VERSION);
+    
+    // Hardware Revision String (0x2A27)
+    pHardwareRevisionChar = pDeviceInfoService->createCharacteristic(
+        BLEUUID((uint16_t)0x2A27), BLECharacteristic::PROPERTY_READ);
+    pHardwareRevisionChar->setValue(HARDWARE_VERSION);
+    
+    // Software Revision String (0x2A28)
+    pSoftwareRevisionChar = pDeviceInfoService->createCharacteristic(
+        BLEUUID((uint16_t)0x2A28), BLECharacteristic::PROPERTY_READ);
+    pSoftwareRevisionChar->setValue(SOFTWARE_VERSION);
+    
+    pDeviceInfoService->start();
+    Serial.println("[BLE] Device Information Service started");
+    Serial.printf("[BLE] Serial: %s\n", serial.c_str());
+    // ===========================================================
+    
+    // ========== GENERIC ACCESS PROFILE SERVICE (0x1800) ==========
+    // Add Appearance characteristic for device icon in scanners
+    BLEService *pGAPService = pServer->createService(BLEUUID((uint16_t)0x1800));
+    
+    // Appearance (0x2A01) - Weight Scale (0x0B40)
+    pAppearanceChar = pGAPService->createCharacteristic(
+        BLEUUID((uint16_t)0x2A01), BLECharacteristic::PROPERTY_READ);
+    uint16_t appearance = 0x0B40;  // Generic Weight Scale
+    pAppearanceChar->setValue((uint8_t*)&appearance, 2);
+    
+    pGAPService->start();
+    Serial.println("[BLE] Generic Access Profile Service started (Appearance: Weight Scale)");
+    // ===========================================================
     
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(BLE_SERVICE_UUID);
-    pAdvertising->setScanResponse(false);
-    pAdvertising->setMinPreferred(0x0);
+    pAdvertising->addServiceUUID(BLE_BATTERY_SERVICE_UUID);  // Advertise standard battery service
+    pAdvertising->addServiceUUID(BLEUUID((uint16_t)0x180A));  // Device Information Service
+    pAdvertising->setScanResponse(true);  // Enable scan response for battery service
+    pAdvertising->setMinPreferred(0x06);  // Recommended for iOS
     BLEDevice::startAdvertising();
     
     Serial.println("[BLE_SLAVE] BLE server started, waiting for connections...");
@@ -1000,6 +1247,12 @@ void loop() {
     
     unsigned long now = millis();
     
+    // Send battery BLE notifications every 3 seconds (reduced to save bandwidth)
+    if (now - last_battery_ble_send_ms >= 3000) {
+        last_battery_ble_send_ms = now;
+        send_battery_ble_notification();
+    }
+    
     // Print live stats every 5 seconds
     if (now - last_stats_time >= 5000) {
         // Calculate rates (per second over 5 second window)
@@ -1013,11 +1266,12 @@ void loop() {
         unsigned long data_age = (last_data_received_ms > 0) ? (now - last_data_received_ms) : 999999;
         bool data_flowing = (data_age < DATA_TIMEOUT_MS);
         
-        Serial.printf("📊 LIVE | L: %.0f | R: %.0f | UART: %.0f | BLE: %s %.0f (%.0f) | Q: L=%d R=%d | Flow: %s\n",
+        Serial.printf("📊 LIVE | L: %.0f | R: %.0f | UART: %.0f | BLE: %s %.0f (%.0f) | Q: L=%d R=%d | Flow: %s | BAT: L=%.1f%% R=%.1f%%\n",
                      local_sps, remote_sps, uart_pps,
                      deviceConnected ? "✓" : "✗", ble_pps, batch_sps,
                      data_store.local_count, data_store.remote_count,
-                     data_flowing ? "ON" : "OFF");
+                     data_flowing ? "ON" : "OFF",
+                     battery_local_soc, battery_remote_soc);
         
         // Save current values for next calculation
         last_stats_time = now;

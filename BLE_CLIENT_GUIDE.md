@@ -84,6 +84,9 @@ All command responses are JSON objects with these fields:
 
 // Control command
 {"target":"LOCAL","cmd":"START","ok":true,"ms":120}
+
+// BAT - battery status
+{"target":"BLE","cmd":"BAT","ok":true,"local":{"v":4.12,"pct":85.0},"remote":{"v":3.98,"pct":72.0},"ms":0}
 ```
 
 ---
@@ -161,6 +164,31 @@ Bytes 1-160:   samples[sample_count]
 |---------|-------------|
 | `STATS` | Show BLE Slave statistics |
 | `RESET_STATS` | Reset statistics counters |
+
+### Battery Command
+
+| Command | Description |
+|---------|-------------|
+| `BAT` | Get battery status for both local and remote batteries |
+
+**BAT Response Format:**
+```json
+{
+  "target": "BLE",
+  "cmd": "BAT",
+  "ok": true,
+  "local": {"v": 4.12, "pct": 85.0},
+  "remote": {"v": 3.98, "pct": 72.0},
+  "ms": 0
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `local.v` | Local battery voltage (V) |
+| `local.pct` | Local battery percentage (0-100%) |
+| `remote.v` | Remote battery voltage (V) |
+| `remote.pct` | Remote battery percentage (0-100%) |
 
 ---
 
@@ -413,6 +441,9 @@ Values are in 10g units (divide by 100 for kg).
 Service:   12345678-1234-1234-1234-123456789abc
 Data:      87654321-4321-4321-4321-cba987654321  (NOTIFY)
 Cmd:       11111111-2222-3333-4444-555555555555  (WRITE + NOTIFY)
+
+Standard Battery Service: 0x180F
+Battery Level Char:       0x2A19  (READ + NOTIFY, shows MIN of both batteries)
 ```
 
 ### Data Specs
@@ -431,6 +462,31 @@ Cmd:       11111111-2222-3333-4444-555555555555  (WRITE + NOTIFY)
 |------|---------|
 | Normal | 5 seconds |
 | Calibration | 15 seconds |
+
+---
+
+## Battery Monitoring
+
+The system has two batteries (local and remote). There are two ways to monitor battery status:
+
+### 1. BAT Command (Detailed)
+
+Send `BAT` to get full battery information:
+
+```
+Send: BAT
+Response: {"target":"BLE","cmd":"BAT","ok":true,"local":{"v":4.12,"pct":85.0},"remote":{"v":3.98,"pct":72.0},"ms":0}
+```
+
+### 2. Standard BLE Battery Service (Quick)
+
+The device also exposes a standard BLE Battery Service (0x180F) that any BLE diagnostic tool can read automatically:
+
+- **Service UUID:** `0x180F`
+- **Battery Level Characteristic:** `0x2A19`
+- **Value:** Single byte 0-100%, representing the **minimum** of both batteries
+
+This means if local is 85% and remote is 72%, the standard battery level will show 72% (worst-case).
 
 ---
 

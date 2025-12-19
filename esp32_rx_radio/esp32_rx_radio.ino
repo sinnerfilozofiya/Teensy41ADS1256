@@ -7,7 +7,81 @@
 #include <esp_wifi.h>
 #include <esp_now.h>
 #include <nvs_flash.h>
+#include <Wire.h>
+#include <math.h>
 #include "common_frame.h"
+
+// ============================================================================
+// BMS CONFIGURATION (from esp_bmsv2.ino)
+// ============================================================================
+
+static const uint8_t BQ_ADDR = 0x6B;
+static const int I2C_SDA = 8;
+static const int I2C_SCL = 9;
+static const uint32_t I2C_HZ = 400000;
+
+// VBAT calibration
+static const float VBAT_GAIN     = 1.0000f;
+static const float VBAT_OFFSET_V = -0.111f;
+
+// Sampling
+static const uint32_t BMS_SAMPLE_MS = 2500;   // Read battery every 2.5 seconds
+static const uint32_t BMS_UART_SEND_MS = 3000; // Send battery data to BLE slave every 3 seconds
+static const float EMA_ALPHA = 0.10f;
+
+// BQ register map (subset for reading)
+static const uint8_t REG2E_ADC_CTRL = 0x2E;
+static const uint8_t REG2F_ADC_DIS0 = 0x2F;
+static const uint8_t REG3B_VBAT_ADC = 0x3B;
+
+// BMS state - Local
+static float vBatFiltCal = NAN;
+static float currentSoc = 0.0f;
+static uint32_t lastBmsSampleMs = 0;
+static uint32_t lastBmsUartSendMs = 0;
+static bool bmsInitialized = false;
+
+// BMS state - Remote (received from SPI Slave via ESP-NOW)
+static float remoteVoltage = NAN;
+static float remoteSoc = 0.0f;
+static uint32_t lastRemoteBmsMs = 0;
+
+// SOC lookup table (VBATcal -> SOC)
+struct BmsPt { float v; float soc; };
+static const BmsPt SOC_LUT[] = {
+  {5.80f,   0.0f},
+  {6.00f,   5.0f},
+  {6.20f,  10.0f},
+  {6.30f,  20.0f},
+  {6.40f,  30.0f},
+  {6.50f,  40.0f},
+  {6.56f,  50.0f},
+  {6.60f,  60.0f},
+  {6.64f,  70.0f},
+  {6.68f,  80.0f},
+  {6.74f,  90.0f},
+  {7.00f,  95.0f},
+  {7.10f,  98.0f},
+  {7.20f, 100.0f}
+};
+
+// ESP-NOW Battery Packet (received from SPI Slave)
+struct __attribute__((packed)) ESPNowBattery {
+    uint8_t magic[2];     // 0xBA, 0xBB
+    float voltage;        // Calibrated VBAT in volts
+    float soc;            // State of charge 0-100%
+    uint16_t crc16;
+};  // 12 bytes
+
+// UART Battery Packet (sent to BLE Slave)
+struct __attribute__((packed)) UartBatteryPacket {
+    uint8_t sync[2];      // 0xBB, 0x55
+    float local_voltage;
+    float local_soc;
+    float remote_voltage;
+    float remote_soc;
+    uint16_t crc16;
+};  // 20 bytes
 
 // ============================================================================
 // PIN CONFIGURATION
@@ -249,6 +323,143 @@ bool validate_espnow_response(const ESPNowResponse* resp) {
     return resp->crc16 == expected_crc;
 }
 
+// ============================================================================
+// BMS I2C HELPER FUNCTIONS
+// ============================================================================
+
+static float socFromLUT(float v) {
+  const int n = (int)(sizeof(SOC_LUT)/sizeof(SOC_LUT[0]));
+  if (v <= SOC_LUT[0].v) return SOC_LUT[0].soc;
+  if (v >= SOC_LUT[n-1].v) return SOC_LUT[n-1].soc;
+  for (int i=0; i<n-1; i++) {
+    float v0=SOC_LUT[i].v, v1=SOC_LUT[i+1].v;
+    if (v>=v0 && v<=v1) {
+      float s0=SOC_LUT[i].soc, s1=SOC_LUT[i+1].soc;
+      float t=(v-v0)/(v1-v0);
+      return s0 + t*(s1-s0);
+    }
+  }
+  return 0.0f;
+}
+
+static bool bqProbe() {
+  Wire.beginTransmission(BQ_ADDR);
+  return (Wire.endTransmission() == 0);
+}
+
+static bool bqWrite8(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(BQ_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return (Wire.endTransmission() == 0);
+}
+
+static bool bqRead8(uint8_t reg, uint8_t &val) {
+  Wire.beginTransmission(BQ_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)BQ_ADDR, (uint8_t)1) != 1) return false;
+  val = Wire.read();
+  return true;
+}
+
+static bool bqRead16_MSB(uint8_t reg, uint16_t &val) {
+  Wire.beginTransmission(BQ_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)BQ_ADDR, (uint8_t)2) != 2) return false;
+  uint8_t msb = Wire.read();
+  uint8_t lsb = Wire.read();
+  val = ((uint16_t)msb << 8) | (uint16_t)lsb;
+  return true;
+}
+
+static void bqAdcEnableBestEffort() {
+  uint8_t r2e = 0, r2f = 0;
+
+  if (bqRead8(REG2E_ADC_CTRL, r2e)) {
+    r2e |= (1 << 7);   // ADC_EN = 1
+    r2e &= ~(1 << 6);  // ADC_RATE = 0 (continuous)
+    bqWrite8(REG2E_ADC_CTRL, r2e);
+  }
+
+  if (bqRead8(REG2F_ADC_DIS0, r2f)) {
+    r2f &= ~(1 << 4);  // Clear VBAT disable bit
+    bqWrite8(REG2F_ADC_DIS0, r2f);
+  }
+
+  delay(20);  // Allow ADC to settle
+}
+
+static float applyVbatCal(float vraw) {
+  return vraw * VBAT_GAIN + VBAT_OFFSET_V;
+}
+
+static bool readVBATraw(float &vbatV) {
+  uint16_t raw = 0;
+  if (!bqRead16_MSB(REG3B_VBAT_ADC, raw)) return false;
+  vbatV = raw / 1000.0f;
+  return true;
+}
+
+static bool bmsInit() {
+  if (!bqProbe()) {
+    Serial.println("[BMS] ✗ BQ charger not found at address 0x6B");
+    return false;
+  }
+  
+  bqAdcEnableBestEffort();
+  Serial.println("[BMS] ✓ BQ charger initialized");
+  return true;
+}
+
+static void bmsUpdateReading() {
+  if (!bqProbe()) return;
+  
+  float vraw = 0;
+  if (!readVBATraw(vraw)) return;
+  
+  float vcal = applyVbatCal(vraw);
+  
+  // EMA filter
+  if (isnan(vBatFiltCal)) {
+    vBatFiltCal = vcal;
+  } else {
+    vBatFiltCal = EMA_ALPHA * vcal + (1.0f - EMA_ALPHA) * vBatFiltCal;
+  }
+  
+  currentSoc = socFromLUT(vBatFiltCal);
+}
+
+static bool validateEspNowBattery(const ESPNowBattery* pkt) {
+  if (pkt->magic[0] != 0xBA || pkt->magic[1] != 0xBB) {
+    return false;
+  }
+  uint16_t expected_crc = crc16_ccitt_false((const uint8_t*)pkt, sizeof(ESPNowBattery) - 2);
+  return pkt->crc16 == expected_crc;
+}
+
+static uint16_t calculateBatteryUartCrc(const UartBatteryPacket* pkt) {
+  // CRC of everything except sync bytes and crc field
+  const uint8_t* data = (const uint8_t*)pkt + 2;
+  uint32_t length = sizeof(UartBatteryPacket) - 4;
+  return crc16_ccitt_false(data, length);
+}
+
+static bool sendBatteryToBleSlave() {
+  UartBatteryPacket pkt;
+  pkt.sync[0] = 0xBB;
+  pkt.sync[1] = 0x55;
+  pkt.local_voltage = isnan(vBatFiltCal) ? 0.0f : vBatFiltCal;
+  pkt.local_soc = currentSoc;
+  pkt.remote_voltage = isnan(remoteVoltage) ? 0.0f : remoteVoltage;
+  pkt.remote_soc = remoteSoc;
+  pkt.crc16 = calculateBatteryUartCrc(&pkt);
+  
+  size_t bytes_written = Serial2.write((uint8_t*)&pkt, sizeof(pkt));
+  return (bytes_written == sizeof(pkt));
+}
+
 static inline void count_sample(char type, uint16_t frame_idx, uint8_t sample_idx,
                                int32_t lc1, int32_t lc2, int32_t lc3, int32_t lc4) {
     if (type == 'L') {
@@ -320,6 +531,18 @@ static void spi_rx_task(void* param) {
 // ============================================================================
 
 static void espnow_rx_callback(const esp_now_recv_info *recv_info, const uint8_t *data, int len) {
+    // Check if this is a battery packet from SPI Slave
+    if (len == sizeof(ESPNowBattery)) {
+        const ESPNowBattery* batt = (const ESPNowBattery*)data;
+        
+        if (validateEspNowBattery(batt)) {
+            remoteVoltage = batt->voltage;
+            remoteSoc = batt->soc;
+            lastRemoteBmsMs = millis();
+            return;
+        }
+    }
+    
     // Check if this is a response packet
     if (len == sizeof(ESPNowResponse)) {
         const ESPNowResponse* resp = (const ESPNowResponse*)data;
@@ -674,6 +897,11 @@ static void process_command(String command) {
         Serial.printf("  Frames:    Local=%lu  Remote=%lu\n", local_frames_count, remote_frames_count);
         Serial.printf("  UART TX:   %lu packets (%lu bytes), %lu errors\n", uart_packets_sent, uart_bytes_sent, uart_send_errors);
         Serial.printf("  ESP-NOW:   %lu commands sent, %lu errors\n", espnow_commands_sent, espnow_command_errors);
+        Serial.printf("  BMS Local: %s | VBAT=%.2fV SOC=%.1f%%\n", bmsInitialized ? "OK" : "N/A", 
+                      isnan(vBatFiltCal) ? 0.0f : vBatFiltCal, currentSoc);
+        Serial.printf("  BMS Remote: VBAT=%.2fV SOC=%.1f%% (age=%lums)\n", 
+                      isnan(remoteVoltage) ? 0.0f : remoteVoltage, remoteSoc, 
+                      lastRemoteBmsMs > 0 ? (millis() - lastRemoteBmsMs) : 0);
         Serial.printf("  Heap:      %lu bytes free\n", ESP.getFreeHeap());
         Serial.println("=========================\n");
     }
@@ -703,6 +931,15 @@ static void process_command(String command) {
 void setup() {
     Serial.begin(921600);   // Safer baud rate to prevent USB driver issues
     delay(50);
+    
+    // Initialize I2C for BMS
+    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setClock(I2C_HZ);
+    Wire.setTimeOut(50);
+    Serial.printf("[BMS] I2C initialized (SDA=GPIO%d, SCL=GPIO%d, %lu Hz)\n", I2C_SDA, I2C_SCL, I2C_HZ);
+    
+    // Initialize BMS
+    bmsInitialized = bmsInit();
     
     // Create response mutex for PING test synchronization
     response_mutex = xSemaphoreCreateMutex();
@@ -809,6 +1046,18 @@ void loop() {
     
     unsigned long now = millis();
     
+    // Periodic BMS reading (local)
+    if (bmsInitialized && (now - lastBmsSampleMs >= BMS_SAMPLE_MS)) {
+        lastBmsSampleMs = now;
+        bmsUpdateReading();
+    }
+    
+    // Periodic battery data send to BLE Slave
+    if (now - lastBmsUartSendMs >= BMS_UART_SEND_MS) {
+        lastBmsUartSendMs = now;
+        sendBatteryToBleSlave();
+    }
+    
     // Print live stats every 5 seconds
     if (now - last_stats_time >= 5000) {
         float local_sps = (local_samples_count - last_local_count) / 5.0f;
@@ -818,6 +1067,12 @@ void loop() {
         
         Serial.printf("📊 LIVE | Local: %.0f sps | Remote: %.0f sps | UART: %.0f pps (%.1f kbps)\n",
                      local_sps, remote_sps, uart_pps, uart_kbps);
+        
+        // Battery status log
+        Serial.printf("🔋 BAT | Local: %.2fV (%.1f%%) | Remote: %.2fV (%.1f%%) age=%lums\n",
+                     isnan(vBatFiltCal) ? 0.0f : vBatFiltCal, currentSoc,
+                     isnan(remoteVoltage) ? 0.0f : remoteVoltage, remoteSoc,
+                     lastRemoteBmsMs > 0 ? (millis() - lastRemoteBmsMs) : 0);
         
         last_stats_time = now;
         last_local_count = local_samples_count;
