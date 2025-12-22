@@ -228,6 +228,355 @@ Bytes 1-160:   samples[sample_count]
 
 ---
 
+## Load Cell Data Stream - Complete Guide
+
+This section provides a complete guide on how to receive, parse, and format the load cell data stream into human-readable time-series data.
+
+### Step 1: Subscribe to Data Characteristic
+
+First, enable notifications on the Data characteristic to receive the binary data stream:
+
+```python
+# Python example
+await client.start_notify(DATA_UUID, data_handler)
+```
+
+### Step 2: Parse Binary Packet
+
+Each packet contains 1-10 samples. Parse the packet structure:
+
+```python
+def parse_sensor_data(data: bytes) -> list:
+    """
+    Parse binary sensor data packet.
+    
+    Packet format:
+    - Byte 0: sample_count (1-10)
+    - Bytes 1-160: samples (16 bytes each)
+    
+    Each sample: 8 int16 values (little-endian)
+    - Local: LC1, LC2, LC3, LC4 (bytes 0-7)
+    - Remote: LC5, LC6, LC7, LC8 (bytes 8-15)
+    """
+    if len(data) < 1:
+        return []
+    
+    sample_count = data[0]
+    samples = []
+    
+    for i in range(sample_count):
+        offset = 1 + (i * 16)
+        if offset + 16 > len(data):
+            break
+            
+        # Unpack 8 int16 values (little-endian)
+        values = struct.unpack_from('<8h', data, offset)
+        
+        samples.append({
+            'local': {
+                'lc1': int(values[0]),
+                'lc2': int(values[1]),
+                'lc3': int(values[2]),
+                'lc4': int(values[3])
+            },
+            'remote': {
+                'lc5': int(values[4]),
+                'lc6': int(values[5]),
+                'lc7': int(values[6]),
+                'lc8': int(values[7])
+            }
+        })
+    
+    return samples
+```
+
+### Step 3: Format as Human-Readable Time Series
+
+Convert parsed data into readable format with timestamps:
+
+```python
+import time
+from datetime import datetime
+
+class LoadCellDataLogger:
+    def __init__(self):
+        self.start_time = time.time()
+        self.sample_count = 0
+        
+    def format_sample(self, sample: dict, timestamp: float = None) -> str:
+        """Format a single sample as human-readable string."""
+        if timestamp is None:
+            timestamp = time.time()
+        
+        elapsed = timestamp - self.start_time
+        self.sample_count += 1
+        
+        # Format as CSV-like string
+        local = sample['local']
+        remote = sample['remote']
+        
+        return (
+            f"{self.sample_count:6d}, "
+            f"{elapsed:8.3f}, "
+            f"L:{local['lc1']:6d} {local['lc2']:6d} {local['lc3']:6d} {local['lc4']:6d}, "
+            f"R:{remote['lc5']:6d} {remote['lc6']:6d} {remote['lc7']:6d} {remote['lc8']:6d}"
+        )
+    
+    def format_sample_json(self, sample: dict, timestamp: float = None) -> dict:
+        """Format a single sample as JSON object."""
+        if timestamp is None:
+            timestamp = time.time()
+        
+        elapsed = timestamp - self.start_time
+        
+        return {
+            'sample': self.sample_count,
+            'timestamp': timestamp,
+            'elapsed_ms': elapsed * 1000,
+            'local': {
+                'lc1': sample['local']['lc1'],
+                'lc2': sample['local']['lc2'],
+                'lc3': sample['local']['lc3'],
+                'lc4': sample['local']['lc4']
+            },
+            'remote': {
+                'lc5': sample['remote']['lc5'],
+                'lc6': sample['remote']['lc6'],
+                'lc7': sample['remote']['lc7'],
+                'lc8': sample['remote']['lc8']
+            }
+        }
+```
+
+### Step 4: Complete Data Handler
+
+Complete example with data logging:
+
+```python
+import struct
+import json
+import csv
+from datetime import datetime
+from bleak import BleakClient
+
+SERVICE_UUID = "12345678-1234-1234-1234-123456789abc"
+DATA_UUID = "87654321-4321-4321-4321-cba987654321"
+CMD_UUID = "11111111-2222-3333-4444-555555555555"
+
+class LoadCellDataStream:
+    def __init__(self, output_file=None, format='csv'):
+        self.output_file = output_file
+        self.format = format
+        self.start_time = time.time()
+        self.sample_count = 0
+        self.csv_writer = None
+        
+        if output_file and format == 'csv':
+            self.csv_file = open(output_file, 'w', newline='')
+            self.csv_writer = csv.writer(self.csv_file)
+            # Write header
+            self.csv_writer.writerow([
+                'Sample', 'Elapsed_ms', 'Timestamp',
+                'Local_LC1', 'Local_LC2', 'Local_LC3', 'Local_LC4',
+                'Remote_LC5', 'Remote_LC6', 'Remote_LC7', 'Remote_LC8'
+            ])
+    
+    def parse_packet(self, data: bytes) -> list:
+        """Parse binary packet into list of samples."""
+        if len(data) < 1:
+            return []
+        
+        sample_count = data[0]
+        samples = []
+        
+        for i in range(sample_count):
+            offset = 1 + (i * 16)
+            if offset + 16 > len(data):
+                break
+                
+            values = struct.unpack_from('<8h', data, offset)
+            
+            samples.append({
+                'local': [int(v) for v in values[0:4]],
+                'remote': [int(v) for v in values[4:8]]
+            })
+        
+        return samples
+    
+    def process_samples(self, samples: list):
+        """Process and log samples."""
+        timestamp = time.time()
+        
+        for sample in samples:
+            self.sample_count += 1
+            elapsed_ms = (timestamp - self.start_time) * 1000
+            
+            # Print to console (human-readable)
+            local = sample['local']
+            remote = sample['remote']
+            print(
+                f"Sample {self.sample_count:6d} | "
+                f"Elapsed: {elapsed_ms:8.1f}ms | "
+                f"Local: [{local[0]:6d} {local[1]:6d} {local[2]:6d} {local[3]:6d}] | "
+                f"Remote: [{remote[0]:6d} {remote[1]:6d} {remote[2]:6d} {remote[3]:6d}]"
+            )
+            
+            # Write to CSV file if enabled
+            if self.csv_writer:
+                self.csv_writer.writerow([
+                    self.sample_count,
+                    f"{elapsed_ms:.1f}",
+                    datetime.fromtimestamp(timestamp).isoformat(),
+                    local[0], local[1], local[2], local[3],
+                    remote[0], remote[1], remote[2], remote[3]
+                ])
+                self.csv_file.flush()
+    
+    def data_handler(self, sender, data: bytes):
+        """BLE notification handler for data characteristic."""
+        samples = self.parse_packet(data)
+        if samples:
+            self.process_samples(samples)
+    
+    def close(self):
+        """Close output file if open."""
+        if self.csv_file:
+            self.csv_file.close()
+
+# Usage example
+async def main():
+    stream = LoadCellDataStream(output_file='loadcell_data.csv', format='csv')
+    
+    async with BleakClient("XX:XX:XX:XX:XX:XX") as client:
+        # Subscribe to data stream
+        await client.start_notify(DATA_UUID, stream.data_handler)
+        
+        # Start data acquisition
+        await client.write_gatt_char(CMD_UUID, b"ALL_START")
+        
+        # Run for 60 seconds
+        await asyncio.sleep(60)
+        
+        # Stop data acquisition
+        await client.write_gatt_char(CMD_UUID, b"ALL_STOP")
+    
+    stream.close()
+    print(f"\nTotal samples collected: {stream.sample_count}")
+```
+
+### Step 5: Output Formats
+
+#### CSV Format
+```
+Sample, Elapsed_ms, Timestamp, Local_LC1, Local_LC2, Local_LC3, Local_LC4, Remote_LC5, Remote_LC6, Remote_LC7, Remote_LC8
+1, 0.0, 2025-12-19T10:30:00.123, 1234, 5678, -1234, 8901, 2345, 6789, -2345, 9012
+2, 1.0, 2025-12-19T10:30:00.124, 1235, 5679, -1233, 8902, 2346, 6790, -2344, 9013
+```
+
+#### JSON Format
+```json
+{
+  "sample": 1,
+  "timestamp": 1734604200.123,
+  "elapsed_ms": 0.0,
+  "local": {"lc1": 1234, "lc2": 5678, "lc3": -1234, "lc4": 8901},
+  "remote": {"lc5": 2345, "lc6": 6789, "lc7": -2345, "lc8": 9012}
+}
+```
+
+#### Console Output (Human-Readable)
+```
+Sample      1 | Elapsed:      0.0ms | Local: [  1234   5678  -1234   8901] | Remote: [  2345   6789  -2345   9012]
+Sample      2 | Elapsed:      1.0ms | Local: [  1235   5679  -1233   8902] | Remote: [  2346   6790  -2344   9013]
+```
+
+### JavaScript Example
+
+```javascript
+const DATA_UUID = '87654321-4321-4321-4321-cba987654321';
+
+class LoadCellParser {
+    constructor() {
+        this.startTime = Date.now();
+        this.sampleCount = 0;
+    }
+    
+    parsePacket(dataView) {
+        const sampleCount = dataView.getUint8(0);
+        const samples = [];
+        
+        for (let i = 0; i < sampleCount; i++) {
+            const offset = 1 + (i * 16);
+            if (offset + 16 > dataView.byteLength) break;
+            
+            const local = [
+                dataView.getInt16(offset + 0, true),  // LC1
+                dataView.getInt16(offset + 2, true),  // LC2
+                dataView.getInt16(offset + 4, true),  // LC3
+                dataView.getInt16(offset + 6, true)   // LC4
+            ];
+            
+            const remote = [
+                dataView.getInt16(offset + 8, true),  // LC5
+                dataView.getInt16(offset + 10, true), // LC6
+                dataView.getInt16(offset + 12, true), // LC7
+                dataView.getInt16(offset + 14, true)  // LC8
+            ];
+            
+            samples.push({ local, remote });
+        }
+        
+        return samples;
+    }
+    
+    formatSample(sample) {
+        this.sampleCount++;
+        const elapsed = Date.now() - this.startTime;
+        
+        const localStr = sample.local.map(v => v.toString().padStart(6)).join(' ');
+        const remoteStr = sample.remote.map(v => v.toString().padStart(6)).join(' ');
+        
+        return `Sample ${this.sampleCount.toString().padStart(6)} | ` +
+               `Elapsed: ${elapsed.toString().padStart(8)}ms | ` +
+               `Local: [${localStr}] | Remote: [${remoteStr}]`;
+    }
+    
+    handleData(event) {
+        const dataView = new DataView(event.target.value.buffer);
+        const samples = this.parsePacket(dataView);
+        
+        samples.forEach(sample => {
+            console.log(this.formatSample(sample));
+        });
+    }
+}
+
+// Usage
+const parser = new LoadCellParser();
+await dataChar.startNotifications();
+dataChar.addEventListener('characteristicvaluechanged', (event) => {
+    parser.handleData(event);
+});
+```
+
+### Data Rate Information
+
+- **Sample Rate:** 1000 Hz per channel (4000 Hz total for 4 channels)
+- **Packet Rate:** ~100 packets/second
+- **Samples per Packet:** 1-10 samples
+- **Packet Size:** 1 + (sample_count × 16) bytes (max 161 bytes)
+- **Data Throughput:** ~16 KB/s
+
+### Tips for Data Collection
+
+1. **Buffer Management:** Process samples quickly to avoid buffer overflow
+2. **File I/O:** Use buffered writes or async I/O for CSV/JSON logging
+3. **Real-time Display:** Update UI in batches (e.g., every 10-20 samples)
+4. **Data Validation:** Check sample_count and packet size before parsing
+5. **Error Handling:** Handle incomplete packets gracefully
+
+---
+
 ## Parsing Examples
 
 ### Python (with bleak)
