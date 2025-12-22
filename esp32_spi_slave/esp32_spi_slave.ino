@@ -230,7 +230,8 @@ static void process_espnow_command(const ESPNowCommand* cmd) {
     // Control commands - forward to Teensy
     else if (cmd_upper == "START" || cmd_upper == "STOP" ||
              cmd_upper == "RESTART" || cmd_upper == "RESET" ||
-             cmd_upper == "LED_ON" || cmd_upper == "LED_OFF") {
+             cmd_upper == "LED_ON" || cmd_upper == "LED_OFF" ||
+             cmd_upper == "MOCK_ON" || cmd_upper == "MOCK_OFF") {
         Serial.printf("[SPI_SLAVE] Forwarding '%s' to Teensy...\n", safe_command);
         Serial1.println(safe_command);
         Serial1.flush();
@@ -812,7 +813,8 @@ void handle_serial_commands() {
     
     // Teensy control commands
     if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
-        command == "LED_ON" || command == "LED_OFF") {
+        command == "LED_ON" || command == "LED_OFF" ||
+        command == "MOCK_ON" || command == "MOCK_OFF") {
       Serial.printf("[SPI_SLAVE] Forwarding '%s' to Teensy...\n", command.c_str());
       Serial1.println(command);
       Serial1.flush();

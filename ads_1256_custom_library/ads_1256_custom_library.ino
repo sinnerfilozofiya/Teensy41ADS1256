@@ -447,6 +447,10 @@ __attribute__((used)) void update_led_status() {  // Made non-static so calibrat
   
   uint32_t now = millis();
   
+  // Check if mock data is enabled (for color inversion)
+  extern bool mock_data_is_enabled();
+  bool mock_mode = mock_data_is_enabled();
+  
   switch (current_led_status) {
     case LED_BOOTING:
       // Yellow solid during boot
@@ -454,40 +458,71 @@ __attribute__((used)) void update_led_status() {  // Made non-static so calibrat
       break;
       
     case LED_IDLE:
-      // Pink/Magenta breathing effect (2 second cycle) - more visible
-      {
-        // Use sine wave for smooth breathing (0 to 2*PI over 2000ms)
-        float phase = (now % 2000) / 2000.0f * 2.0f * 3.14159f;
-        // Map sine (-1 to 1) to brightness (10% to 100% of base brightness for more visible effect)
-        float sine_val = (sin(phase) + 1.0f) / 2.0f;  // 0 to 1
-        uint8_t br = (uint8_t)(led_brightness * (0.1f + 0.9f * sine_val));
-        led_setAll(167, 36, 104, br);  // #A72468 - Pink/Magenta
+      if (mock_mode) {
+        // Yellow breathing effect (2 second cycle) - Mock data mode
+        {
+          float phase = (now % 2000) / 2000.0f * 2.0f * 3.14159f;
+          float sine_val = (sin(phase) + 1.0f) / 2.0f;  // 0 to 1
+          uint8_t br = (uint8_t)(led_brightness * (0.1f + 0.9f * sine_val));
+          led_setAll(255, 200, 0, br);  // Yellow breathing
+        }
+      } else {
+        // Pink/Magenta breathing effect (2 second cycle) - Real data mode
+        {
+          float phase = (now % 2000) / 2000.0f * 2.0f * 3.14159f;
+          float sine_val = (sin(phase) + 1.0f) / 2.0f;  // 0 to 1
+          uint8_t br = (uint8_t)(led_brightness * (0.1f + 0.9f * sine_val));
+          led_setAll(167, 36, 104, br);  // #A72468 - Pink/Magenta
+        }
       }
       break;
       
     case LED_STARTING:
-      // Dark blue slow pulse (500ms cycle) - transitioning to running
-      {
-        uint8_t phase = (now / 250) % 2;
-        uint8_t br = phase ? led_brightness : (led_brightness / 3);
-        led_setAll(6, 28, 47, br);  // #061C2F - Dark blue
+      if (mock_mode) {
+        // Orange slow pulse (500ms cycle) - Mock data mode
+        {
+          uint8_t phase = (now / 250) % 2;
+          uint8_t br = phase ? led_brightness : (led_brightness / 3);
+          led_setAll(255, 165, 0, br);  // Orange pulse
+        }
+      } else {
+        // Dark blue slow pulse (500ms cycle) - Real data mode
+        {
+          uint8_t phase = (now / 250) % 2;
+          uint8_t br = phase ? led_brightness : (led_brightness / 3);
+          led_setAll(6, 28, 47, br);  // #061C2F - Dark blue
+        }
       }
       break;
       
     case LED_RUNNING:
-      led_setAll(6, 28, 47, led_brightness);  // #061C2F - Dark blue solid
+      if (mock_mode) {
+        // Orange solid - Mock data mode
+        led_setAll(255, 165, 0, led_brightness);  // Orange solid
+      } else {
+        // Dark blue solid - Real data mode
+        led_setAll(6, 28, 47, led_brightness);  // #061C2F - Dark blue solid
+      }
       break;
       
     case LED_STOPPING:
-      // Orange fast blink (200ms cycle)
-      {
-        uint8_t phase = (now / 100) % 2;
-        led_setAll(255, 128, 0, phase ? led_brightness : 0);
+      if (mock_mode) {
+        // Cyan fast blink (200ms cycle) - Mock data mode (inverted from orange)
+        {
+          uint8_t phase = (now / 100) % 2;
+          led_setAll(0, 255, 255, phase ? led_brightness : 0);  // Cyan
+        }
+      } else {
+        // Orange fast blink (200ms cycle) - Real data mode
+        {
+          uint8_t phase = (now / 100) % 2;
+          led_setAll(255, 128, 0, phase ? led_brightness : 0);
+        }
       }
       break;
       
     case LED_ERROR:
-      // Red fast flash (150ms cycle)
+      // Red fast flash (150ms cycle) - Same for both modes
       {
         uint8_t phase = (now / 75) % 2;
         led_setAll(255, 0, 0, phase ? led_brightness : 0);
@@ -496,66 +531,131 @@ __attribute__((used)) void update_led_status() {  // Made non-static so calibrat
       
     // Calibration states (functional) - rearranged with relatable colors
     case LED_CAL_TARE_COLLECTING:
-      // Green solid - zeroing/resetting (command being processed, matches success flash)
-      led_setAll(0, 255, 0, led_brightness);  // Green solid
+      if (mock_mode) {
+        // Magenta solid - Mock data mode (inverted from green)
+        led_setAll(255, 0, 255, led_brightness);  // Magenta solid
+      } else {
+        // Green solid - Real data mode
+        led_setAll(0, 255, 0, led_brightness);  // Green solid
+      }
       break;
       
     case LED_CAL_TARE_SUCCESS:
-      // Green double flash (500ms total) - success
-      {
-        uint32_t elapsed = now - led_success_start_ms;
-        if (elapsed < 500) {
-          uint8_t flash = (elapsed / 125) % 2;
-          led_setAll(0, 255, 0, flash ? led_brightness : 0);  // Green
-        } else {
-          current_led_status = LED_IDLE;  // Return to idle after flash
+      if (mock_mode) {
+        // Magenta double flash (500ms total) - Mock data mode
+        {
+          uint32_t elapsed = now - led_success_start_ms;
+          if (elapsed < 500) {
+            uint8_t flash = (elapsed / 125) % 2;
+            led_setAll(255, 0, 255, flash ? led_brightness : 0);  // Magenta
+          } else {
+            current_led_status = LED_IDLE;  // Return to idle after flash
+          }
+        }
+      } else {
+        // Green double flash (500ms total) - Real data mode
+        {
+          uint32_t elapsed = now - led_success_start_ms;
+          if (elapsed < 500) {
+            uint8_t flash = (elapsed / 125) % 2;
+            led_setAll(0, 255, 0, flash ? led_brightness : 0);  // Green
+          } else {
+            current_led_status = LED_IDLE;  // Return to idle after flash
+          }
         }
       }
       break;
       
     case LED_CAL_ADD_COLLECTING:
-      // Green solid - adding calibration point (command being processed, matches success flash)
-      led_setAll(0, 255, 0, led_brightness);  // Green solid
+      if (mock_mode) {
+        // Magenta solid - Mock data mode (inverted from green)
+        led_setAll(255, 0, 255, led_brightness);  // Magenta solid
+      } else {
+        // Green solid - Real data mode
+        led_setAll(0, 255, 0, led_brightness);  // Green solid
+      }
       break;
       
     case LED_CAL_ADD_SUCCESS:
-      // Green triple flash (300ms each, 900ms total) - success
-      {
-        uint32_t elapsed = now - led_success_start_ms;
-        if (elapsed < 900) {
-          uint8_t flash = (elapsed / 150) % 2;
-          led_setAll(0, 255, 0, flash ? led_brightness : 0);  // Green
-        } else {
-          current_led_status = LED_IDLE;  // Return to idle after flash
+      if (mock_mode) {
+        // Magenta triple flash (300ms each, 900ms total) - Mock data mode
+        {
+          uint32_t elapsed = now - led_success_start_ms;
+          if (elapsed < 900) {
+            uint8_t flash = (elapsed / 150) % 2;
+            led_setAll(255, 0, 255, flash ? led_brightness : 0);  // Magenta
+          } else {
+            current_led_status = LED_IDLE;  // Return to idle after flash
+          }
+        }
+      } else {
+        // Green triple flash (300ms each, 900ms total) - Real data mode
+        {
+          uint32_t elapsed = now - led_success_start_ms;
+          if (elapsed < 900) {
+            uint8_t flash = (elapsed / 150) % 2;
+            led_setAll(0, 255, 0, flash ? led_brightness : 0);  // Green
+          } else {
+            current_led_status = LED_IDLE;  // Return to idle after flash
+          }
         }
       }
       break;
       
     case LED_CAL_FIT_RUNNING:
-      // Green solid - fitting regression (command being processed, matches success flash)
-      led_setAll(0, 255, 0, led_brightness);  // Green solid
+      if (mock_mode) {
+        // Magenta solid - Mock data mode (inverted from green)
+        led_setAll(255, 0, 255, led_brightness);  // Magenta solid
+      } else {
+        // Green solid - Real data mode
+        led_setAll(0, 255, 0, led_brightness);  // Green solid
+      }
       break;
       
     case LED_CAL_FIT_SUCCESS:
-      // Green single long flash (800ms) - success
-      {
-        uint32_t elapsed = now - led_success_start_ms;
-        if (elapsed < 800) {
-          led_setAll(0, 255, 0, led_brightness);  // Green
-        } else {
-          current_led_status = LED_IDLE;  // Return to idle after flash
+      if (mock_mode) {
+        // Magenta single long flash (800ms) - Mock data mode
+        {
+          uint32_t elapsed = now - led_success_start_ms;
+          if (elapsed < 800) {
+            led_setAll(255, 0, 255, led_brightness);  // Magenta
+          } else {
+            current_led_status = LED_IDLE;  // Return to idle after flash
+          }
+        }
+      } else {
+        // Green single long flash (800ms) - Real data mode
+        {
+          uint32_t elapsed = now - led_success_start_ms;
+          if (elapsed < 800) {
+            led_setAll(0, 255, 0, led_brightness);  // Green
+          } else {
+            current_led_status = LED_IDLE;  // Return to idle after flash
+          }
         }
       }
       break;
       
     case LED_CAL_CLEAR:
-      // Orange/Yellow quick flash (200ms) - warning/clearing
-      {
-        uint32_t elapsed = now - led_success_start_ms;
-        if (elapsed < 200) {
-          led_setAll(255, 165, 0, led_brightness);  // Orange
-        } else {
-          current_led_status = LED_IDLE;  // Return to idle after flash
+      if (mock_mode) {
+        // Blue quick flash (200ms) - Mock data mode (inverted from orange)
+        {
+          uint32_t elapsed = now - led_success_start_ms;
+          if (elapsed < 200) {
+            led_setAll(0, 100, 255, led_brightness);  // Blue
+          } else {
+            current_led_status = LED_IDLE;  // Return to idle after flash
+          }
+        }
+      } else {
+        // Orange/Yellow quick flash (200ms) - Real data mode
+        {
+          uint32_t elapsed = now - led_success_start_ms;
+          if (elapsed < 200) {
+            led_setAll(255, 165, 0, led_brightness);  // Orange
+          } else {
+            current_led_status = LED_IDLE;  // Return to idle after flash
+          }
         }
       }
       break;
@@ -726,6 +826,17 @@ void handle_esp32_commands() {
       led_enabled = false;
       led_setAll(0, 0, 0, 0);
       send_status_response("LED_OFF", "OK");
+    }
+    // ========== MOCK DATA COMMANDS ==========
+    else if (command == "MOCK_ON") {
+      extern void mock_data_set_enabled(bool);
+      mock_data_set_enabled(true);
+      send_status_response("MOCK_ON", "OK");
+    }
+    else if (command == "MOCK_OFF") {
+      extern void mock_data_set_enabled(bool);
+      mock_data_set_enabled(false);
+      send_status_response("MOCK_OFF", "OK");
     }
     // ========== NOISE FILTERING COMMANDS ==========
     else if (command == "FILTER_ENABLE") {
@@ -977,6 +1088,17 @@ void handle_serial_monitor_commands() {
       led_setAll(0, 0, 0, 0);
       Serial.println("[T41] ✓ LEDs disabled");
     }
+    // ========== MOCK DATA COMMANDS ==========
+    else if (command == "MOCK_ON") {
+      extern void mock_data_set_enabled(bool);
+      mock_data_set_enabled(true);
+      Serial.println("[T41] ✓ Mock data generation enabled");
+    }
+    else if (command == "MOCK_OFF") {
+      extern void mock_data_set_enabled(bool);
+      mock_data_set_enabled(false);
+      Serial.println("[T41] ✓ Mock data generation disabled");
+    }
     // ========== NOISE FILTERING COMMANDS ==========
     else if (command == "FILTER_ENABLE") {
       enable_filtering(true);
@@ -1194,6 +1316,7 @@ void handle_serial_monitor_commands() {
       Serial.println("[T41] Debug: SHOW_FILTERED, PING, TX_TEST");
       Serial.println("[T41] Cal: CAL_SHOW, CAL_POINTS, CAL_READ, CAL_READ_RAW, CAL_TARE");
       Serial.println("[T41]      CAL_ADD_<kg>, CAL_ADD_CH_<1-4>_<kg>, CAL_FIT, CAL_CLEAR");
+      Serial.println("[T41] Mock: MOCK_ON, MOCK_OFF (generate test waveforms)");
     }
     else if (command == "") {
       // Empty command, do nothing

@@ -90,6 +90,11 @@ All command responses are JSON objects with these fields:
 {"target":"REMOTE","cmd":"LED_OFF","ok":true,"ms":52}
 {"target":"ALL","cmd":"LED_ON","ok":true,"ms":48}
 
+// Mock data commands
+{"target":"LOCAL","cmd":"MOCK_ON","ok":true,"ms":42}
+{"target":"REMOTE","cmd":"MOCK_OFF","ok":true,"ms":48}
+{"target":"ALL","cmd":"MOCK_ON","ok":true,"ms":45}
+
 // BAT - battery status
 {"target":"BLE","cmd":"BAT","ok":true,"local":{"v":4.12,"pct":85.0},"remote":{"v":3.98,"pct":72.0},"ms":0}
 ```
@@ -155,6 +160,19 @@ Bytes 1-160:   samples[sample_count]
 | `ALL_LED_OFF` | Turn off LEDs on both Teensy devices | `{"target":"ALL","cmd":"LED_OFF","ok":true,"ms":XX}` |
 
 **Note:** LED commands control the WS2812 RGB LEDs on each Teensy device. When LEDs are enabled, they display status information (idle, running, calibration, etc.). When disabled, all LEDs are turned off.
+
+### Mock Data Commands
+
+| Command | Description | Response |
+|---------|-------------|----------|
+| `LOCAL_MOCK_ON` | Enable mock data generation on local Teensy | `{"target":"LOCAL","cmd":"MOCK_ON","ok":true,"ms":XX}` |
+| `LOCAL_MOCK_OFF` | Disable mock data generation on local Teensy | `{"target":"LOCAL","cmd":"MOCK_OFF","ok":true,"ms":XX}` |
+| `REMOTE_MOCK_ON` | Enable mock data generation on remote Teensy | `{"target":"REMOTE","cmd":"MOCK_ON","ok":true,"ms":XX}` |
+| `REMOTE_MOCK_OFF` | Disable mock data generation on remote Teensy | `{"target":"REMOTE","cmd":"MOCK_OFF","ok":true,"ms":XX}` |
+| `ALL_MOCK_ON` | Enable mock data generation on both Teensy devices | `{"target":"ALL","cmd":"MOCK_ON","ok":true,"ms":XX}` |
+| `ALL_MOCK_OFF` | Disable mock data generation on both Teensy devices | `{"target":"ALL","cmd":"MOCK_OFF","ok":true,"ms":XX}` |
+
+**Note:** Mock data generation replaces physical load cell readings with synthetic waveforms for testing data rates and connection reliability without requiring physical hardware. When enabled, LEDs display inverted colors (yellow/orange instead of pink/blue) to indicate mock data mode.
 
 ### Ping Commands
 
@@ -262,6 +280,9 @@ async def main():
         # Control LEDs
         await client.write_gatt_char(CMD_UUID, b"ALL_LED_ON")
         
+        # Enable mock data for testing (optional)
+        # await client.write_gatt_char(CMD_UUID, b"ALL_MOCK_ON")
+        
         # Subscribe to sensor data
         await client.start_notify(DATA_UUID, data_handler)
         await client.write_gatt_char(CMD_UUID, b"ALL_START")
@@ -333,6 +354,9 @@ async function connect() {
     await cmdChar.writeValue(encoder.encode('LOCAL_PING'));
     // Control LEDs
     await cmdChar.writeValue(encoder.encode('ALL_LED_ON'));
+    
+    // Enable mock data for testing (optional)
+    // await cmdChar.writeValue(encoder.encode('ALL_MOCK_ON'));
     
     // Start data acquisition
     await cmdChar.writeValue(encoder.encode('ALL_START'));
@@ -406,6 +430,9 @@ Future<void> connectAndStream(BluetoothDevice device) async {
   await cmdChar.write(utf8.encode('LOCAL_PING'));
   // Control LEDs
   await cmdChar.write(utf8.encode('ALL_LED_ON'));
+  
+  // Enable mock data for testing (optional)
+  // await cmdChar.write(utf8.encode('ALL_MOCK_ON'));
   
   // Start data acquisition
   await cmdChar.write(utf8.encode('ALL_START'));
@@ -500,18 +527,18 @@ The system includes WS2812 RGB LEDs on each Teensy device that provide visual st
 
 ### LED Status Indicators
 
-When LEDs are enabled, they display different colors and patterns based on system state:
+When LEDs are enabled, they display different colors and patterns based on system state. **Colors are inverted when mock data is enabled** to clearly indicate mock data mode:
 
-| State | Color | Pattern |
-|-------|-------|---------|
-| **Booting** | Yellow | Solid |
-| **Idle** | Pink/Magenta (#A72468) | Breathing effect |
-| **Starting** | Dark Blue (#061C2F) | Slow pulse |
-| **Running** | Dark Blue (#061C2F) | Solid |
-| **Stopping** | Orange | Fast blink |
-| **Calibration Processing** | Green | Solid |
-| **Calibration Success** | Green | Flash pattern |
-| **Error** | Red | Fast flash |
+| State | Real Data Mode | Mock Data Mode | Pattern |
+|-------|----------------|----------------|---------|
+| **Booting** | Yellow | Yellow | Solid |
+| **Idle** | Pink/Magenta (#A72468) | **Yellow** | Breathing effect |
+| **Starting** | Dark Blue (#061C2F) | **Orange** | Slow pulse |
+| **Running** | Dark Blue (#061C2F) | **Orange** | Solid |
+| **Stopping** | Orange | Cyan | Fast blink |
+| **Calibration Processing** | Green | **Magenta** | Solid |
+| **Calibration Success** | Green | **Magenta** | Flash pattern |
+| **Error** | Red | Red | Fast flash |
 
 ### LED Commands
 
@@ -540,6 +567,64 @@ await client.write_gatt_char(CMD_UUID, b"LOCAL_LED_OFF")  # Disable local LEDs o
 ```
 
 **Note:** When LEDs are disabled (`LED_OFF`), all status indicators are turned off. When enabled (`LED_ON`), LEDs automatically display the current system status.
+
+---
+
+## Mock Data Generation
+
+Mock data generation allows testing data rates and connection reliability without physical load cells. When enabled, the system generates synthetic waveforms instead of reading from the ADS1256 ADC.
+
+### Wave Types
+
+Each channel generates a different waveform pattern:
+
+| Channel | Wave Type | Description |
+|---------|-----------|-------------|
+| 0 | Square Wave | Binary {-1, +1} pattern: `y = sign(sin(2πft))` |
+| 1 | Triangle Wave | Linear ramp up/down: `y = (2/π) * arcsin(sin(2πft))` |
+| 2 | Sawtooth Wave | Periodic reset pattern: `y = 2(tf - floor(tf + 0.5))` |
+| 3 | Sine Wave | Smooth sinusoidal: `y = sin(2πft)` |
+
+**Parameters:**
+- Frequency: 1 Hz (base frequency)
+- Amplitude: 100,000 counts (adjustable in code)
+- Range: Repetitive, fixed-range patterns
+
+### Usage
+
+```python
+# Enable mock data on both devices
+await client.write_gatt_char(CMD_UUID, b"ALL_MOCK_ON")
+
+# Start data acquisition with mock data
+await client.write_gatt_char(CMD_UUID, b"ALL_START")
+
+# Disable mock data to return to real hardware
+await client.write_gatt_char(CMD_UUID, b"ALL_MOCK_OFF")
+```
+
+### Visual Indicators
+
+When mock data is enabled, LEDs display **inverted colors** to clearly indicate mock data mode:
+
+| State | Real Data Mode | Mock Data Mode |
+|-------|----------------|----------------|
+| **Idle** | Pink/Magenta breathing | **Yellow breathing** |
+| **Starting** | Dark blue pulse | **Orange pulse** |
+| **Running** | Dark blue solid | **Orange solid** |
+| **Stopping** | Orange blink | Cyan blink |
+| **Calibration** | Green | Magenta |
+
+This visual distinction helps identify when the system is using mock data versus real hardware readings.
+
+### Use Cases
+
+- **Testing data rates**: Verify system can handle full data throughput
+- **Connection reliability**: Test wireless communication without hardware
+- **Development**: Develop and test software when load cells are unavailable
+- **Debugging**: Isolate issues between hardware and software layers
+
+**Note:** Mock data can be easily removed by deleting the `mock_data_generator.ino` file from the Teensy codebase.
 
 ---
 

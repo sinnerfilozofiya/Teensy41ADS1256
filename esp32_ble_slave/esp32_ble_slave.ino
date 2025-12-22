@@ -585,6 +585,9 @@ static void process_ble_command(String command) {
         command == "LOCAL_LED_ON" || command == "LOCAL_LED_OFF" ||
         command == "REMOTE_LED_ON" || command == "REMOTE_LED_OFF" ||
         command == "ALL_LED_ON" || command == "ALL_LED_OFF" ||
+        command == "LOCAL_MOCK_ON" || command == "LOCAL_MOCK_OFF" ||
+        command == "REMOTE_MOCK_ON" || command == "REMOTE_MOCK_OFF" ||
+        command == "ALL_MOCK_ON" || command == "ALL_MOCK_OFF" ||
         command.startsWith("LOCAL_CAL_") || command.startsWith("REMOTE_CAL_")) {
         
         forward_command_to_rx_radio(command);
@@ -1063,6 +1066,9 @@ static void handle_serial_commands() {
             command == "LOCAL_LED_ON" || command == "LOCAL_LED_OFF" ||
             command == "REMOTE_LED_ON" || command == "REMOTE_LED_OFF" ||
             command == "ALL_LED_ON" || command == "ALL_LED_OFF" ||
+            command == "LOCAL_MOCK_ON" || command == "LOCAL_MOCK_OFF" ||
+            command == "REMOTE_MOCK_ON" || command == "REMOTE_MOCK_OFF" ||
+            command == "ALL_MOCK_ON" || command == "ALL_MOCK_OFF" ||
             command.startsWith("LOCAL_CAL_") || command.startsWith("REMOTE_CAL_")) {
             
             forward_command_to_rx_radio(command);

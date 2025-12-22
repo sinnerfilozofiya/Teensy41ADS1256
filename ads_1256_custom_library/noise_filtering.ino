@@ -587,7 +587,16 @@ void set_gaussian_sigma(double sigma) {
 int32_t get_filtered_load_cell_reading(uint8_t channel) {
   if (channel >= 4) return 0;
   
-  // Get raw reading
+  // Check if mock data is enabled (external function from mock_data_generator.ino)
+  extern bool mock_data_is_enabled();
+  extern int32_t mock_data_generate(uint8_t channel);
+  
+  if (mock_data_is_enabled()) {
+    // Return mock data directly (no filtering needed for mock data)
+    return mock_data_generate(channel);
+  }
+  
+  // Get raw reading from actual hardware
   int32_t raw_value = read_single_channel_fast(channel);
   
   // Apply filtering
