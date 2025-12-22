@@ -85,6 +85,11 @@ All command responses are JSON objects with these fields:
 // Control command
 {"target":"LOCAL","cmd":"START","ok":true,"ms":120}
 
+// LED control commands
+{"target":"LOCAL","cmd":"LED_ON","ok":true,"ms":45}
+{"target":"REMOTE","cmd":"LED_OFF","ok":true,"ms":52}
+{"target":"ALL","cmd":"LED_ON","ok":true,"ms":48}
+
 // BAT - battery status
 {"target":"BLE","cmd":"BAT","ok":true,"local":{"v":4.12,"pct":85.0},"remote":{"v":3.98,"pct":72.0},"ms":0}
 ```
@@ -137,6 +142,19 @@ Bytes 1-160:   samples[sample_count]
 | `REMOTE_RESET` | Reset remote Teensy |
 | `ALL_START` | Start both |
 | `ALL_STOP` | Stop both |
+
+### LED Control Commands
+
+| Command | Description | Response |
+|---------|-------------|----------|
+| `LOCAL_LED_ON` | Turn on LEDs on local Teensy | `{"target":"LOCAL","cmd":"LED_ON","ok":true,"ms":XX}` |
+| `LOCAL_LED_OFF` | Turn off LEDs on local Teensy | `{"target":"LOCAL","cmd":"LED_OFF","ok":true,"ms":XX}` |
+| `REMOTE_LED_ON` | Turn on LEDs on remote Teensy | `{"target":"REMOTE","cmd":"LED_ON","ok":true,"ms":XX}` |
+| `REMOTE_LED_OFF` | Turn off LEDs on remote Teensy | `{"target":"REMOTE","cmd":"LED_OFF","ok":true,"ms":XX}` |
+| `ALL_LED_ON` | Turn on LEDs on both Teensy devices | `{"target":"ALL","cmd":"LED_ON","ok":true,"ms":XX}` |
+| `ALL_LED_OFF` | Turn off LEDs on both Teensy devices | `{"target":"ALL","cmd":"LED_OFF","ok":true,"ms":XX}` |
+
+**Note:** LED commands control the WS2812 RGB LEDs on each Teensy device. When LEDs are enabled, they display status information (idle, running, calibration, etc.). When disabled, all LEDs are turned off.
 
 ### Ping Commands
 
@@ -241,6 +259,9 @@ async def main():
         # Send command
         await client.write_gatt_char(CMD_UUID, b"LOCAL_PING")
         
+        # Control LEDs
+        await client.write_gatt_char(CMD_UUID, b"ALL_LED_ON")
+        
         # Subscribe to sensor data
         await client.start_notify(DATA_UUID, data_handler)
         await client.write_gatt_char(CMD_UUID, b"ALL_START")
@@ -310,6 +331,10 @@ async function connect() {
     // Send command
     const encoder = new TextEncoder();
     await cmdChar.writeValue(encoder.encode('LOCAL_PING'));
+    // Control LEDs
+    await cmdChar.writeValue(encoder.encode('ALL_LED_ON'));
+    
+    // Start data acquisition
     await cmdChar.writeValue(encoder.encode('ALL_START'));
 }
 ```
@@ -379,6 +404,10 @@ Future<void> connectAndStream(BluetoothDevice device) async {
   
   // Send commands
   await cmdChar.write(utf8.encode('LOCAL_PING'));
+  // Control LEDs
+  await cmdChar.write(utf8.encode('ALL_LED_ON'));
+  
+  // Start data acquisition
   await cmdChar.write(utf8.encode('ALL_START'));
 }
 ```
@@ -462,6 +491,55 @@ Battery Level Char:       0x2A19  (READ + NOTIFY, shows MIN of both batteries)
 |------|---------|
 | Normal | 5 seconds |
 | Calibration | 15 seconds |
+
+---
+
+## LED Control
+
+The system includes WS2812 RGB LEDs on each Teensy device that provide visual status feedback. LEDs can be controlled via BLE commands.
+
+### LED Status Indicators
+
+When LEDs are enabled, they display different colors and patterns based on system state:
+
+| State | Color | Pattern |
+|-------|-------|---------|
+| **Booting** | Yellow | Solid |
+| **Idle** | Pink/Magenta (#A72468) | Breathing effect |
+| **Starting** | Dark Blue (#061C2F) | Slow pulse |
+| **Running** | Dark Blue (#061C2F) | Solid |
+| **Stopping** | Orange | Fast blink |
+| **Calibration Processing** | Green | Solid |
+| **Calibration Success** | Green | Flash pattern |
+| **Error** | Red | Fast flash |
+
+### LED Commands
+
+All LED commands return standard JSON responses with `ok` status and round-trip time:
+
+```json
+// Turn on local LEDs
+Send: LOCAL_LED_ON
+Response: {"target":"LOCAL","cmd":"LED_ON","ok":true,"ms":45}
+
+// Turn off remote LEDs
+Send: REMOTE_LED_OFF
+Response: {"target":"REMOTE","cmd":"LED_OFF","ok":true,"ms":52}
+
+// Control both devices
+Send: ALL_LED_ON
+Response: {"target":"ALL","cmd":"LED_ON","ok":true,"ms":48}
+```
+
+### Usage Example
+
+```python
+# Python example
+await client.write_gatt_char(CMD_UUID, b"ALL_LED_ON")  # Enable LEDs on both devices
+await client.write_gatt_char(CMD_UUID, b"LOCAL_LED_OFF")  # Disable local LEDs only
+```
+
+**Note:** When LEDs are disabled (`LED_OFF`), all status indicators are turned off. When enabled (`LED_ON`), LEDs automatically display the current system status.
 
 ---
 
