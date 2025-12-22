@@ -2,6 +2,9 @@
 #include <math.h>
 #include "calibration_regression.h"
 
+// Forward declaration for LED update function (used by calibration functions)
+void update_led_status();
+
 // Include ADS1256 constants first
 // (These are defined in the ads1256_constants.ino tab)
 
@@ -28,6 +31,45 @@
 // RX3 = Pin 15 (from ESP32 GPIO2) - Used for receiving commands
 // TX is on Pin 16 (software serial) - PCB fixed wiring
 #define SOFT_TX_PIN 16
+
+// ============================================================================
+// LED STATUS CONTROL (WS2812)
+// ============================================================================
+
+#define LED_EN1 31
+#define LED_EN2 32
+#define LED_EN3 33
+#define LED_EN4 34
+
+#define LED_DI1 37
+#define LED_DI2 38
+#define LED_DI3 39
+#define LED_DI4 40
+
+// LED state
+enum LedStatus {
+  LED_BOOTING = 0,
+  LED_IDLE,
+  LED_STARTING,
+  LED_RUNNING,
+  LED_STOPPING,
+  LED_ERROR,
+  // Calibration states (functional)
+  LED_CAL_TARE_COLLECTING,
+  LED_CAL_TARE_SUCCESS,
+  LED_CAL_ADD_COLLECTING,
+  LED_CAL_ADD_SUCCESS,
+  LED_CAL_FIT_RUNNING,
+  LED_CAL_FIT_SUCCESS,
+  LED_CAL_CLEAR,
+  LED_CAL_ERROR
+};
+
+static LedStatus current_led_status = LED_BOOTING;
+static uint32_t led_last_update_ms = 0;
+static uint32_t led_success_start_ms = 0;  // For success flash timing
+static uint8_t led_brightness = 80;  // Default brightness (0-255)
+static bool led_enabled = true;      // Master LED enable flag
 
 // ============================================================================
 // DATA ACQUISITION STATE MANAGEMENT
@@ -321,6 +363,216 @@ void softSerialTX_printf(const char* format, ...) {
 }
 
 // ============================================================================
+// LED CONTROL FUNCTIONS (WS2812)
+// ============================================================================
+
+// DWT cycle counter (Teensy 4.1)
+static inline void led_dwt_init() {
+  *(volatile uint32_t *)0xE000EDFC |= 0x01000000; // DEMCR TRCENA
+  *(volatile uint32_t *)0xE0001004 = 0;          // CYCCNT
+  *(volatile uint32_t *)0xE0001000 |= 1;         // enable CYCCNT
+}
+
+static inline uint32_t led_dwt_cycles() { 
+  return *(volatile uint32_t *)0xE0001004; 
+}
+
+static inline void led_wait_cycles(uint32_t c) {
+  uint32_t s = led_dwt_cycles();
+  while ((uint32_t)(led_dwt_cycles() - s) < c) {}
+}
+
+// WS2812 800kHz timings
+static inline void led_ws_send_byte(uint8_t pin, uint8_t b) {
+  const uint32_t F = F_CPU;
+  const uint32_t T0H = (uint32_t)(F * 0.35e-6);
+  const uint32_t T1H = (uint32_t)(F * 0.70e-6);
+  const uint32_t TT  = (uint32_t)(F * 1.25e-6);
+
+  for (int i = 7; i >= 0; --i) {
+    bool one = b & (1 << i);
+    uint32_t start = led_dwt_cycles();
+    digitalWriteFast(pin, HIGH);
+    led_wait_cycles(one ? T1H : T0H);
+    digitalWriteFast(pin, LOW);
+    while ((uint32_t)(led_dwt_cycles() - start) < TT) {}
+  }
+}
+
+static inline uint8_t led_scale8(uint8_t v, uint8_t br) {
+  return (uint16_t)v * (uint16_t)br / 255;
+}
+
+static inline void led_ws_show_1pixel(uint8_t pin, uint8_t r, uint8_t g, uint8_t b, uint8_t br) {
+  r = led_scale8(r, br);
+  g = led_scale8(g, br);
+  b = led_scale8(b, br);
+
+  noInterrupts();
+  // WS2812 order: GRB
+  led_ws_send_byte(pin, g);
+  led_ws_send_byte(pin, r);
+  led_ws_send_byte(pin, b);
+  interrupts();
+
+  delayMicroseconds(80); // latch
+}
+
+static inline void led_allEN(bool on) {
+  digitalWriteFast(LED_EN1, on);
+  digitalWriteFast(LED_EN2, on);
+  digitalWriteFast(LED_EN3, on);
+  digitalWriteFast(LED_EN4, on);
+}
+
+static inline void led_allDI_low() {
+  digitalWriteFast(LED_DI1, LOW);
+  digitalWriteFast(LED_DI2, LOW);
+  digitalWriteFast(LED_DI3, LOW);
+  digitalWriteFast(LED_DI4, LOW);
+}
+
+static inline void led_setAll(uint8_t r, uint8_t g, uint8_t b, uint8_t br) {
+  led_ws_show_1pixel(LED_DI1, r, g, b, br);
+  led_ws_show_1pixel(LED_DI2, r, g, b, br);
+  led_ws_show_1pixel(LED_DI3, r, g, b, br);
+  led_ws_show_1pixel(LED_DI4, r, g, b, br);
+}
+
+__attribute__((used)) void update_led_status() {  // Made non-static so calibration functions can call it
+  if (!led_enabled) {
+    led_setAll(0, 0, 0, 0);
+    return;
+  }
+  
+  uint32_t now = millis();
+  
+  switch (current_led_status) {
+    case LED_BOOTING:
+      // Yellow solid during boot
+      led_setAll(255, 200, 0, led_brightness);
+      break;
+      
+    case LED_IDLE:
+      // Pink/Magenta breathing effect (2 second cycle) - more visible
+      {
+        // Use sine wave for smooth breathing (0 to 2*PI over 2000ms)
+        float phase = (now % 2000) / 2000.0f * 2.0f * 3.14159f;
+        // Map sine (-1 to 1) to brightness (10% to 100% of base brightness for more visible effect)
+        float sine_val = (sin(phase) + 1.0f) / 2.0f;  // 0 to 1
+        uint8_t br = (uint8_t)(led_brightness * (0.1f + 0.9f * sine_val));
+        led_setAll(167, 36, 104, br);  // #A72468 - Pink/Magenta
+      }
+      break;
+      
+    case LED_STARTING:
+      // Dark blue slow pulse (500ms cycle) - transitioning to running
+      {
+        uint8_t phase = (now / 250) % 2;
+        uint8_t br = phase ? led_brightness : (led_brightness / 3);
+        led_setAll(6, 28, 47, br);  // #061C2F - Dark blue
+      }
+      break;
+      
+    case LED_RUNNING:
+      led_setAll(6, 28, 47, led_brightness);  // #061C2F - Dark blue solid
+      break;
+      
+    case LED_STOPPING:
+      // Orange fast blink (200ms cycle)
+      {
+        uint8_t phase = (now / 100) % 2;
+        led_setAll(255, 128, 0, phase ? led_brightness : 0);
+      }
+      break;
+      
+    case LED_ERROR:
+      // Red fast flash (150ms cycle)
+      {
+        uint8_t phase = (now / 75) % 2;
+        led_setAll(255, 0, 0, phase ? led_brightness : 0);
+      }
+      break;
+      
+    // Calibration states (functional) - rearranged with relatable colors
+    case LED_CAL_TARE_COLLECTING:
+      // Green solid - zeroing/resetting (command being processed, matches success flash)
+      led_setAll(0, 255, 0, led_brightness);  // Green solid
+      break;
+      
+    case LED_CAL_TARE_SUCCESS:
+      // Green double flash (500ms total) - success
+      {
+        uint32_t elapsed = now - led_success_start_ms;
+        if (elapsed < 500) {
+          uint8_t flash = (elapsed / 125) % 2;
+          led_setAll(0, 255, 0, flash ? led_brightness : 0);  // Green
+        } else {
+          current_led_status = LED_IDLE;  // Return to idle after flash
+        }
+      }
+      break;
+      
+    case LED_CAL_ADD_COLLECTING:
+      // Green solid - adding calibration point (command being processed, matches success flash)
+      led_setAll(0, 255, 0, led_brightness);  // Green solid
+      break;
+      
+    case LED_CAL_ADD_SUCCESS:
+      // Green triple flash (300ms each, 900ms total) - success
+      {
+        uint32_t elapsed = now - led_success_start_ms;
+        if (elapsed < 900) {
+          uint8_t flash = (elapsed / 150) % 2;
+          led_setAll(0, 255, 0, flash ? led_brightness : 0);  // Green
+        } else {
+          current_led_status = LED_IDLE;  // Return to idle after flash
+        }
+      }
+      break;
+      
+    case LED_CAL_FIT_RUNNING:
+      // Green solid - fitting regression (command being processed, matches success flash)
+      led_setAll(0, 255, 0, led_brightness);  // Green solid
+      break;
+      
+    case LED_CAL_FIT_SUCCESS:
+      // Green single long flash (800ms) - success
+      {
+        uint32_t elapsed = now - led_success_start_ms;
+        if (elapsed < 800) {
+          led_setAll(0, 255, 0, led_brightness);  // Green
+        } else {
+          current_led_status = LED_IDLE;  // Return to idle after flash
+        }
+      }
+      break;
+      
+    case LED_CAL_CLEAR:
+      // Orange/Yellow quick flash (200ms) - warning/clearing
+      {
+        uint32_t elapsed = now - led_success_start_ms;
+        if (elapsed < 200) {
+          led_setAll(255, 165, 0, led_brightness);  // Orange
+        } else {
+          current_led_status = LED_IDLE;  // Return to idle after flash
+        }
+      }
+      break;
+      
+    case LED_CAL_ERROR:
+      // Red fast flash (100ms cycle)
+      {
+        uint8_t phase = (now / 50) % 2;
+        led_setAll(255, 0, 0, phase ? led_brightness : 0);
+      }
+      break;
+  }
+  
+  led_last_update_ms = now;
+}
+
+// ============================================================================
 // STATE MANAGEMENT AND DATA ACQUISITION CONTROL
 // ============================================================================
 
@@ -358,23 +610,25 @@ bool start_data_acquisition() {
   
   Serial.println("[T41] Starting data acquisition...");
   current_state = STATE_STARTING;
+  current_led_status = LED_STARTING;
   state_changed = true;
-  
+
   // Reset statistics
   st.start_ms = millis();
   st.last_ms = st.start_ms;
   st.frames_sent = 0;
   st.min_xfer_us = UINT32_MAX;
   st.max_xfer_us = 0;
-  
+
   // Reset buffer
   buffer_index = 0;
   frame_idx = 0;
   tick = 0;
-  
+
   current_state = STATE_RUNNING;
+  current_led_status = LED_RUNNING;
   state_changed = true;
-  
+
   Serial.println("[T41] Data acquisition started");
   return true;
 }
@@ -387,14 +641,16 @@ bool stop_data_acquisition() {
   
   Serial.println("[T41] Stopping data acquisition...");
   current_state = STATE_STOPPING;
+  current_led_status = LED_STOPPING;
   state_changed = true;
-  
+
   // Print final stats
   print_statistics();
-  
+
   current_state = STATE_STOPPED;
+  current_led_status = LED_IDLE;
   state_changed = true;
-  
+
   Serial.println("[T41] Data acquisition stopped");
   return true;
 }
@@ -459,6 +715,17 @@ void handle_esp32_commands() {
                state_names_arr[current_state], (unsigned long)st.frames_sent);
       softSerialTX_println(buf);
       send_status_response("STATUS", "OK");
+    }
+    // ========== LED CONTROL COMMANDS ==========
+    else if (command == "LED_ON") {
+      led_enabled = true;
+      update_led_status();
+      send_status_response("LED_ON", "OK");
+    }
+    else if (command == "LED_OFF") {
+      led_enabled = false;
+      led_setAll(0, 0, 0, 0);
+      send_status_response("LED_OFF", "OK");
     }
     // ========== NOISE FILTERING COMMANDS ==========
     else if (command == "FILTER_ENABLE") {
@@ -541,7 +808,15 @@ void handle_esp32_commands() {
     }
     else if (command == "CAL_TARE") {
       Serial.println("[CAL] TARE: collecting samples...");
-      bool ok = cal_tare(600, true);
+      current_led_status = LED_CAL_TARE_COLLECTING;
+      update_led_status();  // Update LED immediately to show solid color
+      bool ok = cal_tare(1500, true);  // 1.5 seconds collection time
+      if (ok) {
+        current_led_status = LED_CAL_TARE_SUCCESS;
+        led_success_start_ms = millis();
+      } else {
+        current_led_status = LED_CAL_ERROR;
+      }
       cal_response(ok ? "TARE:OK" : "TARE:ERR");
     }
     else if (command.startsWith("CAL_ADD_") && !command.startsWith("CAL_ADD_CH_")) {
@@ -549,11 +824,21 @@ void handle_esp32_commands() {
       float kg = command.substring(8).toFloat();
       if (kg > 0.0f) {
         Serial.printf("[CAL] ADD %.3f kg: collecting...\n", (double)kg);
-        bool ok = cal_add_point_total(kg, 800, true);
+        current_led_status = LED_CAL_ADD_COLLECTING;
+        update_led_status();  // Update LED immediately to show solid color
+        bool ok = cal_add_point_total(kg, 1500, true);  // 1.5 seconds collection time
         if (ok) {
+          current_led_status = LED_CAL_FIT_RUNNING;
           bool fit_ok = cal_fit_and_save();
+          if (fit_ok) {
+            current_led_status = LED_CAL_ADD_SUCCESS;
+            led_success_start_ms = millis();
+          } else {
+            current_led_status = LED_CAL_ERROR;
+          }
           cal_response(fit_ok ? "ADD:OK" : "ADD:FIT_ERR");
         } else {
+          current_led_status = LED_CAL_ERROR;
           cal_response("ADD:ERR");
         }
       } else {
@@ -570,11 +855,21 @@ void handle_esp32_commands() {
         float kg = params.substring(us + 1).toFloat();
         if (ch >= 1 && ch <= 4 && kg > 0.0f) {
           Serial.printf("[CAL] ADD_CH%d %.3f kg: collecting...\n", ch, (double)kg);
-          bool ok = cal_add_point_channel((uint8_t)(ch - 1), kg, 800, true);
+          current_led_status = LED_CAL_ADD_COLLECTING;
+          update_led_status();  // Update LED immediately to show solid color
+          bool ok = cal_add_point_channel((uint8_t)(ch - 1), kg, 1500, true);  // 1.5 seconds collection time
           if (ok) {
+            current_led_status = LED_CAL_FIT_RUNNING;
             bool fit_ok = cal_fit_and_save();
+            if (fit_ok) {
+              current_led_status = LED_CAL_ADD_SUCCESS;
+              led_success_start_ms = millis();
+            } else {
+              current_led_status = LED_CAL_ERROR;
+            }
             cal_response(fit_ok ? "ADD_CH:OK" : "ADD_CH:FIT_ERR");
           } else {
+            current_led_status = LED_CAL_ERROR;
             cal_response("ADD_CH:ERR");
           }
         } else {
@@ -585,11 +880,24 @@ void handle_esp32_commands() {
       }
     }
     else if (command == "CAL_FIT") {
+      current_led_status = LED_CAL_FIT_RUNNING;
       bool ok = cal_fit_and_save();
+      if (ok) {
+        current_led_status = LED_CAL_FIT_SUCCESS;
+        led_success_start_ms = millis();
+      } else {
+        current_led_status = LED_CAL_ERROR;
+      }
       cal_response(ok ? "FIT:OK" : "FIT:ERR");
     }
     else if (command == "CAL_CLEAR") {
       bool ok = cal_clear();
+      if (ok) {
+        current_led_status = LED_CAL_CLEAR;
+        led_success_start_ms = millis();
+      } else {
+        current_led_status = LED_CAL_ERROR;
+      }
       cal_response(ok ? "CLEAR:OK" : "CLEAR:ERR");
     }
     else if (command == "CAL_POINTS") {
@@ -657,6 +965,17 @@ void handle_serial_monitor_commands() {
       const char* state_names[] = {"STOPPED", "STARTING", "RUNNING", "STOPPING", "ERROR"};
       Serial.printf("[T41] State: %s | Frames: %lu | Uptime: %lu ms\n", 
                     state_names[current_state], (unsigned long)st.frames_sent, millis());
+    }
+    // ========== LED CONTROL COMMANDS ==========
+    else if (command == "LED_ON") {
+      led_enabled = true;
+      update_led_status();
+      Serial.println("[T41] ✓ LEDs enabled");
+    }
+    else if (command == "LED_OFF") {
+      led_enabled = false;
+      led_setAll(0, 0, 0, 0);
+      Serial.println("[T41] ✓ LEDs disabled");
     }
     // ========== NOISE FILTERING COMMANDS ==========
     else if (command == "FILTER_ENABLE") {
@@ -758,7 +1077,15 @@ void handle_serial_monitor_commands() {
     }
     else if (command == "CAL TARE" || command == "CAL_TARE") {
       Serial.println("[CAL] TARE: remove all load and keep still...");
-      bool ok = cal_tare(600, true);
+      current_led_status = LED_CAL_TARE_COLLECTING;
+      update_led_status();  // Update LED immediately to show solid color
+      bool ok = cal_tare(1500, true);  // 1.5 seconds collection time
+      if (ok) {
+        current_led_status = LED_CAL_TARE_SUCCESS;
+        led_success_start_ms = millis();
+      } else {
+        current_led_status = LED_CAL_ERROR;
+      }
       Serial.println(ok ? "[CAL] TARE OK" : "[CAL] TARE ERROR");
     }
     else if (command.startsWith("CAL ADD ") || command.startsWith("CAL_ADD_")) {
@@ -771,12 +1098,22 @@ void handle_serial_monitor_commands() {
         kg = command.substring(8).toFloat();
       }
       Serial.printf("[CAL] ADD(TOTAL): apply %.3f kg and keep still...\n", (double)kg);
-      bool ok = cal_add_point_total(kg, 800, true);
+      current_led_status = LED_CAL_ADD_COLLECTING;
+      update_led_status();  // Update LED immediately to show solid color
+      bool ok = cal_add_point_total(kg, 1500, true);  // 1.5 seconds collection time
       if (ok) {
         Serial.println("[CAL] ADD OK -> auto-fitting...");
+        current_led_status = LED_CAL_FIT_RUNNING;
         bool fit_ok = cal_fit_and_save();
+        if (fit_ok) {
+          current_led_status = LED_CAL_ADD_SUCCESS;
+          led_success_start_ms = millis();
+        } else {
+          current_led_status = LED_CAL_ERROR;
+        }
         Serial.println(fit_ok ? "[CAL] FIT OK" : "[CAL] FIT ERROR");
       } else {
+        current_led_status = LED_CAL_ERROR;
         Serial.println("[CAL] ADD ERROR");
       }
     }
@@ -807,22 +1144,45 @@ void handle_serial_monitor_commands() {
       }
       if (ch > 0 && ch <= 4 && kg > 0.0f) {
         Serial.printf("[CAL] ADD(LC%d): apply %.3f kg mostly on that cell and keep still...\n", ch, (double)kg);
-        bool ok = cal_add_point_channel((uint8_t)(ch - 1), kg, 800, true);
+        current_led_status = LED_CAL_ADD_COLLECTING;
+        update_led_status();  // Update LED immediately to show solid color
+        bool ok = cal_add_point_channel((uint8_t)(ch - 1), kg, 1500, true);  // 1.5 seconds collection time
         if (ok) {
           Serial.println("[CAL] ADD_CH OK -> auto-fitting...");
+          current_led_status = LED_CAL_FIT_RUNNING;
           bool fit_ok = cal_fit_and_save();
+          if (fit_ok) {
+            current_led_status = LED_CAL_ADD_SUCCESS;
+            led_success_start_ms = millis();
+          } else {
+            current_led_status = LED_CAL_ERROR;
+          }
           Serial.println(fit_ok ? "[CAL] FIT OK" : "[CAL] FIT ERROR");
         } else {
+          current_led_status = LED_CAL_ERROR;
           Serial.println("[CAL] ADD_CH ERROR");
         }
       }
     }
     else if (command == "CAL FIT" || command == "CAL_FIT") {
+      current_led_status = LED_CAL_FIT_RUNNING;
       bool ok = cal_fit_and_save();
+      if (ok) {
+        current_led_status = LED_CAL_FIT_SUCCESS;
+        led_success_start_ms = millis();
+      } else {
+        current_led_status = LED_CAL_ERROR;
+      }
       Serial.println(ok ? "[CAL] FIT OK" : "[CAL] FIT ERROR");
     }
     else if (command == "CAL CLEAR" || command == "CAL_CLEAR") {
       bool ok = cal_clear();
+      if (ok) {
+        current_led_status = LED_CAL_CLEAR;
+        led_success_start_ms = millis();
+      } else {
+        current_led_status = LED_CAL_ERROR;
+      }
       Serial.println(ok ? "[CAL] CLEAR OK" : "[CAL] CLEAR ERROR");
     }
     else if (command == "HELP") {
@@ -865,6 +1225,38 @@ static inline void pack_int24_le(uint8_t* p, int32_t v) {
 }
 
 void setup() {
+  // Set booting state immediately
+  current_led_status = LED_BOOTING;
+  
+  // Initialize LEDs early so booting state is visible
+  pinMode(LED_EN1, OUTPUT);
+  pinMode(LED_EN2, OUTPUT);
+  pinMode(LED_EN3, OUTPUT);
+  pinMode(LED_EN4, OUTPUT);
+  pinMode(LED_DI1, OUTPUT);
+  pinMode(LED_DI2, OUTPUT);
+  pinMode(LED_DI3, OUTPUT);
+  pinMode(LED_DI4, OUTPUT);
+  
+  // Hard boot sequence
+  led_allEN(false);
+  led_allDI_low();
+  delay(500);
+  
+  led_dwt_init();
+  
+  led_allEN(true);
+  delay(500);
+  
+  // Sync LEDs
+  for (int i = 0; i < 5; i++) {
+    led_setAll(0, 0, 0, 0);
+    delay(20);
+  }
+  
+  // Update LED to show booting state
+  update_led_status();
+  
   delay(1000);
   Serial.begin(115200);
   Serial.println("[T41] ADS1256 Force Plate System");
@@ -875,6 +1267,7 @@ void setup() {
   pinMode(ADS_RST_PIN, OUTPUT);
   SPI.begin();
   initADS();
+  update_led_status();  // Update LED during boot
   Serial.println("[T41] ADS1256 initialized");
 
   // Initialize SPI1 for ESP32 communication
@@ -884,6 +1277,7 @@ void setup() {
   SPI1.setMOSI(PIN_MOSI1);
   SPI1.setMISO(PIN_MISO1);
   SPI1.begin();
+  update_led_status();  // Update LED during boot
   Serial.println("[T41] SPI1 Master initialized");
   
   // Initialize Serial3 for ESP32 command interface (RX only - Pin 15)
@@ -916,8 +1310,14 @@ void setup() {
   // Load calibration (Teensy-only, does not affect frame output format)
   bool cal_ok = cal_init_load();
   Serial.printf("[CAL] EEPROM load: %s\n", cal_ok ? "OK" : "DEFAULTS");
+  update_led_status();  // Update LED during boot
   
   Serial.println("[T41] Ready - type HELP for commands");
+  
+  // Change LED status from booting to idle
+  current_led_status = LED_IDLE;
+  update_led_status();
+  Serial.println("[T41] LEDs initialized");
   
   // Send initial state to ESP32
   send_state_update();
@@ -929,6 +1329,13 @@ void loop() {
   
   // Handle Serial Monitor commands for testing
   handle_serial_monitor_commands();
+  
+  // Update LED status (every 50ms for smooth animations)
+  static uint32_t last_led_update = 0;
+  if (millis() - last_led_update >= 50) {
+    update_led_status();
+    last_led_update = millis();
+  }
   
   // Send state updates when state changes
   if (state_changed) {

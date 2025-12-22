@@ -637,7 +637,8 @@ static void handle_serial_commands() {
 
 static void process_command(String command) {
     // Local Teensy control commands
-    if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET") {
+    if (command == "START" || command == "STOP" || command == "RESTART" || command == "RESET" ||
+        command == "LED_ON" || command == "LED_OFF") {
             Serial.printf("[RX_RADIO] Forwarding '%s' to Local Teensy...\n", command.c_str());
             
             Serial1.println(command);
@@ -704,7 +705,8 @@ static void process_command(String command) {
         }
     }
     // Remote Teensy control commands (via ESP-NOW)
-    else if (command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET") {
+    else if (command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
+             command == "REMOTE_LED_ON" || command == "REMOTE_LED_OFF") {
         String teensy_command = command.substring(7); // Remove "REMOTE_" prefix
         Serial.printf("[RX_RADIO] Sending '%s' to Remote Teensy via ESP-NOW...\n", teensy_command.c_str());
         if (send_espnow_command(teensy_command.c_str())) {
@@ -756,7 +758,8 @@ static void process_command(String command) {
         }
     }
     // ALL commands - control both local and remote Teensy simultaneously
-    else if (command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET") {
+    else if (command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET" ||
+             command == "ALL_LED_ON" || command == "ALL_LED_OFF") {
         String teensy_command = command.substring(4); // Remove "ALL_" prefix
         Serial.printf("[RX_RADIO] Executing '%s' on BOTH Local and Remote Teensy...\n", teensy_command.c_str());
         

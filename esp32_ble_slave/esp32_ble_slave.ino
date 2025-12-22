@@ -582,6 +582,9 @@ static void process_ble_command(String command) {
         command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
         command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET" ||
         command == "LOCAL_PING" || command == "REMOTE_PING" ||
+        command == "LOCAL_LED_ON" || command == "LOCAL_LED_OFF" ||
+        command == "REMOTE_LED_ON" || command == "REMOTE_LED_OFF" ||
+        command == "ALL_LED_ON" || command == "ALL_LED_OFF" ||
         command.startsWith("LOCAL_CAL_") || command.startsWith("REMOTE_CAL_")) {
         
         forward_command_to_rx_radio(command);
@@ -1011,6 +1014,10 @@ static void show_help() {
     Serial.println("    START, STOP, RESTART, RESET (local Teensy)");
     Serial.println("    REMOTE_START/STOP/RESTART/RESET (remote Teensy)");
     Serial.println("    ALL_START/STOP/RESTART/RESET (both)");
+    Serial.println("  LED Control:");
+    Serial.println("    LOCAL_LED_ON, LOCAL_LED_OFF (local Teensy)");
+    Serial.println("    REMOTE_LED_ON, REMOTE_LED_OFF (remote Teensy)");
+    Serial.println("    ALL_LED_ON, ALL_LED_OFF (both)");
     Serial.println("  Ping:");
     Serial.println("    LOCAL_PING, REMOTE_PING");
     Serial.println("  Calibration:");
@@ -1053,6 +1060,9 @@ static void handle_serial_commands() {
             command == "REMOTE_START" || command == "REMOTE_STOP" || command == "REMOTE_RESTART" || command == "REMOTE_RESET" ||
             command == "ALL_START" || command == "ALL_STOP" || command == "ALL_RESTART" || command == "ALL_RESET" ||
             command == "LOCAL_PING" || command == "REMOTE_PING" ||
+            command == "LOCAL_LED_ON" || command == "LOCAL_LED_OFF" ||
+            command == "REMOTE_LED_ON" || command == "REMOTE_LED_OFF" ||
+            command == "ALL_LED_ON" || command == "ALL_LED_OFF" ||
             command.startsWith("LOCAL_CAL_") || command.startsWith("REMOTE_CAL_")) {
             
             forward_command_to_rx_radio(command);

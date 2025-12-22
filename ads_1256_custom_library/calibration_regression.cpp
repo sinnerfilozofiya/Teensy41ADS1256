@@ -7,6 +7,9 @@
 extern int32_t read_single_channel_fast(uint8_t channel);
 extern int32_t get_filtered_load_cell_reading(uint8_t channel);
 
+// External LED update function (defined in main .ino file)
+extern void update_led_status();
+
 // ---------------- Storage ----------------
 static const uint32_t CAL_MAGIC   = 0xCA1BCA1Bu;
 static const uint16_t CAL_VERSION = 0x0003u; // per-cell regression (no total fit)
@@ -136,6 +139,7 @@ static bool capture_window(uint32_t window_ms, bool use_filtered, CaptureStats* 
   uint32_t n = 0;
 
   const uint32_t t0 = millis();
+  uint32_t last_led_update = 0;
   while ((millis() - t0) < window_ms) {
     n++;
     for (uint8_t ch = 0; ch < CHANNELS; ch++) {
@@ -147,6 +151,13 @@ static bool capture_window(uint32_t window_ms, bool use_filtered, CaptureStats* 
     }
     delayMicroseconds(300);
     yield();
+    
+    // Update LED status every 50ms during collection
+    uint32_t now = millis();
+    if (now - last_led_update >= 50) {
+      update_led_status();
+      last_led_update = now;
+    }
   }
 
   out->n = n;
